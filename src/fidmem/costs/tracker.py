@@ -27,6 +27,7 @@ class _TrackedRecord:
     video_id: str | None
     question_id: str | None
     action_type: str | None
+    cost_component: str
 def amortized_total(base_gpu_s: float, online_gpu_s: float, answer_gpu_s: float, query_count: int) -> float:
     if query_count < 1:
         raise ValueError("query_count must be at least one")
@@ -59,14 +60,15 @@ class CostTracker:
             return tokens
         return tokens.get("visual", 0), tokens.get("text", 0)
     @contextmanager
-    def measure(self, operation: str, cache_status: str, frames: int, tokens: int | tuple[int, int] | Mapping[str, int], *, video_id: str | None = None, question_id: str | None = None, action_type: str | None = None) -> Iterator[CostMeasurement]:
+    def measure(self, operation: str, cache_status: str, frames: int, tokens: int | tuple[int, int] | Mapping[str, int], *, video_id: str | None = None, question_id: str | None = None, action_type: str | None = None, cost_component: str = "online") -> Iterator[CostMeasurement]:
         if frames < 0:
             raise ValueError("frames must be non-negative")
         visual_tokens, text_tokens = self._token_counts(tokens)
         if visual_tokens < 0 or text_tokens < 0:
             raise ValueError("token counts must be non-negative")
+        if cost_component not in {"base", "online", "answer", "visual"}:
+            raise ValueError("unknown cost_component")
         measurement = CostMeasurement()
-        wall_start_ns = perf_counter_ns()
         start_event: Any | None = None
         end_event: Any | None = None
         if self._cuda is not None:
@@ -77,32 +79,41 @@ class CostTracker:
             start_event = self._cuda.Event(enable_timing=True)
             end_event = self._cuda.Event(enable_timing=True)
             start_event.record()
+        wall_start_ns = perf_counter_ns()
         try:
             yield measurement
         finally:
-            wall_seconds = (perf_counter_ns() - wall_start_ns) / 1_000_000_000
             if self._cuda is None:
                 gpu_seconds, peak_memory_bytes, device_name = 0.0, 0, "cpu"
             else:
                 end_event.record()
                 self._cuda.synchronize()
-                gpu_seconds = end_event.elapsed_time(start_event) / 1_000
+                gpu_seconds = start_event.elapsed_time(end_event) / 1_000
                 peak_memory_bytes = int(self._cuda.max_memory_allocated())
                 device_name = str(self._cuda.get_device_name())
+            wall_seconds = (perf_counter_ns() - wall_start_ns) / 1_000_000_000
             record = CostRecord(operation, gpu_seconds, wall_seconds, frames, visual_tokens, text_tokens, peak_memory_bytes, cache_status, device_name)
             measurement.record = record
-            self._records.append(_TrackedRecord(record, video_id, question_id, action_type))
-    def aggregate(self) -> dict[tuple[str | None, str | None, str | None, str], dict[str, float | int]]:
+            self._records.append(_TrackedRecord(record, video_id, question_id, action_type, cost_component))
+    def aggregate(self, query_counts: Mapping[str, int] | None = None) -> dict[tuple[str | None, str | None, str | None, str], dict[str, float | int]]:
         totals: dict[tuple[str | None, str | None, str | None, str], dict[str, float | int]] = defaultdict(lambda: {"count": 0, "gpu_seconds": 0.0, "wall_seconds": 0.0, "input_frames": 0, "visual_tokens": 0, "text_tokens": 0, "peak_memory_bytes": 0})
         for tracked in self._records:
             record = tracked.record
             key = (tracked.video_id, tracked.question_id, tracked.action_type, record.cache_status)
             total = totals[key]
+            if tracked.cost_component == 'base':
+                if query_counts is None or tracked.video_id not in query_counts:
+                    raise ValueError('base costs require a per-video query count')
+                divisor = query_counts[tracked.video_id]
+            else:
+                divisor = 1
+            if divisor < 1:
+                raise ValueError("base costs require a positive per-video query count")
             total["count"] += 1
-            total["gpu_seconds"] += record.gpu_seconds
-            total["wall_seconds"] += record.wall_seconds
-            total["input_frames"] += record.input_frames
-            total["visual_tokens"] += record.visual_tokens
-            total["text_tokens"] += record.text_tokens
+            total["gpu_seconds"] += record.gpu_seconds / divisor
+            total["wall_seconds"] += record.wall_seconds / divisor
+            total["input_frames"] += record.input_frames / divisor
+            total["visual_tokens"] += record.visual_tokens / divisor
+            total["text_tokens"] += record.text_tokens / divisor
             total["peak_memory_bytes"] = max(total["peak_memory_bytes"], record.peak_memory_bytes)
         return dict(totals)

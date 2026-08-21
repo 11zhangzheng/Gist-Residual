@@ -1,0 +1,9 @@
+model: shared-frozen-vlm
+model_version: residual-v1
+schema_version: residual-schema-v1
+frame_sampler_version: residual-uniform-v1
+normalizer_version: nfkc-casefold-v1
+embedder: frozen-text-embedder
+prompt: "Extract only novel visual event details."
+question_independent: true
+json_repair_max_attempts: 1

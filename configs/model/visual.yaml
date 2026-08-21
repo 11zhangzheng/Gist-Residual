@@ -1,0 +1,11 @@
+model: shared-frozen-vlm
+model_version: visual-v1
+sampler_version: visual-uniform-v1
+event_prompt: "Describe reusable event observations."
+question_prompt: "Verify the requested visual detail from the observation."
+budgets:
+  low: 12
+  high: 32
+cache:
+  event_scope: reusable
+  question_scope: non_amortizable

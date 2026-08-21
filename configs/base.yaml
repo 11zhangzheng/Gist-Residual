@@ -1,0 +1,11 @@
+retrieval:
+  top_k: 5
+oracle:
+  max_depth: 5
+  beam_size: 8
+visual:
+  low_frames: 12
+  high_frames: 32
+budget:
+  a800_gpu_hours: 800
+  v100_gpu_hours: 200

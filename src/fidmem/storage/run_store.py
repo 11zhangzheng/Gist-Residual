@@ -15,22 +15,24 @@ class RunStore:
         self.database=str(database);self.lease_seconds=lease_seconds
         with self._connect() as c:c.execute("CREATE TABLE IF NOT EXISTS run_items (run_id VARCHAR NOT NULL, item_key VARCHAR NOT NULL, status VARCHAR NOT NULL, attempt INTEGER NOT NULL, worker_id VARCHAR, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, error_type VARCHAR, error_message VARCHAR, output_uri VARCHAR, PRIMARY KEY (run_id, item_key))")
     def claim(self,run_id:str,item_key:str,worker_id:str)->bool:
-        """Atomically claim once; duplicate-key write races are deterministic losers."""
-        for attempt in range(8):
+        if not all(isinstance(x,str) and x for x in (run_id,item_key,worker_id)): raise ValueError("claim identifiers must be non-empty strings")
+        lock=Path(f"{self.database}.claim.lock")
+        with open(lock,"a+b") as handle:
+            import msvcrt
+            deadline=__import__("time").monotonic()+10
+            while True:
+                try: handle.seek(0);handle.write(b"0");handle.flush();handle.seek(0);msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1);break
+                except OSError:
+                    if __import__("time").monotonic()>deadline: raise TimeoutError("claim lock timeout")
+                    __import__("time").sleep(.01)
             try:
                 with self._connect() as c:
                     c.execute("BEGIN TRANSACTION")
                     try:
                         c.execute("INSERT INTO run_items (run_id,item_key,status,attempt) VALUES (?,?,'pending',0) ON CONFLICT (run_id,item_key) DO NOTHING",[run_id,item_key])
-                        row=c.execute("UPDATE run_items SET status='running',attempt=attempt+1,worker_id=?,started_at=?,finished_at=NULL,error_type=NULL,error_message=NULL WHERE run_id=? AND item_key=? AND status IN ('pending','failed') RETURNING item_key",[worker_id,_utcnow(),run_id,item_key]).fetchone()
-                        c.execute("COMMIT");return row is not None
-                    except BaseException:
-                        c.execute("ROLLBACK");raise
-            except (duckdb.ConstraintException, duckdb.TransactionException):
-                item=self.item(run_id,item_key)
-                if item is not None and item.status in ("running","complete"): return False
-                if attempt == 7: return False
-        return False
+                        row=c.execute("UPDATE run_items SET status='running',attempt=attempt+1,worker_id=?,started_at=?,finished_at=NULL,error_type=NULL,error_message=NULL WHERE run_id=? AND item_key=? AND status IN ('pending','failed') RETURNING item_key",[worker_id,_utcnow(),run_id,item_key]).fetchone();c.execute("COMMIT");return row is not None
+                    except BaseException:c.execute("ROLLBACK");raise
+            finally: handle.seek(0);msvcrt.locking(handle.fileno(),msvcrt.LK_UNLCK,1)
     def complete(self,run_id:str,item_key:str,output_uri:str)->None:
         if not Path(output_uri).exists():raise ValueError("output_uri must refer to an existing output")
         with self._connect() as c:result=c.execute("UPDATE run_items SET status='complete',output_uri=?,finished_at=? WHERE run_id=? AND item_key=? AND status='running' RETURNING item_key",[output_uri,_utcnow(),run_id,item_key]).fetchone()

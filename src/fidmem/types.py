@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class ActionType(str, Enum):
@@ -21,20 +21,58 @@ class FidelityLevel(str, Enum):
 
 
 class EventRecord(BaseModel):
+    """Canonical, immutable event memory record.
+
+    The validation aliases keep Task 1's field names accepted at input while
+    all serialization uses the design-spec names.
+    """
+
     model_config = ConfigDict(frozen=True)
 
-    event_id: str
     video_id: str
-    start_seconds: float = Field(ge=0)
-    end_seconds: float = Field(ge=0)
-    gist: str
+    event_id: str
+    start_sec: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias=AliasChoices("start_sec", "start_seconds"),
+    )
+    end_sec: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias=AliasChoices("end_sec", "end_seconds"),
+    )
+    asr_text: str = ""
+    keyframe_paths: tuple[str, ...] = ()
+    visual_embedding: tuple[float, ...] = ()
+    text_embedding: tuple[float, ...] = ()
+    gist_text: str = Field(
+        default="",
+        validation_alias=AliasChoices("gist_text", "gist"),
+    )
+    raw_video_uri: str = ""
+    memory_version: str = "unknown"
     residual: str | None = None
 
     @model_validator(mode="after")
     def end_must_not_precede_start(self) -> "EventRecord":
-        if self.end_seconds < self.start_seconds:
-            raise ValueError("end_seconds must be at least start_seconds")
+        if self.end_sec < self.start_sec:
+            raise ValueError("end_sec must be at least start_sec")
         return self
+
+    @property
+    def start_seconds(self) -> float:
+        """Read-only compatibility alias for the Task 1 field name."""
+        return self.start_sec
+
+    @property
+    def end_seconds(self) -> float:
+        """Read-only compatibility alias for the Task 1 field name."""
+        return self.end_sec
+
+    @property
+    def gist(self) -> str:
+        """Read-only compatibility alias for the Task 1 field name."""
+        return self.gist_text
 
 
 class EvidenceItem(BaseModel):

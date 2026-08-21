@@ -1,0 +1,24 @@
+main:
+  mode: main
+  namespace: gist
+  summary_model: text-1b-2b
+  summary_max_tokens: 40
+  visual_encoder: frozen-cheap-encoder
+  visual_frame_count: 4
+  visual_resolution: [224, 224]
+  use_vlm: false
+
+gist_plus:
+  mode: gist_plus
+  namespace: gist_plus
+  summary_model: text-1b-2b
+  summary_max_tokens: 40
+  visual_encoder: frozen-cheap-encoder
+  visual_frame_count: 4
+  visual_resolution: [224, 224]
+  use_vlm: true
+  vlm_model: shared-frozen-vlm
+
+retrieval:
+  text_weight: 0.6
+  visual_weight: 0.4

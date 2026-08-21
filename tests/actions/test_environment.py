@@ -8,7 +8,7 @@ from fidmem.actions.environment import (
     ActionCostTable,
     ActionObservation,
     IllegalActionError,
-    MemoryEnvironment,
+    MemoryEnvironment, OperationMetadata,
     TerminalStateError,
 )
 from fidmem.types import (
@@ -62,7 +62,7 @@ def _environment(calls: list[ActionInstance], *, budget: float = 20.0, cached_vi
     return MemoryEnvironment(
         events=(_event("e1", 0), _event("e2", 10)),
         executor=_executor(calls, cached_visual=cached_visual),
-        costs=ActionCostTable(search_gist=1, residual=2, context=1, visual_low=4, visual_high=8, cache_hit=0),
+        costs=ActionCostTable(search_gist=1, residual=2, context=1, visual_low=4, visual_high=8, visual_low_question=0, visual_high_question=0, cache_hit=0),
     )
 
 
@@ -71,7 +71,7 @@ def test_hard_mask_tracks_residual_visual_context_and_budget_without_provider_io
     environment = _environment(calls)
     initial = _state()
 
-    assert environment.valid_actions(initial) == (_action(ActionType.SEARCH_GIST),)
+    assert environment.valid_actions(initial) == (_action(ActionType.SEARCH_GIST), _action(ActionType.STOP))
     assert calls == []
 
     after_search = environment.step(initial, _action(ActionType.SEARCH_GIST)).next_state

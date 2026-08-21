@@ -5,6 +5,7 @@ from .environment import (
     ActionObservation,
     EnvironmentTransition,
     IllegalActionError,
+    OperationMetadata,
     MemoryEnvironment,
     ObservationValidationError,
     TerminalStateError,
@@ -12,5 +13,5 @@ from .environment import (
 
 __all__ = [
     "ActionCostTable", "ActionObservation", "EnvironmentTransition", "IllegalActionError",
-    "MemoryEnvironment", "ObservationValidationError", "TerminalStateError",
+    "MemoryEnvironment", "ObservationValidationError", "OperationMetadata", "TerminalStateError",
 ]

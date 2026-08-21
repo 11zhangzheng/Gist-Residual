@@ -1,120 +1,77 @@
 """Bounded execution of a masked memory policy with durable transition logs."""
-
 from __future__ import annotations
-
-from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
-
 from pydantic import BaseModel, ConfigDict
-
 from fidmem.actions.environment import EnvironmentTransition, MemoryEnvironment
 from fidmem.agent.answerer import AnswerResult, FrozenAnswerer
 from fidmem.storage.run_store import RunStore
 from fidmem.types import ActionInstance, ActionType, RouterState
-
-
-class InvalidPolicyActionError(ValueError):
-    """Raised instead of silently repairing an illegal policy proposal."""
-
-
+class InvalidPolicyActionError(ValueError): pass
+class ResumeValidationError(ValueError): pass
 class RouterPolicy(Protocol):
-    def __call__(self, state: RouterState, legal_actions: tuple[ActionInstance, ...]) -> ActionInstance: ...
-
-
+    def __call__(self,state:RouterState,legal_actions:tuple[ActionInstance,...])->ActionInstance: ...
 class RunResult(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    transitions: tuple[EnvironmentTransition, ...]
-    answer: AnswerResult
-    final_state: RouterState
-    forced_stop: bool
-
-
+    model_config=ConfigDict(frozen=True)
+    transitions:tuple[EnvironmentTransition,...]; answer:AnswerResult; final_state:RouterState; forced_stop:bool
 class AgentRunner:
-    """Execute at most five transitions, then answer only from acquired evidence."""
-
-    def __init__(
-        self,
-        environment: MemoryEnvironment,
-        policy: RouterPolicy,
-        answerer: FrozenAnswerer,
-        *,
-        run_store: RunStore | None = None,
-        artifact_dir: Path | str | None = None,
-        worker_id: str = "agent-runner",
-    ) -> None:
-        self.environment = environment
-        self.policy = policy
-        self.answerer = answerer
-        self.run_store = run_store
-        self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
-        self.worker_id = worker_id
-        if self.run_store is not None and self.artifact_dir is None:
-            raise ValueError("artifact_dir is required when RunStore is enabled")
-
-    def _item_key(self, step: int) -> str:
-        return f"transition-{step:03d}"
-
-    def _claim(self, run_id: str, item_key: str) -> None:
-        if self.run_store is not None and not self.run_store.claim(run_id, item_key, self.worker_id):
-            raise RuntimeError(f"run item cannot be claimed: {run_id}/{item_key}")
-
-    def _complete(self, run_id: str, item_key: str, payload: BaseModel) -> None:
-        if self.run_store is None:
-            return
+    def __init__(self,environment:MemoryEnvironment,policy:RouterPolicy,answerer:FrozenAnswerer,*,run_store:RunStore|None=None,artifact_dir:Path|str|None=None,worker_id:str="agent-runner")->None:
+        self.environment=environment;self.policy=policy;self.answerer=answerer;self.run_store=run_store;self.artifact_dir=Path(artifact_dir) if artifact_dir is not None else None;self.worker_id=worker_id
+        if run_store is not None and self.artifact_dir is None: raise ValueError("artifact_dir is required with RunStore")
+    @staticmethod
+    def _key(step:int)->str:return f"transition-{step:03d}"
+    def _claim(self,run:str,key:str)->None:
+        if self.run_store is not None and not self.run_store.claim(run,key,self.worker_id): raise RuntimeError(f"run item cannot be claimed: {run}/{key}")
+    def _complete(self,run:str,key:str,payload:BaseModel)->None:
+        if self.run_store is None:return
         assert self.artifact_dir is not None
-        path = self.artifact_dir / run_id / f"{item_key}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
-        self.run_store.complete(run_id, item_key, str(path))
-
-    def _fail(self, run_id: str, item_key: str, error: BaseException) -> None:
-        if self.run_store is not None:
-            self.run_store.fail(run_id, item_key, type(error).__name__, str(error))
-
-    def _choose(self, state: RouterState, legal_actions: tuple[ActionInstance, ...]) -> ActionInstance:
-        selected = self.policy(state, legal_actions)
-        if selected not in legal_actions:
-            raise InvalidPolicyActionError("policy selected an action outside the provided legal tuple")
-        return selected
-
-    def run(self, initial_state: RouterState, *, run_id: str) -> RunResult:
-        state = initial_state
-        transitions: list[EnvironmentTransition] = []
-        forced_stop = False
+        target=self.artifact_dir/run/f"{key}.json";target.parent.mkdir(parents=True,exist_ok=True);temp=target.with_suffix(target.suffix+".tmp")
+        temp.write_text(payload.model_dump_json(indent=2),encoding="utf-8");temp.replace(target);self.run_store.complete(run,key,str(target))
+    def _fail(self,run:str,key:str,error:BaseException)->None:
+        if self.run_store is not None:self.run_store.fail(run,key,type(error).__name__,str(error))
+    def _load_transition(self,uri:str|None)->EnvironmentTransition:
+        if uri is None or not Path(uri).is_file():raise ResumeValidationError("complete transition missing artifact")
+        try:return EnvironmentTransition.model_validate_json(Path(uri).read_text(encoding="utf-8"))
+        except (OSError,ValueError) as error:raise ResumeValidationError("invalid transition artifact") from error
+    def _restore(self,initial:RouterState,run:str)->tuple[list[EnvironmentTransition],RouterState]:
+        if self.run_store is None:return [],initial
+        state=initial;out=[]
         for step in range(5):
-            legal_actions = self.environment.valid_actions(state)
-            if not legal_actions:
-                raise RuntimeError("environment reached a non-terminal state with no legal actions")
-            item_key = self._item_key(step)
-            self._claim(run_id, item_key)
+            item=self.run_store.item(run,self._key(step))
+            if item is None or item.status!="complete":break
+            tr=self._load_transition(item.output_uri)
+            if tr.state!=state or len(tr.state.action_history)!=step or tr.action not in self.environment.valid_actions(state) or tr.terminal!=(tr.action.action_type is ActionType.STOP):raise ResumeValidationError("transition artifact state or index mismatch")
+            out.append(tr);state=tr.next_state
+            if tr.terminal:break
+        return out,state
+    def _answer(self,state:RouterState,trs:list[EnvironmentTransition],run:str,forced:bool)->RunResult:
+        key="answer"
+        if self.run_store is not None:
+            item=self.run_store.item(run,key)
+            if item is not None and item.status=="complete":
+                if item.output_uri is None or not Path(item.output_uri).is_file():raise ResumeValidationError("complete answer missing artifact")
+                return RunResult(transitions=tuple(trs),answer=AnswerResult.model_validate_json(Path(item.output_uri).read_text(encoding="utf-8")),final_state=state,forced_stop=forced)
+        self._claim(run,key)
+        try:answer=self.answerer.answer(state.question,state.options,state.evidence);self._complete(run,key,answer)
+        except BaseException as error:self._fail(run,key,error);raise
+        return RunResult(transitions=tuple(trs),answer=answer,final_state=state,forced_stop=forced)
+    def run(self,initial_state:RouterState,*,run_id:str)->RunResult:
+        trs,state=self._restore(initial_state,run_id);forced=bool(len(trs)==5 and trs[-1].terminal)
+        if trs and trs[-1].terminal:return self._answer(state,trs,run_id,forced)
+        for step in range(len(trs),5):
+            legal=self.environment.valid_actions(state)
+            if not legal:raise RuntimeError("non-terminal state has no legal action")
+            key=self._key(step);self._claim(run_id,key)
             try:
-                if step == 4:
-                    stop = ActionInstance(ActionType.STOP, None, None)
-                    if stop not in legal_actions:
-                        raise RuntimeError("fifth transition requires a legal STOP action")
-                    selected = stop
-                    forced_stop = True
+                if step==4:
+                    selected=ActionInstance(ActionType.STOP,None,None)
+                    if selected not in legal:raise RuntimeError("fifth transition requires STOP")
+                    forced=True
                 else:
-                    selected = self._choose(state, legal_actions)
-                transition = self.environment.step(state, selected)
-                self._complete(run_id, item_key, transition)
-            except BaseException as error:
-                self._fail(run_id, item_key, error)
-                raise
-            transitions.append(transition)
-            state = transition.next_state
-            if transition.terminal:
-                break
-        if not transitions or not transitions[-1].terminal:
-            raise RuntimeError("runner exceeded its transition bound without STOP")
-        answer_key = "answer"
-        self._claim(run_id, answer_key)
-        try:
-            answer = self.answerer.answer(state.question, state.options, state.evidence)
-            self._complete(run_id, answer_key, answer)
-        except BaseException as error:
-            self._fail(run_id, answer_key, error)
-            raise
-        return RunResult(transitions=tuple(transitions), answer=answer, final_state=state, forced_stop=forced_stop)
+                    selected=self.policy(state,legal)
+                    if selected not in legal:raise InvalidPolicyActionError("policy selected action outside legal tuple")
+                tr=self.environment.step(state,selected);self._complete(run_id,key,tr)
+            except BaseException as error:self._fail(run_id,key,error);raise
+            trs.append(tr);state=tr.next_state
+            if tr.terminal:return self._answer(state,trs,run_id,forced)
+        raise RuntimeError("runner exceeded transition bound")

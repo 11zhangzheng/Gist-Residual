@@ -34,7 +34,7 @@ class FrozenAnswerer:
     def _ordered(evidence: Sequence[EvidenceItem]) -> tuple[EvidenceItem, ...]:
         return tuple(sorted(
             evidence,
-            key=lambda item: (item.start_sec, item.acquisition_step, item.event_id, item.fidelity_level.value),
+            key=lambda item: (item.start_sec, item.acquisition_step, item.event_id, item.fidelity_level.value, item.content, item.attachments, item.score),
         ))
 
     @classmethod
@@ -52,7 +52,7 @@ class FrozenAnswerer:
             for item in cls._ordered(evidence)
         ]
         return (
-            f"Question:\n{question}\n"
+            f"Question:\n{json.dumps(question, ensure_ascii=False, separators=(',', ':'))}\n"
             f"Options:\n{json.dumps(normalized_options, ensure_ascii=False, separators=(',', ':'))}\n"
             f"Evidence:\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n"
             "Answer:\n"

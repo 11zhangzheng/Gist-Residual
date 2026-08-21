@@ -61,7 +61,7 @@ def test_answerer_rejects_empty_adapter_response() -> None:
 def test_runner_records_normal_stop_and_forced_stop_with_at_most_five_transitions(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs.duckdb")
     answerer = FrozenAnswerer(lambda prompt: "A")
-    normal = AgentRunner(_environment(), lambda state, legal: legal[-1], answerer, run_store=store, artifact_dir=tmp_path, worker_id="worker")
+    normal = AgentRunner(_environment(), lambda state, legal: next(action for action in legal if action.action_type is ActionType.SEARCH_GIST) if not state.candidate_event_ids else ActionInstance(ActionType.STOP, None, None), answerer, run_store=store, artifact_dir=tmp_path, worker_id="worker")
     normal_result = normal.run(_state(), run_id="normal")
     assert [transition.action.action_type for transition in normal_result.transitions] == [ActionType.SEARCH_GIST, ActionType.STOP]
     assert normal_result.forced_stop is False
@@ -78,7 +78,7 @@ def test_runner_records_normal_stop_and_forced_stop_with_at_most_five_transition
 def test_runner_marks_policy_and_provider_failures_as_failed(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs.duckdb")
     answerer = FrozenAnswerer(lambda prompt: "A")
-    illegal = AgentRunner(_environment(), lambda state, legal: ActionInstance(ActionType.STOP, None, None), answerer,
+    illegal = AgentRunner(_environment(), lambda state, legal: ActionInstance(ActionType.EXPAND_RESIDUAL, "e1", None), answerer,
                           run_store=store, artifact_dir=tmp_path, worker_id="worker")
     with pytest.raises(InvalidPolicyActionError):
         illegal.run(_state(), run_id="illegal")

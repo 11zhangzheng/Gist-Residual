@@ -27,6 +27,7 @@ class VisualCostMetadata(BaseModel):
     amortizable: bool
     reused: bool
     input_frames: int = Field(ge=0)
+    evidence_frame_count: int = Field(ge=0)
 
 
 class VisualObservation(BaseModel):
@@ -46,6 +47,7 @@ class VisualVerification(BaseModel):
     verification: str
     cache_key: str
     event_cache_key: str
+    event_cost_metadata: VisualCostMetadata
     cost_metadata: VisualCostMetadata
 
 
@@ -79,6 +81,23 @@ def _sample_evenly(paths: Sequence[str], count: int) -> tuple[str, ...]:
         raise ValueError(f"visual verification requires at least {count} source frames")
     indices = tuple(round(index * (len(paths) - 1) / (count - 1)) for index in range(count))
     return tuple(paths[index] for index in indices)
+
+
+def _source_event_projection(event: EventRecord) -> dict[str, object]:
+    """Stable offline event content, excluding online Residual state."""
+    return {
+        "video_id": event.video_id,
+        "event_id": event.event_id,
+        "start_sec": event.start_sec,
+        "end_sec": event.end_sec,
+        "asr_text": event.asr_text,
+        "keyframe_paths": event.keyframe_paths,
+        "visual_embedding": event.visual_embedding,
+        "text_embedding": event.text_embedding,
+        "gist_text": event.gist_text,
+        "raw_video_uri": event.raw_video_uri,
+        "memory_version": event.memory_version,
+    }
 
 
 class VisualVerifier:
@@ -118,7 +137,7 @@ class VisualVerifier:
         return self.cache.key(
             self._video_hash(event), (event.start_sec, event.end_sec), self.model_version,
             self.event_prompt,
-            {"namespace": "visual-event", "event": event.model_dump(mode="json"),
+            {"namespace": "visual-event", "source_event": _source_event_projection(event),
              "budget": budget, "frame_count": _FRAME_COUNTS[budget], "frames": frames,
              "sampler_version": self.sampler_version, "adapter_version": self.event_adapter_version},
         )
@@ -149,13 +168,13 @@ class VisualVerifier:
                 raise ValueError("cached visual observation identity does not match event")
             return observation.model_copy(update={"cost_metadata": VisualCostMetadata(
                 charge_scope="event_observation", cache_status="hit", amortizable=True,
-                reused=True, input_frames=_FRAME_COUNTS[checked_budget],
+                reused=True, input_frames=0, evidence_frame_count=len(observation.frames),
             )})
         generic = self.event_adapter(frames)
         observation = VisualObservation(
             event_id=event.event_id, budget=checked_budget, frames=frames,
             generic_observation=str(generic), cache_key=key,
-            cost_metadata=VisualCostMetadata(charge_scope="event_observation", cache_status="miss", amortizable=True, reused=False, input_frames=len(frames)),
+            cost_metadata=VisualCostMetadata(charge_scope="event_observation", cache_status="miss", amortizable=True, reused=False, input_frames=len(frames), evidence_frame_count=len(frames)),
         )
         self.cache.put(key, observation.model_dump(mode="json"))
         return observation
@@ -172,13 +191,14 @@ class VisualVerifier:
                 raise ValueError("cached visual verification identity does not match event")
             return result.model_copy(update={"cost_metadata": VisualCostMetadata(
                 charge_scope="question_verification", cache_status="hit", amortizable=False,
-                reused=True, input_frames=_FRAME_COUNTS[observation.budget],
-            )})
+                reused=True, input_frames=0, evidence_frame_count=len(observation.frames),
+            ), "event_cost_metadata": observation.cost_metadata})
         verification = self.question_adapter(observation.generic_observation, question, options)
         result = VisualVerification(
             event_id=event.event_id, budget=observation.budget, verification=str(verification),
             cache_key=key, event_cache_key=observation.cache_key,
-            cost_metadata=VisualCostMetadata(charge_scope="question_verification", cache_status="miss", amortizable=False, reused=False, input_frames=_FRAME_COUNTS[observation.budget]),
+            event_cost_metadata=observation.cost_metadata,
+            cost_metadata=VisualCostMetadata(charge_scope="question_verification", cache_status="miss", amortizable=False, reused=False, input_frames=0, evidence_frame_count=len(observation.frames)),
         )
         self.cache.put(key, result.model_dump(mode="json"))
         return result
@@ -200,6 +220,8 @@ def expand_context(events: Sequence[EventRecord], frontier: ContextFrontier) -> 
         raise ValueError("right_radius exceeds available context")
     if frontier.exhausted and (frontier.left_radius != max_left or frontier.right_radius != max_right):
         raise ValueError("exhausted ContextFrontier must cover all available context")
+    if not frontier.exhausted and frontier.left_radius == max_left and frontier.right_radius == max_right:
+        raise ValueError("fully covered ContextFrontier must be exhausted")
     if frontier.exhausted:
         return ContextExpansion(events=(), frontier=frontier)
     new_events: list[EventRecord] = []

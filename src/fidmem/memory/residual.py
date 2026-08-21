@@ -82,6 +82,23 @@ def _propositions(gist: str) -> tuple[str, ...]:
     return tuple(piece.strip() for piece in re.split(r"[;。！？!?\n.]", gist) if piece.strip())
 
 
+def _source_event_projection(event: EventRecord) -> dict[str, object]:
+    """Stable offline event content, excluding online fidelity upgrades."""
+    return {
+        "video_id": event.video_id,
+        "event_id": event.event_id,
+        "start_sec": event.start_sec,
+        "end_sec": event.end_sec,
+        "asr_text": event.asr_text,
+        "keyframe_paths": event.keyframe_paths,
+        "visual_embedding": event.visual_embedding,
+        "text_embedding": event.text_embedding,
+        "gist_text": event.gist_text,
+        "raw_video_uri": event.raw_video_uri,
+        "memory_version": event.memory_version,
+    }
+
+
 def _embedding(values: Sequence[float], *, label: str) -> tuple[float, ...]:
     vector = tuple(float(value) for value in values)
     if not vector:
@@ -142,7 +159,7 @@ class ResidualGenerator:
         prompt = self._prompt(gist)
         return self.cache.key(
             self._video_hash(event), (event.start_sec, event.end_sec), self.model_version, prompt,
-            {"namespace": "residual", "event": event.model_dump(mode="json"), "gist": gist,
+            {"namespace": "residual", "source_event": _source_event_projection(event), "gist": gist,
              "frames": frames, "frame_sampler_version": self.frame_sampler_version,
              "schema_version": self.schema_version, "normalizer_version": self.normalizer_version,
              "embedder_version": self.embedder_version},
@@ -160,10 +177,10 @@ class ResidualGenerator:
         gist_embeddings = tuple(_embedding(self.embedder(item), label="Gist") for item in gist_items)
         exact = gist_semantic = residual_semantic = 0
         accepted_embeddings: list[tuple[float, ...]] = []
+        seen_exact: set[str] = set()
         filtered: dict[str, tuple[str, ...]] = {}
         for field in RESIDUAL_FIELDS:
             kept: list[str] = []
-            seen_exact: set[str] = set()
             for item in getattr(payload, field):
                 normalized = _normalize(item)
                 if not normalized or normalized in gist_norms or normalized in seen_exact:

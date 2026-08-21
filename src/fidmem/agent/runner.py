@@ -40,7 +40,9 @@ class AgentRunner:
             item=self.run_store.item(run,self._key(step))
             if item is None or item.status!="complete":break
             tr=self._load_transition(item.output_uri)
-            if tr.state!=state or len(tr.state.action_history)!=step or tr.action not in self.environment.valid_actions(state) or tr.terminal!=(tr.action.action_type is ActionType.STOP):raise ResumeValidationError("transition artifact state or index mismatch")
+            if tr.state!=state or len(tr.state.action_history)!=step:raise ResumeValidationError("transition artifact state or index mismatch")
+            try: expected=self.environment.replay(tr.state,tr.action,tr.observation)
+            except Exception as error: raise ResumeValidationError("persisted transition fails pure replay") from error
             out.append(tr);state=tr.next_state
             if tr.terminal:break
         return out,state

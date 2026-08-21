@@ -143,6 +143,15 @@ class MemoryEnvironment:
             levels[a.event_id]=self._max(levels[a.event_id],incoming)
         step=len(state.action_history)+1; ev=tuple(x.model_copy(update={"start_sec":self._by_id[x.event_id].start_sec,"acquisition_step":step}) for x in o.evidence)
         return RouterState(question=state.question,options=state.options,evidence=state.evidence+ev,action_history=state.action_history+(a,),remaining_budget=state.remaining_budget-cost,candidate_event_ids=tuple(ids),candidate_fidelity_levels=levels,context_frontiers=fronts,cost_preference=state.cost_preference)
+    def replay(self,state:RouterState,a:ActionInstance,o:ActionObservation)->EnvironmentTransition:
+        """Purely revalidate a persisted transition; never invokes the executor."""
+        if self._terminal(state): raise TerminalStateError("cannot replay terminal")
+        if a not in self.valid_actions(state): raise IllegalActionError("replayed action is not legal")
+        self._validate(state,a,o); cost=self._charge(a,o.operation_metadata)
+        if cost>state.remaining_budget: raise IllegalActionError("replayed action exceeds budget")
+        nxt=self._reduce(state,a,o,cost)
+        return EnvironmentTransition(state=state,action=a,observation=o,next_state=nxt,step_cost=cost,operation_metadata=o.operation_metadata,terminal=a.action_type is ActionType.STOP)
+
     def step(self,state:RouterState,a:ActionInstance)->EnvironmentTransition:
         if self._terminal(state): raise TerminalStateError("cannot step terminal")
         if a not in self.valid_actions(state): raise IllegalActionError("action is not legal")

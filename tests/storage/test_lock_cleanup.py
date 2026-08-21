@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import msvcrt
 from pathlib import Path
 
 import pytest
@@ -9,9 +8,14 @@ from fidmem.storage import run_store
 
 
 class _FakeHandle:
-    def __init__(self, *, close_error: OSError | None = None) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.calls = calls
         self.close_error = close_error
-        self.closed = False
 
     def seek(self, offset: int, whence: int = 0) -> int:
         return 0
@@ -19,120 +23,136 @@ class _FakeHandle:
     def tell(self) -> int:
         return 1
 
-    def fileno(self) -> int:
-        return 1
-
     def close(self) -> None:
-        self.closed = True
+        self.calls.append("close")
         if self.close_error is not None:
             raise self.close_error
 
 
-def _inject_handle(
+class _FakeThreadLock:
+    def __init__(
+        self,
+        calls: list[str],
+        *,
+        release_error: BaseException | None = None,
+    ) -> None:
+        self.calls = calls
+        self.release_error = release_error
+
+    def acquire(self, *, timeout: float) -> bool:
+        self.calls.append("acquire")
+        return True
+
+    def release(self) -> None:
+        self.calls.append("release")
+        if self.release_error is not None:
+            raise self.release_error
+
+
+def _inject_cleanup(
     monkeypatch: pytest.MonkeyPatch,
-    handle: _FakeHandle,
-    *,
-    unlock_error: OSError | None,
     calls: list[str],
+    *,
+    unlock_error: BaseException | None = None,
+    close_error: BaseException | None = None,
+    release_error: BaseException | None = None,
 ) -> None:
+    handle = _FakeHandle(calls, close_error=close_error)
+    thread_lock = _FakeThreadLock(calls, release_error=release_error)
     monkeypatch.setattr(run_store, "open", lambda path, mode: handle, raising=False)
+    monkeypatch.setattr(run_store, "_thread_lock", lambda path: thread_lock)
+    monkeypatch.setattr(run_store, "_try_lock_handle", lambda current: calls.append("lock"))
 
-    def locking(fd: int, mode: int, count: int) -> None:
-        if mode == msvcrt.LK_UNLCK:
-            calls.append("unlock")
-            if unlock_error is not None:
-                raise unlock_error
-        else:
-            calls.append("lock")
+    def unlock(current: object) -> None:
+        calls.append("unlock")
+        if unlock_error is not None:
+            raise unlock_error
 
-    monkeypatch.setattr(msvcrt, "locking", locking)
+    monkeypatch.setattr(run_store, "_unlock_handle", unlock)
 
 
-def test_body_error_wins_over_unlock_error_and_close_is_still_attempted(
+@pytest.mark.parametrize(
+    "body_error",
+    [
+        ValueError("body failed"),
+        RuntimeError("body failed"),
+        KeyboardInterrupt("body failed"),
+        SystemExit("body failed"),
+    ],
+)
+def test_body_error_wins_over_all_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_error: BaseException,
+) -> None:
+    calls: list[str] = []
+    _inject_cleanup(
+        monkeypatch,
+        calls,
+        unlock_error=OSError("unlock failed"),
+        close_error=OSError("close failed"),
+        release_error=OSError("release failed"),
+    )
+
+    with pytest.raises(type(body_error)) as caught:
+        with run_store._claim_file_lock(tmp_path / "body.lock", 1):
+            raise body_error
+
+    assert caught.value is body_error
+    assert calls == ["acquire", "lock", "unlock", "close", "release"]
+
+
+def test_first_cleanup_error_wins_after_successful_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
-    handle = _FakeHandle()
-    _inject_handle(monkeypatch, handle, unlock_error=OSError("unlock failed"), calls=calls)
+    unlock_error = OSError("unlock failed")
+    _inject_cleanup(
+        monkeypatch,
+        calls,
+        unlock_error=unlock_error,
+        close_error=OSError("close failed"),
+        release_error=OSError("release failed"),
+    )
 
-    with pytest.raises(ValueError, match="body failed"):
-        with run_store._claim_file_lock(tmp_path / "body-unlock.lock", 1):
-            raise ValueError("body failed")
-
-    assert calls == ["lock", "unlock"]
-    assert handle.closed is True
-
-
-def test_unlock_error_propagates_after_successful_body_and_close_is_attempted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[str] = []
-    handle = _FakeHandle()
-    _inject_handle(monkeypatch, handle, unlock_error=OSError("unlock failed"), calls=calls)
-
-    with pytest.raises(OSError, match="unlock failed"):
-        with run_store._claim_file_lock(tmp_path / "unlock.lock", 1):
+    with pytest.raises(OSError) as caught:
+        with run_store._claim_file_lock(tmp_path / "all-cleanup.lock", 1):
             pass
 
-    assert calls == ["lock", "unlock"]
-    assert handle.closed is True
+    assert caught.value is unlock_error
+    assert calls == ["acquire", "lock", "unlock", "close", "release"]
 
 
-def test_body_error_wins_over_close_error(
+def test_close_error_wins_when_unlock_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
-    handle = _FakeHandle(close_error=OSError("close failed"))
-    _inject_handle(monkeypatch, handle, unlock_error=None, calls=calls)
+    close_error = OSError("close failed")
+    _inject_cleanup(
+        monkeypatch,
+        calls,
+        close_error=close_error,
+        release_error=OSError("release failed"),
+    )
 
-    with pytest.raises(ValueError, match="body failed"):
-        with run_store._claim_file_lock(tmp_path / "body-close.lock", 1):
-            raise ValueError("body failed")
-
-    assert calls == ["lock", "unlock"]
-    assert handle.closed is True
-
-
-def test_close_error_propagates_after_successful_body(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[str] = []
-    handle = _FakeHandle(close_error=OSError("close failed"))
-    _inject_handle(monkeypatch, handle, unlock_error=None, calls=calls)
-
-    with pytest.raises(OSError, match="close failed"):
+    with pytest.raises(OSError) as caught:
         with run_store._claim_file_lock(tmp_path / "close.lock", 1):
             pass
 
-    assert calls == ["lock", "unlock"]
-    assert handle.closed is True
+    assert caught.value is close_error
+    assert calls == ["acquire", "lock", "unlock", "close", "release"]
 
 
-def test_body_error_wins_when_unlock_and_close_both_fail(
+def test_release_error_propagates_when_it_is_the_only_cleanup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
-    handle = _FakeHandle(close_error=OSError("close failed"))
-    _inject_handle(monkeypatch, handle, unlock_error=OSError("unlock failed"), calls=calls)
+    release_error = OSError("release failed")
+    _inject_cleanup(monkeypatch, calls, release_error=release_error)
 
-    with pytest.raises(ValueError, match="body failed"):
-        with run_store._claim_file_lock(tmp_path / "body-both.lock", 1):
-            raise ValueError("body failed")
-
-    assert calls == ["lock", "unlock"]
-    assert handle.closed is True
-
-
-def test_first_cleanup_error_wins_when_unlock_and_close_both_fail(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[str] = []
-    handle = _FakeHandle(close_error=OSError("close failed"))
-    _inject_handle(monkeypatch, handle, unlock_error=OSError("unlock failed"), calls=calls)
-
-    with pytest.raises(OSError, match="unlock failed"):
-        with run_store._claim_file_lock(tmp_path / "both.lock", 1):
+    with pytest.raises(OSError) as caught:
+        with run_store._claim_file_lock(tmp_path / "release.lock", 1):
             pass
 
-    assert calls == ["lock", "unlock"]
-    assert handle.closed is True
+    assert caught.value is release_error
+    assert calls == ["acquire", "lock", "unlock", "close", "release"]

@@ -208,3 +208,46 @@ def test_legacy_unbound_answer_artifact_is_rejected_explicitly(tmp_path: Path) -
 
     with pytest.raises(ResumeValidationError, match="answer artifact"):
         runner.run(_state(), run_id="legacy")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gpu_seconds", float("inf")),
+        ("gpu_seconds", float("nan")),
+        ("wall_seconds", float("inf")),
+        ("wall_seconds", float("nan")),
+    ],
+)
+def test_runner_rejects_non_finite_nested_cost_records(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    store, artifact = _search_then_fail_artifact(tmp_path)
+    payload = json.loads(artifact.read_bytes())
+    cost_record = {
+        "operation": "search",
+        "gpu_seconds": 0.1,
+        "wall_seconds": 0.2,
+        "input_frames": 0,
+        "visual_tokens": 0,
+        "text_tokens": 1,
+        "peak_memory_bytes": 0,
+        "cache_status": "miss",
+        "device_name": "cpu",
+    }
+    for metadata in (
+        payload["observation"]["operation_metadata"][0],
+        payload["operation_metadata"][0],
+    ):
+        metadata["cost_record"] = dict(cost_record)
+        metadata["cost_record"][field] = value
+    artifact.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
+
+    runner = _runner(
+        tmp_path,
+        store,
+        lambda action, state: pytest.fail("executor must not run while restoring"),
+        lambda state, legal: pytest.fail("policy must not run while restoring"),
+    )
+    with pytest.raises(ResumeValidationError):
+        runner.run(_state(), run_id="tamper")

@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from fidmem.costs.tracker import CostRecord
 from fidmem.types import ActionInstance, ActionType, EventRecord, EvidenceItem, FidelityLevel, RouterState
 
@@ -29,6 +29,12 @@ class OperationMetadata(BaseModel):
     visual_tokens: int = Field(0, ge=0)
     text_tokens: int = Field(0, ge=0)
     cost_record: CostRecord | None = None
+
+    @model_validator(mode="after")
+    def nested_cost_record_must_be_valid(self) -> "OperationMetadata":
+        if self.cost_record is not None:
+            self.cost_record.validate_values()
+        return self
 class ActionObservation(BaseModel):
     model_config = ConfigDict(frozen=True)
     action_type: ActionType | None = None

@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from math import isfinite
 from time import perf_counter_ns
 from typing import Any
 _AUTO_CUDA = object()
@@ -18,6 +19,19 @@ class CostRecord:
     peak_memory_bytes: int
     cache_status: str
     device_name: str
+
+    def __post_init__(self) -> None:
+        self.validate_values()
+
+    def validate_values(self) -> None:
+        for field_name in ("gpu_seconds", "wall_seconds"):
+            value = getattr(self, field_name)
+            if not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        for field_name in ("input_frames", "visual_tokens", "text_tokens", "peak_memory_bytes"):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
 @dataclass
 class CostMeasurement:
     record: CostRecord | None = None

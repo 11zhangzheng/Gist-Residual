@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from threading import Lock
 import time
-from typing import Iterator, Literal
+from typing import BinaryIO, Iterator, Literal
 import duckdb
 
 _CLAIM_LOCKS_GUARD = Lock()
@@ -20,6 +20,30 @@ def _thread_lock(path: Path) -> Lock:
         return _CLAIM_LOCKS.setdefault(key, Lock())
 
 
+def _try_lock_handle(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_handle(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def _claim_file_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
     """Hold a per-path thread lock and a non-blocking cross-process file lock."""
@@ -30,8 +54,9 @@ def _claim_file_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
     if not thread_lock.acquire(timeout=timeout_seconds):
         raise TimeoutError("claim lock timeout")
 
-    handle = None
+    handle: BinaryIO | None = None
     file_locked = False
+    primary_error: BaseException | None = None
     try:
         handle = open(path, "a+b")
         handle.seek(0, os.SEEK_END)
@@ -41,15 +66,7 @@ def _claim_file_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
 
         while True:
             try:
-                handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _try_lock_handle(handle)
                 file_locked = True
                 break
             except OSError:
@@ -58,22 +75,29 @@ def _claim_file_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
                     raise TimeoutError("claim lock timeout")
                 time.sleep(min(0.01, remaining))
         yield
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        try:
-            if handle is not None and file_locked:
-                handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            if handle is not None:
+        cleanup_error: BaseException | None = None
+        if handle is not None and file_locked:
+            try:
+                _unlock_handle(handle)
+            except BaseException as error:
+                cleanup_error = error
+        if handle is not None:
+            try:
                 handle.close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        try:
             thread_lock.release()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
 @dataclass(frozen=True)
 class RunItem:
     run_id:str; item_key:str; status:Literal["pending","running","complete","failed"]; attempt:int

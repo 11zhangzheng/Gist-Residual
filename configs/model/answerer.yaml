@@ -1,0 +1,8 @@
+name: frozen-answerer
+version: v1
+temperature: 0.0
+prompt_fields:
+  - Question
+  - Options
+  - Evidence
+  - Answer

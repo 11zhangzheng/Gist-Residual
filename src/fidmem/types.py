@@ -82,6 +82,16 @@ class EvidenceItem(BaseModel):
     fidelity_level: FidelityLevel
     content: str
     score: float
+    start_sec: float = Field(default=0.0, ge=0)
+    acquisition_step: int = Field(default=0, ge=0)
+    attachments: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def attachments_must_belong_to_visual_evidence(self) -> "EvidenceItem":
+        if self.attachments and self.fidelity_level is not FidelityLevel.VISUAL:
+            raise ValueError("attachments are only permitted for visual evidence")
+        return self
+
 
 
 class ActionInstance(BaseModel):

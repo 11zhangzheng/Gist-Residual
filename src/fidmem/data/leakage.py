@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path
-import re
 from tempfile import TemporaryDirectory
 from typing import Callable, Iterable, Sequence
 
@@ -48,9 +47,10 @@ class LeakageReport:
     parquet_path: Path
 
 
-def _normalise_video_id(video_id: str) -> str:
-    stem = Path(video_id).stem.lower()
-    return re.sub(r"[^a-z0-9]+", "", stem)
+def _normalise_video_id(video_id: str) -> str | None:
+    stem = Path(video_id).stem.casefold()
+    normalised = "".join(character for character in stem if character.isalnum())
+    return normalised or None
 
 
 def _sha256(path: Path) -> str:
@@ -115,7 +115,10 @@ class LeakageAuditor:
         )
         with TemporaryDirectory(prefix="fidmem-leakage-") as directory:
             frames = sample_frames(asset.path, timestamps, directory)
-            return _centroid(self.embedding_provider(asset.path, frames))
+            embeddings = self.embedding_provider(asset.path, frames)
+            if len(embeddings) != self.sample_count:
+                raise ValueError("embedding provider must return exactly eight frame embeddings")
+            return _centroid(embeddings)
 
     def _write_parquet(self, findings: Sequence[LeakageFinding]) -> None:
         self.parquet_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,9 +158,9 @@ class LeakageAuditor:
 
         for train_asset in train_assets:
             for eval_asset in eval_assets:
-                if _normalise_video_id(train_asset.video_id) == _normalise_video_id(
-                    eval_asset.video_id
-                ):
+                train_id = _normalise_video_id(train_asset.video_id)
+                eval_id = _normalise_video_id(eval_asset.video_id)
+                if train_id is not None and train_id == eval_id:
                     findings.append(
                         LeakageFinding(train_asset.video_id, eval_asset.video_id, "id_duplicate", None)
                     )

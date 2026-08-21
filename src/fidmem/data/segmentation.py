@@ -65,17 +65,20 @@ def segment_timestamps(
     segments: list[Segment] = []
     start = 0.0
 
-    while duration - start > max_sec:
+    while start < duration:
         upper = min(start + max_sec, duration - min_sec)
         lower = start + min_sec
         valid_pauses = [time for time in pauses if lower <= time <= upper]
         if valid_pauses:
             end = valid_pauses[0]
-        else:
+        elif duration - start > max_sec:
             valid_shots = [time for time in shots_merged if lower <= time <= upper]
             end = valid_shots[-1] if valid_shots else upper
+        else:
+            break
         segments.append(Segment(start, end))
         start = end
 
-    segments.append(Segment(start, duration))
+    if start < duration:
+        segments.append(Segment(start, duration))
     return tuple(segments)

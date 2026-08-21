@@ -1,5 +1,7 @@
 from pathlib import Path
+import subprocess
 
+import fidmem.data.video as video
 import pytest
 
 from fidmem.data.video import probe_video, sample_frames, segment_video
@@ -25,3 +27,25 @@ def test_tiny_video_can_be_probed_sampled_and_segmented(tmp_path: Path) -> None:
 
     assert events[0].start_sec == 0.0
     assert events[-1].end_sec == pytest.approx(4.0, abs=0.1)
+
+
+def test_sample_frames_rejects_a_timestamp_beyond_video_duration(tmp_path: Path) -> None:
+    """A regression against accepting a seek past the decoded video timeline."""
+    with pytest.raises(ValueError, match="duration"):
+        sample_frames(FIXTURE, (4.1,), tmp_path / "frames")
+
+
+def test_sample_frames_rejects_a_successful_command_without_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regression against returning paths for frames ffmpeg did not create."""
+
+    def successful_command_without_output(
+        command: list[str],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(video, "_run", successful_command_without_output)
+
+    with pytest.raises(RuntimeError, match="no output"):
+        video.sample_frames(FIXTURE, (1.0,), tmp_path / "frames")

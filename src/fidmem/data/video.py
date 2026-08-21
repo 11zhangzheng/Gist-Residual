@@ -64,13 +64,14 @@ def sample_frames(
 ) -> tuple[Path, ...]:
     """Extract one JPEG per timestamp using stable, timestamped filenames."""
     video_path = Path(path)
+    duration_sec = probe_video(video_path).duration_sec
+    timestamps = tuple(float(timestamp) for timestamp in timestamps_sec)
+    if any(timestamp < 0 or timestamp >= duration_sec for timestamp in timestamps):
+        raise ValueError("frame timestamps must lie within the probed video duration")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     frames: list[Path] = []
-    for index, timestamp in enumerate(timestamps_sec):
-        seconds = float(timestamp)
-        if seconds < 0:
-            raise ValueError("frame timestamps must be non-negative")
+    for index, seconds in enumerate(timestamps):
         frame = destination / f"frame_{index:03d}_{round(seconds * 1000):010d}.jpg"
         _run(
             [
@@ -87,6 +88,10 @@ def sample_frames(
                 str(frame),
             ]
         )
+        if not frame.is_file() or frame.stat().st_size == 0:
+            raise RuntimeError(
+                f"frame extraction produced no output for timestamp {seconds:.6f}"
+            )
         frames.append(frame)
     return tuple(frames)
 

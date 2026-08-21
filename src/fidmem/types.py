@@ -76,7 +76,7 @@ class EventRecord(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     event_id: str
     fidelity_level: FidelityLevel
@@ -117,7 +117,7 @@ class ActionInstance(BaseModel):
 
 
 class RouterState(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     question: str
     options: tuple[str, ...]

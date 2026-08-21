@@ -1,5 +1,7 @@
 """Bounded execution of a masked memory policy with durable transition logs."""
 from __future__ import annotations
+import hashlib
+import json
 from pathlib import Path
 from typing import Protocol
 from pydantic import BaseModel, ConfigDict
@@ -14,6 +16,12 @@ class RouterPolicy(Protocol):
 class RunResult(BaseModel):
     model_config=ConfigDict(frozen=True)
     transitions:tuple[EnvironmentTransition,...]; answer:AnswerResult; final_state:RouterState; forced_stop:bool
+class _AnswerArtifact(BaseModel):
+    model_config=ConfigDict(frozen=True)
+    run_id:str; state_sha256:str; answer:AnswerResult
+def _state_sha256(state:RouterState)->str:
+    payload=json.dumps(state.model_dump(mode="json"),ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 class AgentRunner:
     def __init__(self,environment:MemoryEnvironment,policy:RouterPolicy,answerer:FrozenAnswerer,*,run_store:RunStore|None=None,artifact_dir:Path|str|None=None,worker_id:str="agent-runner")->None:
         self.environment=environment;self.policy=policy;self.answerer=answerer;self.run_store=run_store;self.artifact_dir=Path(artifact_dir) if artifact_dir is not None else None;self.worker_id=worker_id
@@ -53,9 +61,18 @@ class AgentRunner:
             item=self.run_store.item(run,key)
             if item is not None and item.status=="complete":
                 if item.output_uri is None or not Path(item.output_uri).is_file():raise ResumeValidationError("complete answer missing artifact")
-                return RunResult(transitions=tuple(trs),answer=AnswerResult.model_validate_json(Path(item.output_uri).read_text(encoding="utf-8")),final_state=state,forced_stop=forced)
+                try:
+                    artifact=_AnswerArtifact.model_validate_json(Path(item.output_uri).read_text(encoding="utf-8"))
+                except (OSError,ValueError) as error:
+                    raise ResumeValidationError("legacy or invalid answer artifact envelope") from error
+                if artifact.run_id!=run or artifact.state_sha256!=_state_sha256(state):
+                    raise ResumeValidationError("answer artifact run or final state mismatch")
+                return RunResult(transitions=tuple(trs),answer=artifact.answer,final_state=state,forced_stop=forced)
         self._claim(run,key)
-        try:answer=self.answerer.answer(state.question,state.options,state.evidence);self._complete(run,key,answer)
+        try:
+            answer=self.answerer.answer(state.question,state.options,state.evidence)
+            artifact=_AnswerArtifact(run_id=run,state_sha256=_state_sha256(state),answer=answer)
+            self._complete(run,key,artifact)
         except BaseException as error:self._fail(run,key,error);raise
         return RunResult(transitions=tuple(trs),answer=answer,final_state=state,forced_stop=forced)
     def run(self,initial_state:RouterState,*,run_id:str)->RunResult:

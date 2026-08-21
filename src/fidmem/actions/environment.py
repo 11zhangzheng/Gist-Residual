@@ -11,7 +11,7 @@ class IllegalActionError(ValueError): pass
 class ObservationValidationError(ValueError): pass
 
 class ActionCostTable(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
     search_gist: float = Field(1, ge=0); search_gist_hit: float = Field(0, ge=0)
     residual: float = Field(2, ge=0); residual_hit: float = Field(0, ge=0)
     context: float = Field(.5, ge=0); context_hit: float = Field(0, ge=0)
@@ -40,7 +40,7 @@ class ActionObservation(BaseModel):
     candidate_event_ids: tuple[str, ...] = ()
     operation_metadata: tuple[OperationMetadata, ...] = ()
 class EnvironmentTransition(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
     state: RouterState; action: ActionInstance; observation: ActionObservation; next_state: RouterState
     step_cost: float = Field(ge=0)
     operation_metadata: tuple[OperationMetadata, ...] = ()

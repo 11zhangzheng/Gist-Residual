@@ -43,6 +43,7 @@ class AgentRunner:
             if tr.state!=state or len(tr.state.action_history)!=step:raise ResumeValidationError("transition artifact state or index mismatch")
             try: expected=self.environment.replay(tr.state,tr.action,tr.observation)
             except Exception as error: raise ResumeValidationError("persisted transition fails pure replay") from error
+            if tr != expected: raise ResumeValidationError("persisted transition differs from pure replay")
             out.append(tr);state=tr.next_state
             if tr.terminal:break
         return out,state

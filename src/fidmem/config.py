@@ -36,8 +36,8 @@ class VisualConfig(BaseModel):
 class BudgetConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    a800_gpu_hours: float = Field(ge=0)
-    v100_gpu_hours: float = Field(ge=0)
+    a800_gpu_hours: float = Field(ge=0, le=800)
+    v100_gpu_hours: float = Field(ge=0, le=200)
 
 
 class AppConfig(BaseModel):

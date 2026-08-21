@@ -28,3 +28,24 @@ def test_app_config_rejects_high_frame_count_below_low_frame_count() -> None:
                 "budget": {"a800_gpu_hours": 800, "v100_gpu_hours": 200},
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("budget_field", "excessive_hours"),
+    (("a800_gpu_hours", 801), ("v100_gpu_hours", 201)),
+)
+def test_app_config_rejects_gpu_budget_above_hardware_cap(
+    budget_field: str, excessive_hours: int
+) -> None:
+    budget = {"a800_gpu_hours": 800, "v100_gpu_hours": 200}
+    budget[budget_field] = excessive_hours
+
+    with pytest.raises(ValidationError, match=budget_field):
+        AppConfig.model_validate(
+            {
+                "retrieval": {"top_k": 5},
+                "oracle": {"max_depth": 5, "beam_size": 8},
+                "visual": {"low_frames": 12, "high_frames": 32},
+                "budget": budget,
+            }
+        )

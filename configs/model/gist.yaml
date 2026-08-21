@@ -2,6 +2,7 @@ main:
   mode: main
   namespace: gist
   summary_model: text-1b-2b
+  tokenizer: gist-tokenizer-v1
   summary_max_tokens: 40
   visual_encoder: frozen-cheap-encoder
   visual_frame_count: 4
@@ -12,7 +13,9 @@ gist_plus:
   mode: gist_plus
   namespace: gist_plus
   summary_model: text-1b-2b
+  tokenizer: gist-tokenizer-v1
   summary_max_tokens: 40
+  visual_summary_tokens: 12
   visual_encoder: frozen-cheap-encoder
   visual_frame_count: 4
   visual_resolution: [224, 224]

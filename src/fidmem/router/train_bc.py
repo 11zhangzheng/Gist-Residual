@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import random
@@ -20,7 +21,19 @@ from omegaconf import OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor, nn
 
-from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization
+from fidmem.actions.environment import ActionObservation, EnvironmentTransition
+from fidmem.agent.answerer import FrozenAnswerer
+from fidmem.data.longroute import (
+    BUILDER_VERSION,
+    MANIFEST_VERSION,
+    DatasetManifest,
+    LongRouteExample,
+    SourceManifestProvenance,
+    SourceVideoProvenance,
+    VirtualSegment,
+)
+from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
+from fidmem.oracle.search import OraclePath
 from fidmem.types import (
     ActionInstance,
     ActionType,
@@ -30,16 +43,19 @@ from fidmem.types import (
 )
 
 from .dataset import (
+    FrozenComponentIdentity,
     HFTokenizerAdapter,
     OracleBCDataset,
-    OracleBCRecord,
-    OracleRecordProvenance,
     RouterBatch,
     RouterCollator,
     SplitManifest,
+    TestByteTokenizer,
     TextTokenizer,
+    TokenizerIdentity,
     build_grouped_split,
     load_oracle_records,
+    materialize_oracle_record,
+    seal_sufficiency_label,
 )
 from .model import (
     EncoderIdentity,
@@ -159,6 +175,54 @@ class TrainResult:
     split_manifest: SplitManifest
     seed: int
     dataset_identity: str
+
+
+class RuntimeIdentity(BaseModel):
+    """Software and deterministic backend state required for exact resume."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    torch_version: str = Field(min_length=1)
+    transformers_version: str = Field(min_length=1)
+    device: Literal["cpu", "cuda"]
+    deterministic_algorithms: bool
+    cudnn_benchmark: bool
+    cudnn_deterministic: bool
+    matmul_allow_tf32: bool
+    cudnn_allow_tf32: bool
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def current_runtime_identity(
+    device: Literal["cpu", "cuda"],
+) -> RuntimeIdentity:
+    return RuntimeIdentity(
+        torch_version=torch.__version__,
+        transformers_version=_package_version("transformers"),
+        device=device,
+        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+        cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
+        cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+        matmul_allow_tf32=bool(torch.backends.cuda.matmul.allow_tf32),
+        cudnn_allow_tf32=bool(torch.backends.cudnn.allow_tf32),
+    )
+
+
+def configure_deterministic_runtime(
+    device: Literal["cpu", "cuda"],
+) -> RuntimeIdentity:
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    return current_runtime_identity(device)
 
 
 def behavior_cloning_loss(
@@ -481,7 +545,10 @@ def load_checkpoint(
     expected_dataset_identity: str,
     expected_split_manifest: SplitManifest,
     expected_encoder_identity: EncoderIdentity,
+    expected_tokenizer_identity: TokenizerIdentity,
     expected_loss_profile: LossProfile,
+    expected_runtime_identity: RuntimeIdentity,
+    expected_git_commit: str,
     expected_device: Literal["cpu", "cuda"],
 ) -> dict[str, object]:
     source = Path(path)
@@ -505,12 +572,14 @@ def load_checkpoint(
         "dataset_identity",
         "split_manifest",
         "encoder_identity",
+        "tokenizer_identity",
         "loss_profile",
+        "runtime_identity",
         "device",
         "canonical_config",
         "checkpoint_self_hash",
     }
-    if set(payload) != required or payload["schema_version"] != 2:
+    if set(payload) != required or payload["schema_version"] != 3:
         raise ValueError("checkpoint schema is invalid")
     self_hash = payload["checkpoint_self_hash"]
     if (
@@ -538,15 +607,33 @@ def load_checkpoint(
     )
     if payload["encoder_identity"] != expected_encoder.model_dump(mode="json"):
         raise ValueError("checkpoint encoder identity does not match")
+    expected_tokenizer = TokenizerIdentity.model_validate(
+        expected_tokenizer_identity.model_dump(mode="python")
+    )
+    if payload["tokenizer_identity"] != expected_tokenizer.model_dump(mode="json"):
+        raise ValueError("checkpoint tokenizer identity does not match")
     expected_profile = LossProfile.model_validate(
         expected_loss_profile.model_dump(mode="python")
     )
     if payload["loss_profile"] != expected_profile.model_dump(mode="json"):
         raise ValueError("checkpoint loss profile does not match")
+    expected_runtime = RuntimeIdentity.model_validate(
+        expected_runtime_identity.model_dump(mode="python")
+    )
+    if payload["runtime_identity"] != expected_runtime.model_dump(mode="json"):
+        raise ValueError("checkpoint runtime identity does not match")
+    if expected_runtime != current_runtime_identity(expected_device):
+        raise ValueError("current runtime does not match expected runtime identity")
     if payload["device"] != expected_device:
         raise ValueError("checkpoint device does not match")
+    if not isinstance(expected_git_commit, str) or not expected_git_commit:
+        raise ValueError("expected git commit is required")
     if not isinstance(payload["git_commit"], str) or not payload["git_commit"]:
         raise ValueError("checkpoint git commit is invalid")
+    if payload["git_commit"] != expected_git_commit:
+        raise ValueError(
+            "checkpoint git commit does not match; cross-commit exact resume is forbidden"
+        )
     if (
         not isinstance(payload["step"], int)
         or isinstance(payload["step"], bool)
@@ -579,20 +666,25 @@ def _checkpoint_payload(
     config_hash: str,
     dataset: OracleBCDataset,
     split_manifest: SplitManifest,
+    tokenizer_identity: TokenizerIdentity,
+    runtime_identity: RuntimeIdentity,
+    git_commit: str,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
         "rng_state": _capture_rng(config.device),
-        "git_commit": _git_commit(),
+        "git_commit": git_commit,
         "config_hash": config_hash,
         "dataset_identity": dataset.identity,
         "split_manifest": split_manifest.model_dump(mode="json"),
         "encoder_identity": model.config.encoder.model_dump(mode="json"),
+        "tokenizer_identity": tokenizer_identity.model_dump(mode="json"),
         "loss_profile": config.loss_profile.model_dump(mode="json"),
+        "runtime_identity": runtime_identity.model_dump(mode="json"),
         "device": config.device,
         "canonical_config": _config_payload(model, config),
     }
@@ -628,8 +720,20 @@ def train_bc(
 ) -> TrainResult:
     if config.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    if model.config.encoder.kind == "pretrained" and tokenizer is None:
-        raise ValueError("pretrained Router training requires its pinned tokenizer")
+    runtime_identity = configure_deterministic_runtime(config.device)
+    if tokenizer is None:
+        if model.config.encoder.kind == "pretrained":
+            raise ValueError("pretrained Router training requires its pinned tokenizer")
+        tokenizer = TestByteTokenizer(model.config.encoder.tokenizer.model_id)
+    raw_tokenizer_identity = getattr(tokenizer, "identity", None)
+    if not isinstance(raw_tokenizer_identity, TokenizerIdentity):
+        raise ValueError("tokenizer identity must be a structured actual identity")
+    tokenizer_identity = TokenizerIdentity.model_validate(
+        raw_tokenizer_identity.model_dump(mode="python")
+    )
+    if tokenizer_identity != model.config.encoder.tokenizer:
+        raise ValueError("tokenizer identity does not match encoder config")
+    git_commit = _git_commit()
     device = torch.device(config.device)
     checkpoint_path = config.validated_checkpoint_path()
     split_manifest = build_grouped_split(
@@ -663,7 +767,10 @@ def train_bc(
             expected_dataset_identity=dataset.identity,
             expected_split_manifest=split_manifest,
             expected_encoder_identity=model.config.encoder,
+            expected_tokenizer_identity=tokenizer_identity,
             expected_loss_profile=config.loss_profile,
+            expected_runtime_identity=runtime_identity,
+            expected_git_commit=git_commit,
             expected_device=config.device,
         )
         model.load_state_dict(checkpoint["model"], strict=True)  # type: ignore[arg-type]
@@ -708,6 +815,9 @@ def train_bc(
                     config_hash=config_hash,
                     dataset=dataset,
                     split_manifest=split_manifest,
+                    tokenizer_identity=tokenizer_identity,
+                    runtime_identity=runtime_identity,
+                    git_commit=git_commit,
                 ),
             )
     model.eval()
@@ -790,12 +900,23 @@ class TrainFileConfig(BaseModel):
 
 
 def _smoke_dataset(size: int) -> OracleBCDataset:
-    records = []
     normalization = CostNormalization(
         constant=10.0,
         sample_count=size,
         source_split="train",
     )
+    prepared: list[
+        tuple[
+            RouterState,
+            tuple[ActionInstance, ...],
+            ActionInstance,
+            LongRouteExample,
+        ]
+    ] = []
+    videos: list[SourceVideoProvenance] = []
+    examples: list[LongRouteExample] = []
+    asset_hashes: dict[str, str] = {}
+    group_assignment: dict[str, Literal["train"]] = {}
     for index in range(size):
         video_id = f"smoke-v{index:04d}"
         target_event = "event-a" if index % 2 else "event-b"
@@ -805,52 +926,149 @@ def _smoke_dataset(size: int) -> OracleBCDataset:
             for event_id in (candidates if index % 3 else tuple(reversed(candidates)))
         ) + (ActionInstance(ActionType.STOP, None, None),)
         target_action = ActionInstance(ActionType.EXPAND_RESIDUAL, target_event, None)
-        provenance = OracleRecordProvenance(
-            dataset_manifest_hash="a" * 64,
-            source_manifest_hash="b" * 64,
-            source_split="train",
-            video_group_id=video_id,
-            longroute_example_id=f"smoke-example-{index:04d}",
-            normalization_manifest_hash="c" * 64,
-            normalization=normalization,
-            preference_set_hash="d" * 64,
-            preference_values=COST_PREFERENCES,
-            selected_preference=0.3,
-            oracle_utility=1.0,
-            optimal_action_tie_count=1,
+        state = RouterState(
+            question="Which candidate matches the acquired evidence?",
+            options=("candidate A", "candidate B"),
+            evidence=(
+                EvidenceItem(
+                    event_id=target_event,
+                    fidelity_level=FidelityLevel.GIST,
+                    content="the acquired evidence",
+                    score=1.0,
+                ),
+            ),
+            action_history=(),
+            remaining_budget=10,
+            candidate_event_ids=candidates,
+            candidate_fidelity_levels={
+                event_id: FidelityLevel.GIST for event_id in candidates
+            },
+            context_frontiers={event_id: (0, 0) for event_id in candidates},
+            cost_preference=0.3,
+        )
+        segments = tuple(
+            VirtualSegment(
+                source_video_id=video_id,
+                event_id=event_id,
+                source_start_sec=position * 300,
+                source_end_sec=(position + 1) * 300,
+                global_start_sec=position * 300,
+                global_end_sec=(position + 1) * 300,
+            )
+            for position, event_id in enumerate(candidates)
+        )
+        example = LongRouteExample(
+            question_id=f"smoke-q{index:04d}",
+            split="train",
+            question=state.question,
+            options=state.options,
+            answer=state.options[0],
+            target_source_video_id=video_id,
+            target_event_id=f"{video_id}:{target_event}",
+            target_position=candidates.index(target_event),
+            supporting_event_ids=(f"{video_id}:{target_event}",),
+            template="single_event",
+            segments=segments,
+            duration_sec=600,
+        )
+        asset_hash = hashlib.sha256(
+            f"smoke-asset:{video_id}".encode("utf-8")
+        ).hexdigest()
+        videos.append(
+            SourceVideoProvenance(
+                video_id=video_id,
+                source_uri=f"file:///{video_id}.mp4",
+                content_sha256=asset_hash,
+            )
+        )
+        examples.append(example)
+        asset_hashes[video_id] = asset_hash
+        group_assignment[video_id] = "train"
+        prepared.append((state, actions, target_action, example))
+    source_hash = hashlib.sha256(
+        _canonical_json(
+            tuple(video.model_dump(mode="json") for video in videos)
+        ).encode("utf-8")
+    ).hexdigest()
+    source = SourceManifestProvenance(
+        identity="fidmem-smoke-source",
+        dataset_name="fidmem-smoke",
+        dataset_version="v1",
+        source_uri="file:///fidmem-smoke-source.json",
+        license="test-only",
+        canonical_sha256=source_hash,
+        videos=tuple(videos),
+    )
+    manifest = DatasetManifest(
+        manifest_version=MANIFEST_VERSION,
+        schema_version=MANIFEST_VERSION,
+        builder_version=BUILDER_VERSION,
+        seed=0,
+        source_manifest_hashes={source.identity: source_hash},
+        source_manifests=(source,),
+        builder_config={"smoke_dataset_size": size},
+        group_assignment=group_assignment,
+        split_statistics={"train": size, "dev": 0},
+        multi_event_ratio=0,
+        leakage_audit_uri="generation/leakage.json",
+        leakage_parquet_uri="generation/leakage.parquet",
+        examples=tuple(examples),
+        asset_sha256s=asset_hashes,
+        generation_uri="generation",
+    )
+    records = []
+    for state, actions, target_action, example in prepared:
+        next_state = state.model_copy(update={"action_history": (target_action,)})
+        transition = EnvironmentTransition(
+            state=state,
+            action=target_action,
+            observation=ActionObservation(
+                action_type=target_action.action_type,
+                target_event_id=target_action.event_id,
+            ),
+            next_state=next_state,
+            step_cost=10,
+        )
+        labels = tuple(
+            PreferenceLabel(
+                cost_preference=preference,
+                utility=1 - preference,
+                optimal_paths=(
+                    OraclePath(
+                        transitions=(transition,),
+                        answer=example.answer,
+                        answer_score=1,
+                        correct=True,
+                        total_cost=10,
+                        utility=1 - preference,
+                    ),
+                ),
+            )
+            for preference in COST_PREFERENCES
+        )
+        artifact = seal_sufficiency_label(
+            state=state,
+            question_id=example.question_id,
+            gold_answer=example.answer,
+            answerer=FrozenAnswerer(lambda _: "__incorrect__"),
+            answerer_identity=FrozenComponentIdentity(
+                implementation="fidmem.smoke-answerer.v1",
+                model_id="deterministic-wrong-answer",
+                revision="1",
+                artifact_sha256=hashlib.sha256(b"fidmem-smoke-answerer-v1").hexdigest(),
+            ),
         )
         records.append(
-            OracleBCRecord(
-                record_id=f"smoke-r{index:04d}",
-                video_id=video_id,
-                question_id=f"smoke-q{index:04d}",
+            materialize_oracle_record(
                 observation_snapshot_id="synthetic-cached-observation-v1",
-                provenance=provenance,
-                state=RouterState(
-                    question="Which candidate matches the acquired evidence?",
-                    options=("candidate A", "candidate B"),
-                    evidence=(
-                        EvidenceItem(
-                            event_id=target_event,
-                            fidelity_level=FidelityLevel.GIST,
-                            content="the acquired evidence",
-                            score=1.0,
-                        ),
-                    ),
-                    action_history=(),
-                    remaining_budget=10,
-                    candidate_event_ids=candidates,
-                    candidate_fidelity_levels={
-                        event_id: FidelityLevel.GIST for event_id in candidates
-                    },
-                    context_frontiers={event_id: (0, 0) for event_id in candidates},
-                    cost_preference=0.3,
-                ),
+                state=state,
                 action_instances=actions,
                 legal_action_mask=(True, True, True),
-                target_action_index=actions.index(target_action),
-                sufficiency_target=0,
-                cost_to_go=1.0,
+                preference_labels=labels,
+                normalization=normalization,
+                manifest=manifest,
+                example=example,
+                sufficiency_artifact=artifact,
             )
         )
     return OracleBCDataset(records)
@@ -892,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
     def model_factory() -> MemoryRouter | tuple[MemoryRouter, TextTokenizer]:
         if model_config.encoder.kind == "pretrained":
             encoder, raw_tokenizer = ProductionEncoderFactory.load(model_config.encoder)
-            tokenizer = HFTokenizerAdapter(model_config.encoder, raw_tokenizer)
+            tokenizer = HFTokenizerAdapter(raw_tokenizer)
             return MemoryRouter(model_config, text_encoder=encoder), tokenizer
         return MemoryRouter(model_config)
 

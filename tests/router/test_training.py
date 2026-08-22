@@ -5,11 +5,9 @@ from pathlib import Path
 
 import pytest
 import torch
-from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization
 from fidmem.router.dataset import (
     OracleBCDataset,
     OracleBCRecord,
-    OracleRecordProvenance,
     build_grouped_split,
     load_oracle_records,
     write_oracle_records,
@@ -17,6 +15,7 @@ from fidmem.router.dataset import (
 from fidmem.router.model import MemoryRouter, RouterModelConfig, RouterOutput
 from fidmem.router.train_bc import (
     LossProfile,
+    RuntimeIdentity,
     TrainConfig,
     behavior_cloning_loss,
     load_checkpoint,
@@ -30,6 +29,7 @@ from fidmem.types import (
     RouterState,
 )
 from pydantic import ValidationError
+from tests.router._fixtures import authoritative_record
 
 
 def _record(index: int, *, video_id: str | None = None) -> OracleBCRecord:
@@ -41,53 +41,36 @@ def _record(index: int, *, video_id: str | None = None) -> OracleBCRecord:
         ActionInstance(ActionType.EXPAND_RESIDUAL, candidates[1], None),
         ActionInstance(ActionType.STOP, None, None),
     )
-    provenance = OracleRecordProvenance(
-        dataset_manifest_hash="a" * 64,
-        source_manifest_hash="b" * 64,
-        source_split="train",
-        video_group_id=resolved_video_id,
-        longroute_example_id=f"example-{index:03d}",
-        normalization_manifest_hash="c" * 64,
-        normalization=CostNormalization(
-            constant=10.0, sample_count=32, source_split="train"
-        ),
-        preference_set_hash="d" * 64,
-        preference_values=COST_PREFERENCES,
-        selected_preference=0.3,
-        oracle_utility=1.0,
-        optimal_action_tie_count=1,
-    )
-    return OracleBCRecord(
-        record_id=f"r{index:03d}",
-        video_id=resolved_video_id,
-        question_id=f"q{index:03d}",
-        observation_snapshot_id="cached-observations-v1",
-        provenance=provenance,
-        state=RouterState(
-            question="Which candidate matches the acquired evidence?",
-            options=("candidate A", "candidate B"),
-            evidence=(
-                EvidenceItem(
-                    event_id=target_event,
-                    fidelity_level=FidelityLevel.GIST,
-                    content="the acquired evidence",
-                    score=1.0,
-                ),
+    state = RouterState(
+        question="Which candidate matches the acquired evidence?",
+        options=("candidate A", "candidate B"),
+        evidence=(
+            EvidenceItem(
+                event_id=target_event,
+                fidelity_level=FidelityLevel.GIST,
+                content="the acquired evidence",
+                score=1.0,
             ),
-            action_history=(),
-            remaining_budget=10,
-            candidate_event_ids=candidates,
-            candidate_fidelity_levels={
-                event_id: FidelityLevel.GIST for event_id in candidates
-            },
-            context_frontiers={event_id: (0, 0) for event_id in candidates},
-            cost_preference=0.3,
         ),
-        action_instances=actions,
+        action_history=(),
+        remaining_budget=10,
+        candidate_event_ids=candidates,
+        candidate_fidelity_levels={
+            event_id: FidelityLevel.GIST for event_id in candidates
+        },
+        context_frontiers={event_id: (0, 0) for event_id in candidates},
+        cost_preference=0.3,
+    )
+    return authoritative_record(
+        state=state,
+        actions=actions,
         legal_action_mask=(True, True, True),
         target_action_index=index % 2,
+        video_id=resolved_video_id,
+        question_id=f"q{index:03d}",
         sufficiency_target=0,
         cost_to_go=1.0,
+        observation_snapshot_id="cached-observations-v1",
     )
 
 
@@ -145,9 +128,9 @@ def test_dataset_round_trip_and_grouped_split_never_crosses_video_boundaries(
     write_oracle_records(path, records)
 
     loaded = load_oracle_records(path)
-    first = build_grouped_split(loaded, seed=123, train_fraction=0.7, dev_fraction=0.2)
+    first = build_grouped_split(loaded, seed=123, train_fraction=1, dev_fraction=0)
     second = build_grouped_split(
-        tuple(reversed(loaded)), seed=123, train_fraction=0.7, dev_fraction=0.2
+        tuple(reversed(loaded)), seed=123, train_fraction=1, dev_fraction=0
     )
 
     assert loaded == records
@@ -173,10 +156,14 @@ def test_jsonl_loader_fails_on_extra_fields_and_does_not_accept_pickle(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "bad.jsonl"
-    payload = _record(0).model_dump(mode="json")
+    write_oracle_records(path, (_record(0),))
+    payload = json.loads(path.read_text(encoding="utf-8"))
     payload["unexpected"] = "not allowed"
-    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-    with pytest.raises(ValidationError):
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="digest"):
         load_oracle_records(path)
 
     unsafe = tmp_path / "oracle.pkl"
@@ -282,6 +269,8 @@ def test_checkpoint_manifest_contains_weights_config_split_and_all_rng_states(
     model = MemoryRouter(_model_config())
     config = _train_config(tmp_path / "manifest.pt", max_steps=1)
     result = train_bc(model, dataset, config)
+    saved = torch.load(result.checkpoint_path, weights_only=True)
+    runtime = RuntimeIdentity.model_validate(saved["runtime_identity"])
 
     checkpoint = load_checkpoint(
         result.checkpoint_path,
@@ -289,7 +278,10 @@ def test_checkpoint_manifest_contains_weights_config_split_and_all_rng_states(
         expected_dataset_identity=dataset.identity,
         expected_split_manifest=result.split_manifest,
         expected_encoder_identity=model.config.encoder,
+        expected_tokenizer_identity=model.config.encoder.tokenizer,
         expected_loss_profile=config.loss_profile,
+        expected_runtime_identity=runtime,
+        expected_git_commit=saved["git_commit"],
         expected_device="cpu",
     )
     assert checkpoint["step"] == 1

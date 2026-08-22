@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization
-from fidmem.router.dataset import (
-    OracleBCRecord,
-    OracleRecordProvenance,
-    RouterCollator,
-)
+from fidmem.router.dataset import OracleBCRecord, RouterCollator
+from tests.router._fixtures import authoritative_record
 from fidmem.router.model import (
     EncoderIdentity,
     MemoryRouter,
@@ -23,7 +19,12 @@ from fidmem.types import (
 )
 
 
-def _record(index: int, *, with_candidates: bool = True) -> OracleBCRecord:
+def _record(
+    index: int,
+    *,
+    with_candidates: bool = True,
+    question: str | None = None,
+) -> OracleBCRecord:
     evidence = (
         (
             EvidenceItem(
@@ -39,7 +40,7 @@ def _record(index: int, *, with_candidates: bool = True) -> OracleBCRecord:
     )
     candidates = (f"e{index}",) if with_candidates else ()
     state = RouterState(
-        question=f"What color is bottle {index}?",
+        question=question or f"What color is bottle {index}?",
         options=("blue", "red"),
         evidence=evidence,
         action_history=(ActionInstance(ActionType.SEARCH_GIST, None, None),),
@@ -66,34 +67,16 @@ def _record(index: int, *, with_candidates: bool = True) -> OracleBCRecord:
         )
     )
     video_id = f"v{index // 2}"
-    provenance = OracleRecordProvenance(
-        dataset_manifest_hash="a" * 64,
-        source_manifest_hash="b" * 64,
-        source_split="train",
-        video_group_id=video_id,
-        longroute_example_id=f"example-{index}",
-        normalization_manifest_hash="c" * 64,
-        normalization=CostNormalization(
-            constant=10.0, sample_count=2, source_split="train"
-        ),
-        preference_set_hash="d" * 64,
-        preference_values=COST_PREFERENCES,
-        selected_preference=0.3,
-        oracle_utility=1.0,
-        optimal_action_tie_count=1,
-    )
-    return OracleBCRecord(
-        record_id=f"r{index}",
-        video_id=video_id,
-        question_id=f"q{index}",
-        observation_snapshot_id="cached-graph-sha256",
-        provenance=provenance,
+    return authoritative_record(
         state=state,
-        action_instances=actions,
+        actions=actions,
         legal_action_mask=(False, True, True) if with_candidates else (True, True),
         target_action_index=1 if with_candidates else 0,
+        video_id=video_id,
+        question_id=f"q{index}",
         sufficiency_target=1 if index % 2 else 0,
         cost_to_go=float(index % 4),
+        observation_snapshot_id="cached-graph-sha256",
     )
 
 
@@ -155,9 +138,7 @@ def test_forward_fails_closed_when_a_batch_row_has_no_legal_action() -> None:
 
 
 def test_collator_rejects_overlong_text_instead_of_silently_truncating() -> None:
-    record = _record(0).model_copy(
-        update={"state": _record(0).state.model_copy(update={"question": "x" * 129})}
-    )
+    record = _record(0, question="x" * 129)
 
     with pytest.raises(ValueError, match="question.*128"):
         RouterCollator(max_question_bytes=128, max_item_bytes=96)([record])

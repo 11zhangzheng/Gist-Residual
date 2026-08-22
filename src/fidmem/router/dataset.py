@@ -15,7 +15,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 
 import duckdb
 import torch
@@ -30,6 +30,8 @@ from pydantic import (
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from fidmem.agent.answerer import FrozenAnswerer
+from fidmem.data.longroute import DatasetManifest, LongRouteExample
 from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
 from fidmem.types import ActionInstance, ActionType, FidelityLevel, RouterState
 
@@ -49,15 +51,55 @@ def _canonical_json(value: object) -> str:
     )
 
 
+class TokenizerIdentity(BaseModel):
+    """Actual tokenizer implementation plus immutable vocabulary artifacts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    implementation: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+    vocab_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @classmethod
+    def byte_identity(cls, model_id: str) -> "TokenizerIdentity":
+        vocabulary = {"<pad>": 0} | {
+            f"byte:{value:02x}": value + 1 for value in range(256)
+        }
+        vocab_sha256 = hashlib.sha256(
+            _canonical_json(vocabulary).encode("utf-8")
+        ).hexdigest()
+        artifact = {
+            "implementation": "fidmem.byte-utf8.v1",
+            "revision": "offline-byte-v1",
+            "vocab_sha256": vocab_sha256,
+            "encoding": "utf-8-bytes-plus-one",
+            "padding_id": 0,
+        }
+        return cls(
+            implementation="fidmem.byte-utf8.v1",
+            model_id=model_id,
+            revision="offline-byte-v1",
+            vocab_sha256=vocab_sha256,
+            artifact_sha256=hashlib.sha256(
+                _canonical_json(artifact).encode("utf-8")
+            ).hexdigest(),
+        )
+
+
 class TextTokenizer(Protocol):
-    identity: object
+    identity: TokenizerIdentity
 
     def encode(self, text: str, *, maximum: int, label: str) -> list[int]:
         ...
 
 
 class TestByteTokenizer:
-    identity = "offline-byte-tokenizer-v1"
+    __test__ = False
+
+    def __init__(self, model_id: str = "byte-test-v1") -> None:
+        self.identity = TokenizerIdentity.byte_identity(model_id)
 
     def encode(self, text: str, *, maximum: int, label: str) -> list[int]:
         encoded = text.encode("utf-8")
@@ -67,10 +109,72 @@ class TestByteTokenizer:
 
 
 class HFTokenizerAdapter:
-    """No-truncation adapter around a pinned Hugging Face tokenizer."""
+    """No-truncation adapter identified from the actual local tokenizer."""
 
-    def __init__(self, identity: object, tokenizer: object) -> None:
-        self.identity = identity
+    def __init__(self, tokenizer: object) -> None:
+        get_vocab = getattr(tokenizer, "get_vocab", None)
+        if not callable(get_vocab):
+            raise ValueError("pretrained tokenizer does not expose get_vocab")
+        vocabulary = get_vocab()
+        if (
+            not isinstance(vocabulary, Mapping)
+            or not vocabulary
+            or any(
+                not isinstance(token, str)
+                or not isinstance(token_id, int)
+                or isinstance(token_id, bool)
+                or token_id < 0
+                for token, token_id in vocabulary.items()
+            )
+        ):
+            raise ValueError("pretrained tokenizer vocabulary is invalid")
+        raw_path = getattr(tokenizer, "name_or_path", None)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("pretrained tokenizer lacks a local artifact path")
+        snapshot_path = Path(raw_path).resolve()
+        if (
+            snapshot_path.parent.name != "snapshots"
+            or not snapshot_path.is_dir()
+            or len(snapshot_path.name) != 40
+            or any(
+                character not in "0123456789abcdef" for character in snapshot_path.name
+            )
+        ):
+            raise ValueError(
+                "pretrained tokenizer must be loaded from an immutable local snapshot"
+            )
+        repository_dir = snapshot_path.parent.parent.name
+        if not repository_dir.startswith("models--"):
+            raise ValueError("pretrained tokenizer snapshot repository is invalid")
+        repository_parts = repository_dir.removeprefix("models--").split("--")
+        if len(repository_parts) < 2 or any(not part for part in repository_parts):
+            raise ValueError("pretrained tokenizer model identity is invalid")
+        model_id = "/".join(repository_parts)
+        revision = snapshot_path.name
+        implementation = f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
+        vocab_sha256 = hashlib.sha256(
+            _canonical_json(dict(vocabulary)).encode("utf-8")
+        ).hexdigest()
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        backend_to_str = getattr(backend, "to_str", None)
+        backend_payload = backend_to_str() if callable(backend_to_str) else None
+        artifact_payload = {
+            "implementation": implementation,
+            "model_id": model_id,
+            "revision": revision,
+            "vocabulary": dict(vocabulary),
+            "special_tokens_map": getattr(tokenizer, "special_tokens_map", {}),
+            "backend": backend_payload,
+        }
+        self.identity = TokenizerIdentity(
+            implementation=implementation,
+            model_id=model_id,
+            revision=revision,
+            vocab_sha256=vocab_sha256,
+            artifact_sha256=hashlib.sha256(
+                _canonical_json(artifact_payload).encode("utf-8")
+            ).hexdigest(),
+        )
         self._tokenizer = tokenizer
 
     def encode(self, text: str, *, maximum: int, label: str) -> list[int]:
@@ -80,7 +184,10 @@ class HFTokenizerAdapter:
         token_ids = list(encode(text, add_special_tokens=True, truncation=False))
         if len(token_ids) > maximum:
             raise ValueError(f"{label} exceeds configured maximum of {maximum} tokens")
-        if any(not isinstance(token_id, int) or token_id < 0 for token_id in token_ids):
+        if any(
+            not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0
+            for token_id in token_ids
+        ):
             raise ValueError("pretrained tokenizer emitted invalid token ids")
         return token_ids
 
@@ -97,13 +204,99 @@ class LongRouteSourceIdentity(BaseModel):
     example_id: str = Field(min_length=1)
 
 
+class FrozenComponentIdentity(BaseModel):
+    """Immutable identity for a component that emitted a supervised label."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    implementation: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _state_sha256(state: RouterState) -> str:
+    return hashlib.sha256(
+        _canonical_json(state.model_dump(mode="json")).encode("utf-8")
+    ).hexdigest()
+
+
+def _question_sha256(question_id: str, state: RouterState) -> str:
+    payload = {
+        "question_id": question_id,
+        "question": state.question,
+        "options": state.options,
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+class SufficiencyLabelArtifact(BaseModel):
+    """Sealed STOP label with frozen answerer and judge identities."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    question_id: str = Field(min_length=1)
+    state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    question_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    answerer_identity: FrozenComponentIdentity
+    judge_identity: FrozenComponentIdentity
+    stop_answer: str = Field(min_length=1)
+    gold_answer: str = Field(min_length=1)
+    label: Literal[0, 1]
+
+
+def seal_sufficiency_label(
+    *,
+    state: RouterState,
+    question_id: str,
+    gold_answer: str,
+    answerer: FrozenAnswerer,
+    answerer_identity: FrozenComponentIdentity,
+    judge: Callable[[str, str], bool] | None = None,
+    judge_identity: FrozenComponentIdentity | None = None,
+) -> SufficiencyLabelArtifact:
+    """Adapt Task9 STOP evaluation into a self-identifying artifact."""
+
+    if judge is None:
+
+        def judge(predicted, gold):
+            return predicted.strip().casefold() == gold.strip().casefold()
+
+        judge_identity = FrozenComponentIdentity(
+            implementation="fidmem.exact_match.v1",
+            model_id="unicode-casefold-exact-match",
+            revision="1",
+            artifact_sha256=hashlib.sha256(
+                b"strip+unicode-casefold+exact-match/v1"
+            ).hexdigest(),
+        )
+    if judge_identity is None:
+        raise ValueError("a custom sufficiency judge requires a frozen identity")
+    result = answerer.answer(state.question, state.options, state.evidence)
+    return SufficiencyLabelArtifact(
+        question_id=question_id,
+        state_sha256=_state_sha256(state),
+        question_sha256=_question_sha256(question_id, state),
+        answerer_identity=answerer_identity,
+        judge_identity=judge_identity,
+        stop_answer=result.answer,
+        gold_answer=gold_answer,
+        label=int(judge(result.answer, gold_answer)),
+    )
+
+
 class OracleRecordProvenance(BaseModel):
     """Auditable Task8/Task9 lineage carried by every BC row."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     dataset_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dataset_manifest_canonical_json: str = Field(min_length=2, repr=False)
+    longroute_example_canonical_json: str = Field(min_length=2, repr=False)
+    longroute_example_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    group_assignment_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_split: Literal["train", "dev"]
     video_group_id: str = Field(min_length=1)
     longroute_example_id: str = Field(min_length=1)
@@ -114,6 +307,7 @@ class OracleRecordProvenance(BaseModel):
     selected_preference: float = Field(ge=0, le=1)
     oracle_utility: float
     optimal_action_tie_count: int = Field(ge=1, strict=True)
+    sufficiency_artifact: SufficiencyLabelArtifact
 
     @model_validator(mode="after")
     def validate_frozen_preferences(self) -> "OracleRecordProvenance":
@@ -121,6 +315,41 @@ class OracleRecordProvenance(BaseModel):
             raise ValueError("preference_values must match Task9 COST_PREFERENCES")
         if self.selected_preference not in self.preference_values:
             raise ValueError("selected preference is not in the four-value set")
+        normalization_hash = hashlib.sha256(
+            _canonical_json(self.normalization.model_dump(mode="json")).encode("utf-8")
+        ).hexdigest()
+        if normalization_hash != self.normalization_manifest_hash:
+            raise ValueError("normalization identity does not match canonical payload")
+        manifest = DatasetManifest.model_validate_json(
+            self.dataset_manifest_canonical_json
+        )
+        if manifest.canonical_json() != self.dataset_manifest_canonical_json:
+            raise ValueError("dataset manifest is not canonical")
+        if (
+            hashlib.sha256(
+                self.dataset_manifest_canonical_json.encode("utf-8")
+            ).hexdigest()
+            != self.dataset_manifest_hash
+        ):
+            raise ValueError("dataset manifest hash does not match canonical bytes")
+        example = LongRouteExample.model_validate_json(
+            self.longroute_example_canonical_json
+        )
+        if (
+            hashlib.sha256(
+                self.longroute_example_canonical_json.encode("utf-8")
+            ).hexdigest()
+            != self.longroute_example_sha256
+        ):
+            raise ValueError("LongRoute example hash does not match canonical bytes")
+        if (
+            _canonical_json(example.model_dump(mode="json"))
+            != self.longroute_example_canonical_json
+        ):
+            raise ValueError("LongRoute example is not canonical")
+        if example.question_id != self.longroute_example_id:
+            raise ValueError("LongRoute example identity mismatch")
+        _validate_task8_lineage(manifest, example)
         return self
 
 
@@ -164,27 +393,95 @@ class OracleBCRecord(BaseModel):
             raise ValueError("video_id must equal provenance video_group_id")
         if self.state.cost_preference != self.provenance.selected_preference:
             raise ValueError("state preference must match provenance")
+        example = LongRouteExample.model_validate_json(
+            self.provenance.longroute_example_canonical_json
+        )
+        if self.question_id != example.question_id:
+            raise ValueError("question_id must match the LongRoute example")
+        if (
+            self.state.question != example.question
+            or self.state.options != example.options
+        ):
+            raise ValueError("Router state question must match the LongRoute example")
+        artifact = self.provenance.sufficiency_artifact
+        if artifact.question_id != self.question_id:
+            raise ValueError("sufficiency question identity mismatch")
+        if artifact.state_sha256 != _state_sha256(self.state):
+            raise ValueError("sufficiency state hash mismatch")
+        if artifact.question_sha256 != _question_sha256(self.question_id, self.state):
+            raise ValueError("sufficiency question hash mismatch")
+        if (
+            artifact.gold_answer != example.answer
+            or artifact.label != self.sufficiency_target
+        ):
+            raise ValueError("sufficiency artifact does not match the record label")
         return self
+
+
+def _validate_task8_lineage(
+    manifest: DatasetManifest, example: LongRouteExample
+) -> tuple[str, str, str]:
+    if manifest.source_manifest_hashes != {
+        source.identity: source.canonical_sha256 for source in manifest.source_manifests
+    }:
+        raise ValueError("source manifest hashes do not match source provenance")
+    matching_examples = tuple(
+        item for item in manifest.examples if item.question_id == example.question_id
+    )
+    if len(matching_examples) != 1 or matching_examples[0] != example:
+        raise ValueError(
+            "LongRoute example is not an exact member of the dataset manifest"
+        )
+    segment_videos = {segment.source_video_id for segment in example.segments}
+    if not segment_videos or any(
+        manifest.group_assignment.get(video_id) != example.split
+        for video_id in segment_videos
+    ):
+        raise ValueError("LongRoute group assignment does not match example split")
+    if manifest.group_assignment.get(example.target_source_video_id) != example.split:
+        raise ValueError("target video group does not match example split")
+    canonical_events = {
+        f"{segment.source_video_id}:{segment.event_id}" for segment in example.segments
+    }
+    if example.target_event_id not in canonical_events or not set(
+        example.supporting_event_ids
+    ).issubset(canonical_events):
+        raise ValueError("LongRoute event identities do not match virtual segments")
+    owners = tuple(
+        source
+        for source in manifest.source_manifests
+        if any(
+            video.video_id == example.target_source_video_id for video in source.videos
+        )
+    )
+    if len(owners) != 1:
+        raise ValueError("target video must have exactly one source manifest owner")
+    owner = owners[0]
+    video = next(
+        item for item in owner.videos if item.video_id == example.target_source_video_id
+    )
+    if manifest.asset_sha256s.get(video.video_id) != video.content_sha256:
+        raise ValueError("target video asset hash does not match source provenance")
+    return (
+        owner.canonical_sha256,
+        example.target_source_video_id,
+        video.content_sha256,
+    )
 
 
 def materialize_oracle_record(
     *,
-    record_id: str,
-    question_id: str,
     observation_snapshot_id: str,
     state: RouterState,
     action_instances: Sequence[ActionInstance],
     legal_action_mask: Sequence[bool],
     preference_labels: Sequence[PreferenceLabel],
-    selected_preference: float,
-    oracle_action: ActionInstance,
-    sufficiency_target: int,
-    cost_to_go: float,
     normalization: CostNormalization,
-    normalization_manifest: Mapping[str, object],
-    source_identity: LongRouteSourceIdentity,
+    manifest: DatasetManifest,
+    example: LongRouteExample,
+    sufficiency_artifact: SufficiencyLabelArtifact,
 ) -> OracleBCRecord:
-    """Convert Task9 labels plus Task8 lineage into one strict BC row."""
+    """Derive one BC row exclusively from verified Task8/Task9 artifacts."""
 
     labels = tuple(
         PreferenceLabel.model_validate(label.model_dump(mode="python"))
@@ -192,30 +489,87 @@ def materialize_oracle_record(
     )
     if tuple(label.cost_preference for label in labels) != COST_PREFERENCES:
         raise ValueError("preference labels must contain the four Task9 preferences")
+    normalization = CostNormalization.model_validate(
+        normalization.model_dump(mode="python")
+    )
+    manifest = DatasetManifest.model_validate(manifest.model_dump(mode="python"))
+    example = LongRouteExample.model_validate(example.model_dump(mode="python"))
+    source_manifest_hash, video_group_id, asset_sha256 = _validate_task8_lineage(
+        manifest, example
+    )
+    if state.question != example.question or state.options != example.options:
+        raise ValueError("Router state question does not match LongRoute example")
+    canonical_events = {
+        f"{segment.source_video_id}:{segment.event_id}" for segment in example.segments
+    }
+    local_counts: dict[str, int] = {}
+    for segment in example.segments:
+        local_counts[segment.event_id] = local_counts.get(segment.event_id, 0) + 1
+    canonical_events |= {
+        event_id for event_id, count in local_counts.items() if count == 1
+    }
+    referenced_events = (
+        set(state.candidate_event_ids)
+        | {item.event_id for item in state.evidence}
+        | {
+            action.event_id
+            for action in (*state.action_history, *action_instances)
+            if action.event_id is not None
+        }
+    )
+    if not referenced_events.issubset(canonical_events):
+        raise ValueError(
+            "Router state/action event ids do not match LongRoute segments"
+        )
+
     selected = next(
-        (label for label in labels if label.cost_preference == selected_preference),
+        (label for label in labels if label.cost_preference == state.cost_preference),
         None,
     )
-    if selected is None:
-        raise ValueError("selected preference has no Task9 label")
-    if state.cost_preference != selected_preference:
-        raise ValueError("state cost preference does not match selected label")
+    if selected is None or not selected.optimal_paths:
+        raise ValueError("selected preference has no Task9 Oracle path")
+    for label in labels:
+        if not label.optimal_paths:
+            raise ValueError("preference label has no optimal Oracle path")
+        for path in label.optimal_paths:
+            expected_cost = sum(item.step_cost for item in path.transitions)
+            if not math.isclose(
+                path.total_cost, expected_cost, rel_tol=0, abs_tol=1e-12
+            ):
+                raise ValueError("Oracle path cost does not match its transitions")
+            expected_utility = path.answer_score - label.cost_preference * (
+                path.total_cost / normalization.constant
+            )
+            if not math.isclose(
+                path.utility, expected_utility, rel_tol=0, abs_tol=1e-12
+            ):
+                raise ValueError("Oracle path utility does not match normalization")
+        if not math.isclose(
+            label.utility,
+            label.optimal_paths[0].utility,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("preference utility does not match optimal paths")
+
+    selected_path = sorted(
+        selected.optimal_paths,
+        key=lambda path: (path.total_cost, path.depth, path.action_signature),
+    )[0]
+    if not selected_path.transitions or selected_path.transitions[0].state != state:
+        raise ValueError("selected Oracle path does not begin at the record state")
+    oracle_action = selected_path.transitions[0].action
     optimal_actions = selected.optimal_first_actions
-    if oracle_action not in optimal_actions:
-        raise ValueError("oracle action is not optimal for the selected preference")
     actions = tuple(action_instances)
     mask = tuple(legal_action_mask)
     if oracle_action not in actions:
-        raise ValueError("oracle action is absent from action_instances")
+        raise ValueError("Oracle action is absent from action_instances")
     target_index = actions.index(oracle_action)
     if target_index >= len(mask) or not mask[target_index]:
-        raise ValueError("oracle action is not legal in the supplied mask")
-    normalization_payload = normalization.model_dump(mode="json")
-    expected_manifest = {"oracle_cost_normalization": normalization_payload}
-    if dict(normalization_manifest) != expected_manifest:
-        raise ValueError("normalization manifest does not match Task9 normalization")
+        raise ValueError("Oracle action is not legal in the supplied mask")
+
     normalization_hash = hashlib.sha256(
-        _canonical_json(normalization_manifest).encode("utf-8")
+        _canonical_json(normalization.model_dump(mode="json")).encode("utf-8")
     ).hexdigest()
     preference_payload = tuple(
         {
@@ -230,30 +584,71 @@ def materialize_oracle_record(
     preference_hash = hashlib.sha256(
         _canonical_json(preference_payload).encode("utf-8")
     ).hexdigest()
+
+    if not isinstance(sufficiency_artifact, SufficiencyLabelArtifact):
+        raise TypeError("sufficiency_artifact must be a sealed artifact")
+    artifact = SufficiencyLabelArtifact.model_validate(
+        sufficiency_artifact.model_dump(mode="python")
+    )
+    if artifact.question_id != example.question_id:
+        raise ValueError("sufficiency artifact question identity mismatch")
+    if artifact.state_sha256 != _state_sha256(state):
+        raise ValueError("sufficiency artifact state hash mismatch")
+    if artifact.question_sha256 != _question_sha256(example.question_id, state):
+        raise ValueError("sufficiency artifact question hash mismatch")
+    if artifact.gold_answer != example.answer:
+        raise ValueError("sufficiency artifact gold answer mismatch")
+
+    manifest_json = manifest.canonical_json()
+    example_json = _canonical_json(example.model_dump(mode="json"))
+    dataset_manifest_hash = hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
+    record_suffix = hashlib.sha256(
+        _canonical_json(
+            {
+                "dataset_manifest_hash": dataset_manifest_hash,
+                "state_sha256": _state_sha256(state),
+                "observation_snapshot_id": observation_snapshot_id,
+            }
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    record_id = f"{example.question_id}:{record_suffix}"
+    cost_to_go = selected_path.total_cost / normalization.constant
+    if not math.isfinite(cost_to_go) or cost_to_go < 0:
+        raise ValueError("derived cost_to_go must be finite and non-negative")
     return OracleBCRecord(
         record_id=record_id,
-        video_id=source_identity.video_group_id,
-        question_id=question_id,
+        video_id=video_group_id,
+        question_id=example.question_id,
         observation_snapshot_id=observation_snapshot_id,
         provenance=OracleRecordProvenance(
-            dataset_manifest_hash=source_identity.dataset_manifest_hash,
-            source_manifest_hash=source_identity.source_manifest_hash,
-            source_split=source_identity.split,
-            video_group_id=source_identity.video_group_id,
-            longroute_example_id=source_identity.example_id,
+            dataset_manifest_hash=dataset_manifest_hash,
+            dataset_manifest_canonical_json=manifest_json,
+            longroute_example_canonical_json=example_json,
+            longroute_example_sha256=hashlib.sha256(
+                example_json.encode("utf-8")
+            ).hexdigest(),
+            group_assignment_sha256=hashlib.sha256(
+                _canonical_json(manifest.group_assignment).encode("utf-8")
+            ).hexdigest(),
+            source_manifest_hash=source_manifest_hash,
+            asset_sha256=asset_sha256,
+            source_split=example.split,
+            video_group_id=video_group_id,
+            longroute_example_id=example.question_id,
             normalization_manifest_hash=normalization_hash,
             normalization=normalization,
             preference_set_hash=preference_hash,
             preference_values=COST_PREFERENCES,
-            selected_preference=selected_preference,
+            selected_preference=state.cost_preference,
             oracle_utility=selected.utility,
             optimal_action_tie_count=len(optimal_actions),
+            sufficiency_artifact=artifact,
         ),
         state=state,
         action_instances=actions,
         legal_action_mask=mask,
         target_action_index=target_index,
-        sufficiency_target=sufficiency_target,
+        sufficiency_target=artifact.label,
         cost_to_go=cost_to_go,
     )
 
@@ -261,8 +656,9 @@ def materialize_oracle_record(
 class SplitManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     seed: StrictInt
+    assignment_source: Literal["upstream_source_split"]
     dataset_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     train_video_ids: tuple[str, ...]
     dev_video_ids: tuple[str, ...]
@@ -301,6 +697,16 @@ class OracleBCDataset(Dataset[OracleBCRecord]):
                 }
             )
         )
+        if len(self.normalization_manifest_hashes) != 1:
+            raise ValueError(
+                "one Oracle BC dataset must use exactly one cost normalization"
+            )
+        normalization_values = {
+            _canonical_json(record.provenance.normalization.model_dump(mode="json"))
+            for record in self._records
+        }
+        if len(normalization_values) != 1:
+            raise ValueError("mixed cost normalization constants are forbidden")
         payload = "\n".join(
             _canonical_json(record.model_dump(mode="json")) for record in self._records
         )
@@ -330,38 +736,35 @@ def build_grouped_split(
     records: Sequence[OracleBCRecord],
     *,
     seed: int,
-    train_fraction: float = 0.8,
-    dev_fraction: float = 0.1,
+    train_fraction: float = 1.0,
+    dev_fraction: float = 0.0,
 ) -> SplitManifest:
-    """Assign whole videos to deterministic splits, independent of row order."""
+    """Preserve Task8's immutable video-group assignments without remapping."""
 
-    for name, value in (
-        ("train_fraction", train_fraction),
-        ("dev_fraction", dev_fraction),
-    ):
-        if not math.isfinite(value) or not 0 <= value <= 1:
-            raise ValueError(f"{name} must be finite and in [0, 1]")
-    if train_fraction + dev_fraction > 1:
-        raise ValueError("train_fraction + dev_fraction must not exceed one")
+    if train_fraction != 1.0 or dev_fraction != 0.0:
+        raise ValueError(
+            "upstream_source_split requires train_fraction=1 and dev_fraction=0; "
+            "a train-pool resplit needs a separately published assignment artifact"
+        )
     dataset = OracleBCDataset(records)
-    videos = sorted(
-        {record.video_id for record in dataset.records},
-        key=lambda video_id: (
-            hashlib.sha256(f"{seed}\0{video_id}".encode("utf-8")).digest(),
-            video_id,
-        ),
+    train_videos = tuple(
+        sorted(
+            {
+                record.video_id
+                for record in dataset.records
+                if record.provenance.source_split == "train"
+            }
+        )
     )
-    count = len(videos)
-    train_count = min(count, int(math.floor(count * train_fraction)))
-    if train_fraction > 0 and train_count == 0:
-        train_count = 1
-    remaining = count - train_count
-    dev_count = min(remaining, int(math.floor(count * dev_fraction)))
-    if dev_fraction > 0 and remaining > 0 and dev_count == 0:
-        dev_count = 1
-    train_videos = tuple(sorted(videos[:train_count]))
-    dev_videos = tuple(sorted(videos[train_count : train_count + dev_count]))
-    test_videos = tuple(sorted(videos[train_count + dev_count :]))
+    dev_videos = tuple(
+        sorted(
+            {
+                record.video_id
+                for record in dataset.records
+                if record.provenance.source_split == "dev"
+            }
+        )
+    )
 
     def record_ids(video_ids: tuple[str, ...]) -> tuple[str, ...]:
         selected = set(video_ids)
@@ -373,13 +776,14 @@ def build_grouped_split(
 
     return SplitManifest(
         seed=seed,
+        assignment_source="upstream_source_split",
         dataset_hash=dataset.identity,
         train_video_ids=train_videos,
         dev_video_ids=dev_videos,
-        test_video_ids=test_videos,
+        test_video_ids=(),
         train_record_ids=record_ids(train_videos),
         dev_record_ids=record_ids(dev_videos),
-        test_record_ids=record_ids(test_videos),
+        test_record_ids=(),
     )
 
 
@@ -401,11 +805,165 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+class OracleDatasetAuthority(BaseModel):
+    """Dataset-level content-addressed authority stored once beside row data."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    schema_version: Literal[1] = 1
+    dataset_manifests: dict[str, str]
+    normalizations: dict[str, dict[str, object]]
+    record_digests: dict[str, str]
+    authority_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_content_addresses(self) -> "OracleDatasetAuthority":
+        for digest, canonical in self.dataset_manifests.items():
+            if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != digest:
+                raise ValueError("authority dataset manifest hash mismatch")
+            manifest = DatasetManifest.model_validate_json(canonical)
+            if manifest.canonical_json() != canonical:
+                raise ValueError("authority dataset manifest is not canonical")
+        for digest, payload in self.normalizations.items():
+            if (
+                hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+                != digest
+            ):
+                raise ValueError("authority normalization hash mismatch")
+            CostNormalization.model_validate(payload)
+        if any(
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for digest in self.record_digests.values()
+        ):
+            raise ValueError("authority record digest is not SHA-256")
+        expected = hashlib.sha256(
+            _canonical_json(
+                self.model_dump(mode="json", exclude={"authority_sha256"})
+            ).encode("utf-8")
+        ).hexdigest()
+        if expected != self.authority_sha256:
+            raise ValueError("authority self hash mismatch")
+        return self
+
+
+def _authority_path(path: Path) -> Path:
+    return Path(f"{path}.authority.json")
+
+
+def _stored_record_payload(record: OracleBCRecord) -> dict[str, object]:
+    payload = record.model_dump(mode="json")
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("record provenance must be a JSON object")
+    provenance.pop("dataset_manifest_canonical_json", None)
+    provenance.pop("longroute_example_canonical_json", None)
+    return payload
+
+
+def _stored_record_json(record: OracleBCRecord) -> str:
+    return _canonical_json(_stored_record_payload(record))
+
+
+def _build_dataset_authority(
+    records: Sequence[OracleBCRecord],
+) -> OracleDatasetAuthority:
+    manifests: dict[str, str] = {}
+    normalizations: dict[str, dict[str, object]] = {}
+    record_digests: dict[str, str] = {}
+    for record in records:
+        provenance = record.provenance
+        canonical = provenance.dataset_manifest_canonical_json
+        previous = manifests.setdefault(provenance.dataset_manifest_hash, canonical)
+        if previous != canonical:
+            raise ValueError("one dataset manifest hash has conflicting payloads")
+        normalization = provenance.normalization.model_dump(mode="json")
+        previous_normalization = normalizations.setdefault(
+            provenance.normalization_manifest_hash, normalization
+        )
+        if previous_normalization != normalization:
+            raise ValueError("one normalization hash has conflicting payloads")
+        record_digests[record.record_id] = hashlib.sha256(
+            _stored_record_json(record).encode("utf-8")
+        ).hexdigest()
+    base: dict[str, object] = {
+        "schema_version": 1,
+        "dataset_manifests": manifests,
+        "normalizations": normalizations,
+        "record_digests": record_digests,
+    }
+    return OracleDatasetAuthority(
+        **base,
+        authority_sha256=hashlib.sha256(
+            _canonical_json(base).encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def _inflate_stored_record(
+    raw: str, authority: OracleDatasetAuthority
+) -> OracleBCRecord:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("Oracle record row is not valid JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Oracle record row must be a JSON object")
+    canonical = _canonical_json(payload)
+    if raw != canonical:
+        raise ValueError("Oracle record row is not canonical JSON")
+    record_id = payload.get("record_id")
+    if not isinstance(record_id, str):
+        raise ValueError("Oracle record id is missing")
+    expected_digest = authority.record_digests.get(record_id)
+    actual_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if expected_digest != actual_digest:
+        raise ValueError("Oracle record digest does not match dataset authority")
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("Oracle record provenance is missing")
+    manifest_hash = provenance.get("dataset_manifest_hash")
+    if not isinstance(manifest_hash, str):
+        raise ValueError("Oracle record dataset manifest identity is missing")
+    manifest_json = authority.dataset_manifests.get(manifest_hash)
+    if manifest_json is None:
+        raise ValueError("Oracle record manifest is absent from dataset authority")
+    normalization_hash = provenance.get("normalization_manifest_hash")
+    if not isinstance(normalization_hash, str):
+        raise ValueError("Oracle normalization identity is missing")
+    normalization_payload = authority.normalizations.get(normalization_hash)
+    if normalization_payload is None:
+        raise ValueError("Oracle normalization is absent from dataset authority")
+    if provenance.get("normalization") != normalization_payload:
+        raise ValueError("Oracle normalization does not match dataset authority")
+    example_hash = provenance.get("longroute_example_sha256")
+    question_id = payload.get("question_id")
+    manifest = DatasetManifest.model_validate_json(manifest_json)
+    matches = tuple(
+        example
+        for example in manifest.examples
+        if example.question_id == question_id
+        and hashlib.sha256(
+            _canonical_json(example.model_dump(mode="json")).encode("utf-8")
+        ).hexdigest()
+        == example_hash
+    )
+    if len(matches) != 1:
+        raise ValueError("Oracle example is absent from dataset authority")
+    provenance["dataset_manifest_canonical_json"] = manifest_json
+    provenance["longroute_example_canonical_json"] = _canonical_json(
+        matches[0].model_dump(mode="json")
+    )
+    return OracleBCRecord.model_validate(payload)
+
+
 def write_oracle_records(path: str | Path, records: Sequence[OracleBCRecord]) -> None:
-    """Write strict JSONL or auditable structured Parquet without pickle."""
+    """Write rows plus one mandatory, content-addressed provenance sidecar."""
 
     target = Path(path)
     dataset = OracleBCDataset(records)
+    authority = _build_dataset_authority(dataset.records)
+    record_jsons = tuple(_stored_record_json(record) for record in dataset.records)
     rows = tuple(
         (
             record.record_id,
@@ -415,13 +973,15 @@ def write_oracle_records(path: str | Path, records: Sequence[OracleBCRecord]) ->
             record.provenance.source_manifest_hash,
             record.provenance.normalization_manifest_hash,
             record.provenance.selected_preference,
-            _canonical_json(record.model_dump(mode="json")),
+            record_json,
         )
-        for record in dataset.records
+        for record, record_json in zip(dataset.records, record_jsons, strict=True)
     )
     if target.suffix.casefold() == ".jsonl":
+        _atomic_write(target, ("\n".join(record_jsons) + "\n").encode("utf-8"))
         _atomic_write(
-            target, ("\n".join(row[-1] for row in rows) + "\n").encode("utf-8")
+            _authority_path(target),
+            (_canonical_json(authority.model_dump(mode="json")) + "\n").encode("utf-8"),
         )
         return
     if target.suffix.casefold() != ".parquet":
@@ -455,6 +1015,10 @@ def write_oracle_records(path: str | Path, records: Sequence[OracleBCRecord]) ->
         finally:
             connection.close()
         os.replace(temporary, target)
+        _atomic_write(
+            _authority_path(target),
+            (_canonical_json(authority.model_dump(mode="json")) + "\n").encode("utf-8"),
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -464,6 +1028,19 @@ def load_oracle_records(path: str | Path) -> tuple[OracleBCRecord, ...]:
     if not source.is_file():
         raise FileNotFoundError(source)
     suffix = source.suffix.casefold()
+    if suffix not in {".jsonl", ".parquet"}:
+        raise ValueError("Oracle records path must end in jsonl or parquet")
+    authority_path = _authority_path(source)
+    if not authority_path.is_file():
+        raise ValueError("Oracle dataset authority sidecar is missing")
+    try:
+        authority = OracleDatasetAuthority.model_validate_json(
+            authority_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "Oracle dataset authority hash or content is invalid"
+        ) from error
     structured_rows: tuple[tuple[object, ...], ...] = ()
     if suffix == ".jsonl":
         raw_rows = tuple(
@@ -498,7 +1075,17 @@ def load_oracle_records(path: str | Path) -> tuple[OracleBCRecord, ...]:
         raise ValueError("Oracle records path must end in jsonl or parquet")
     if not raw_rows or any(not isinstance(row, str) for row in raw_rows):
         raise ValueError("Oracle record source must contain non-empty JSON strings")
-    records = tuple(OracleBCRecord.model_validate_json(row) for row in raw_rows)
+    records = tuple(_inflate_stored_record(row, authority) for row in raw_rows)
+    if set(authority.record_digests) != {record.record_id for record in records}:
+        raise ValueError("dataset authority record set does not match row data")
+    used_manifests = {record.provenance.dataset_manifest_hash for record in records}
+    used_normalizations = {
+        record.provenance.normalization_manifest_hash for record in records
+    }
+    if used_manifests != set(authority.dataset_manifests):
+        raise ValueError("dataset authority manifest set does not match row data")
+    if used_normalizations != set(authority.normalizations):
+        raise ValueError("dataset authority normalization set does not match row data")
     if suffix == ".parquet":
         for structured, record in zip(structured_rows, records, strict=True):
             expected = (

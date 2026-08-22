@@ -4,8 +4,12 @@ model_overrides:
     kind: test
     model_id: offline-smoke-encoder-v1
     revision: offline-test-v1
-    tokenizer_id: offline-smoke-encoder-v1
-    tokenizer_revision: offline-test-v1
+    tokenizer:
+      implementation: fidmem.byte-utf8.v1
+      model_id: offline-smoke-encoder-v1
+      revision: offline-byte-v1
+      vocab_sha256: 7ed9e54a2ee1ad3205a78fd13daa9ceb7cf8e37c69b83f103f46ccf41303c25a
+      artifact_sha256: 1e4d5d30c9ca55cfb556febaca1a7b0c46005f4cbeab797b5727d97864fc4444
     trust_remote_code: false
   encoder_output_dim: 48
   hidden_dim: 64
@@ -27,8 +31,8 @@ training:
   checkpoint_every: 20
   device: cpu
   split_seed: 2026
-  train_fraction: 0.8
-  dev_fraction: 0.1
+  train_fraction: 1.0
+  dev_fraction: 0.0
   loss_profile:
     name: main-v1
     version: 1

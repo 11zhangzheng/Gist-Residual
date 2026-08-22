@@ -8,7 +8,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor, nn
 
-from .dataset import RouterBatch
+from .dataset import RouterBatch, TokenizerIdentity
 
 
 class EncoderIdentity(BaseModel):
@@ -19,8 +19,7 @@ class EncoderIdentity(BaseModel):
     kind: Literal["pretrained", "test"]
     model_id: str = Field(min_length=1)
     revision: str = Field(min_length=1)
-    tokenizer_id: str = Field(min_length=1)
-    tokenizer_revision: str = Field(min_length=1)
+    tokenizer: TokenizerIdentity
     trust_remote_code: Literal[False] = False
 
     @classmethod
@@ -29,15 +28,14 @@ class EncoderIdentity(BaseModel):
             kind="test",
             model_id=name,
             revision="offline-test-v1",
-            tokenizer_id=name,
-            tokenizer_revision="offline-test-v1",
+            tokenizer=TokenizerIdentity.byte_identity(name),
             trust_remote_code=False,
         )
 
     @model_validator(mode="after")
     def production_revision_must_be_immutable(self) -> "EncoderIdentity":
         if self.kind == "pretrained":
-            for value in (self.revision, self.tokenizer_revision):
+            for value in (self.revision, self.tokenizer.revision):
                 if len(value) != 40 or any(
                     char not in "0123456789abcdef" for char in value
                 ):
@@ -118,12 +116,23 @@ class ProductionEncoderFactory:
     def load(identity: EncoderIdentity) -> tuple[PretrainedTextEncoder, object]:
         if identity.kind != "pretrained" or identity.trust_remote_code:
             raise ValueError("production encoder identity is not safe")
+        from pathlib import Path
+
+        from huggingface_hub import snapshot_download
         from transformers import AutoModel, AutoTokenizer
 
+        tokenizer_snapshot = Path(
+            snapshot_download(
+                identity.tokenizer.model_id,
+                revision=identity.tokenizer.revision,
+                local_files_only=True,
+            )
+        ).resolve()
+        if tokenizer_snapshot.name != identity.tokenizer.revision:
+            raise ValueError("local tokenizer snapshot does not match pinned revision")
         tokenizer = AutoTokenizer.from_pretrained(
-            identity.tokenizer_id,
+            str(tokenizer_snapshot),
             local_files_only=True,
-            revision=identity.tokenizer_revision,
             trust_remote_code=False,
         )
         backbone = AutoModel.from_pretrained(

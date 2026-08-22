@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,14 +9,13 @@ import duckdb
 import pytest
 import torch
 from fidmem.actions.environment import ActionObservation, EnvironmentTransition
-from fidmem.oracle.labels import CostNormalization, PreferenceLabel
+from fidmem.oracle.labels import PreferenceLabel
 from fidmem.oracle.search import OraclePath
 from fidmem.router.dataset import (
-    LongRouteSourceIdentity,
     OracleBCDataset,
     RouterCollator,
+    TokenizerIdentity,
     load_oracle_records,
-    materialize_oracle_record,
     write_oracle_records,
 )
 from fidmem.router.model import (
@@ -30,6 +30,7 @@ from fidmem.router.train_bc import (
     ProductionEncoderFactory,
     TrainConfig,
     TrainFileConfig,
+    RuntimeIdentity,
     behavior_cloning_loss,
     load_checkpoint,
     run_seed_sweep,
@@ -44,6 +45,7 @@ from fidmem.types import (
 )
 from omegaconf import OmegaConf
 from pydantic import ValidationError
+from tests.router._fixtures import authoritative_record
 
 
 def _state(
@@ -119,45 +121,30 @@ def _preference_labels(state: RouterState) -> tuple[PreferenceLabel, ...]:
     return tuple(labels)
 
 
-def _identity(*, split: str = "train") -> LongRouteSourceIdentity:
-    return LongRouteSourceIdentity(
-        dataset_manifest_hash="a" * 64,
-        source_manifest_hash="b" * 64,
-        split=split,
-        video_group_id="video-group-1",
-        example_id="longroute-q1",
-    )
-
-
 def _record(
     *,
     state: RouterState | None = None,
     actions: tuple[ActionInstance, ...] | None = None,
-    identity: LongRouteSourceIdentity | None = None,
+    video_id: str = "video-group-1",
+    question_id: str = "question-1",
+    split: str = "train",
 ):
     current = state or _state()
     candidates = actions or _actions()
-    labels = _preference_labels(current)
-    normalization = CostNormalization(
-        constant=10, sample_count=100, source_split="train"
+    target_index = next(
+        index for index, action in enumerate(candidates) if action.event_id == "e-left"
     )
-    manifest = {"oracle_cost_normalization": normalization.model_dump(mode="json")}
-    oracle_action = next(action for action in candidates if action.event_id == "e-left")
-    return materialize_oracle_record(
-        record_id="record-1",
-        question_id="question-1",
-        observation_snapshot_id="cached-observations-sha256",
+    return authoritative_record(
         state=current,
-        action_instances=candidates,
+        actions=candidates,
         legal_action_mask=(True,) * len(candidates),
-        preference_labels=labels,
-        selected_preference=0.3,
-        oracle_action=oracle_action,
+        target_action_index=target_index,
+        video_id=video_id,
+        question_id=question_id,
         sufficiency_target=0,
-        cost_to_go=1,
-        normalization=normalization,
-        normalization_manifest=manifest,
-        source_identity=identity or _identity(),
+        cost_to_go=0.1,
+        split=split,
+        observation_snapshot_id="cached-observations-sha256",
     )
 
 
@@ -189,32 +176,16 @@ def test_materializer_preserves_four_preference_normalization_and_longroute_line
     assert record.provenance.preference_values == (0.0, 0.1, 0.3, 1.0)
     assert record.provenance.selected_preference == 0.3
     assert record.provenance.normalization_manifest_hash
-    assert record.provenance.dataset_manifest_hash == "a" * 64
-    assert record.provenance.source_manifest_hash == "b" * 64
+    assert len(record.provenance.dataset_manifest_hash) == 64
+    assert len(record.provenance.source_manifest_hash) == 64
     assert record.provenance.source_split == "train"
     assert record.video_id == record.provenance.video_group_id == "video-group-1"
     assert record.action_instances[record.target_action_index].event_id == "e-left"
 
-    normalization = CostNormalization(
-        constant=10, sample_count=100, source_split="train"
-    )
-    with pytest.raises(ValueError, match="normalization manifest"):
-        materialize_oracle_record(
-            record_id="bad",
-            question_id="q",
-            observation_snapshot_id="snapshot",
-            state=_state(),
-            action_instances=_actions(),
-            legal_action_mask=(True, True, True),
-            preference_labels=_preference_labels(_state()),
-            selected_preference=0.3,
-            oracle_action=_actions()[0],
-            sufficiency_target=0,
-            cost_to_go=1,
-            normalization=normalization,
-            normalization_manifest={"oracle_cost_normalization": {"constant": 99}},
-            source_identity=_identity(),
-        )
+    payload = record.provenance.model_dump(mode="json")
+    payload["normalization_manifest_hash"] = "f" * 64
+    with pytest.raises(ValidationError, match="normalization"):
+        type(record.provenance).model_validate(payload)
 
 
 def test_parquet_has_auditable_columns_and_fails_on_structured_provenance_mismatch(
@@ -252,12 +223,14 @@ def test_parquet_has_auditable_columns_and_fails_on_structured_provenance_mismat
         f"COPY (SELECT * REPLACE ('dev' AS source_split) FROM read_parquet('{quoted_source}')) "
         f"TO '{quoted_target}' (FORMAT PARQUET)"
     )
+    shutil.copyfile(
+        f"{path}.authority.json",
+        f"{tampered}.authority.json",
+    )
     with pytest.raises(ValueError, match="structured.*provenance"):
         load_oracle_records(tampered)
 
-    dev = _record(identity=_identity(split="dev")).model_copy(
-        update={"record_id": "record-dev"}
-    )
+    dev = _record(split="dev")
     with pytest.raises(ValueError, match="video.*split"):
         OracleBCDataset((record, dev))
 
@@ -294,6 +267,16 @@ def test_candidate_metadata_enters_all_three_heads_and_padding_is_inert() -> Non
     assert torch.allclose(base_output.cost_to_go[0], padded.cost_to_go[0])
 
 
+def _tokenizer_identity(model_id: str, revision: str) -> TokenizerIdentity:
+    return TokenizerIdentity(
+        implementation="tests.local-tokenizer",
+        model_id=model_id,
+        revision=revision,
+        vocab_sha256="4" * 64,
+        artifact_sha256="5" * 64,
+    )
+
+
 def test_production_encoder_identity_is_pinned_and_rejects_test_or_floating_encoder() -> (
     None
 ):
@@ -302,8 +285,7 @@ def test_production_encoder_identity_is_pinned_and_rejects_test_or_floating_enco
             kind="pretrained",
             model_id="FacebookAI/roberta-base",
             revision="main",
-            tokenizer_id="FacebookAI/roberta-base",
-            tokenizer_revision="main",
+            tokenizer=_tokenizer_identity("FacebookAI/roberta-base", "main"),
             trust_remote_code=False,
         )
     test_identity = EncoderIdentity.test_identity("offline")
@@ -319,8 +301,10 @@ def test_production_encoder_identity_is_pinned_and_rejects_test_or_floating_enco
         kind="pretrained",
         model_id="FacebookAI/roberta-base",
         revision="e2da8e2f811d1448a5b465c236feacd80ffbac7b",
-        tokenizer_id="FacebookAI/roberta-base",
-        tokenizer_revision="e2da8e2f811d1448a5b465c236feacd80ffbac7b",
+        tokenizer=_tokenizer_identity(
+            "FacebookAI/roberta-base",
+            "e2da8e2f811d1448a5b465c236feacd80ffbac7b",
+        ),
         trust_remote_code=False,
     )
     production = RouterModelConfig(
@@ -440,18 +424,14 @@ def test_nonleaking_candidate_relation_toy_overfits_and_seed_sweep_isolated(
         state = _state()
         actions = _actions(reversed_order=bool(index % 2))
         video_id = f"video-{index:03d}"
-        base = _record(state=state, actions=actions)
-        record = base.model_copy(
-            update={
-                "record_id": f"record-{index:03d}",
-                "question_id": f"q-{index:03d}",
-                "video_id": video_id,
-                "provenance": base.provenance.model_copy(
-                    update={"video_group_id": video_id}
-                ),
-            }
+        records.append(
+            _record(
+                state=state,
+                actions=actions,
+                video_id=video_id,
+                question_id=f"q-{index:03d}",
+            )
         )
-        records.append(record)
     dataset = OracleBCDataset(tuple(records))
     model = _model()
     training = TrainConfig(
@@ -495,14 +475,20 @@ def test_checkpoint_rejects_tamper_and_records_exact_resume_environment(
         device="cpu",
         loss_profile=LossProfile.main(),
     )
-    result = train_bc(_model(), dataset, training)
+    model = _model()
+    result = train_bc(model, dataset, training)
+    saved = torch.load(result.checkpoint_path, weights_only=True)
+    runtime = RuntimeIdentity.model_validate(saved["runtime_identity"])
     checkpoint = load_checkpoint(
         result.checkpoint_path,
         expected_config_hash=result.config_hash,
         expected_dataset_identity=dataset.identity,
         expected_split_manifest=result.split_manifest,
-        expected_encoder_identity=_model().config.encoder,
+        expected_encoder_identity=model.config.encoder,
+        expected_tokenizer_identity=model.config.encoder.tokenizer,
         expected_loss_profile=LossProfile.main(),
+        expected_runtime_identity=runtime,
+        expected_git_commit=saved["git_commit"],
         expected_device="cpu",
     )
     assert checkpoint["rng_state"]["source_device"] == "cpu"
@@ -518,8 +504,11 @@ def test_checkpoint_rejects_tamper_and_records_exact_resume_environment(
             expected_config_hash=result.config_hash,
             expected_dataset_identity=dataset.identity,
             expected_split_manifest=result.split_manifest,
-            expected_encoder_identity=_model().config.encoder,
+            expected_encoder_identity=model.config.encoder,
+            expected_tokenizer_identity=model.config.encoder.tokenizer,
             expected_loss_profile=LossProfile.main(),
+            expected_runtime_identity=runtime,
+            expected_git_commit=saved["git_commit"],
             expected_device="cpu",
         )
 
@@ -568,16 +557,27 @@ def test_production_yaml_is_pinned_100_to_150m_and_supports_offline_encoder_inje
 
 def test_production_factory_is_lazy_pinned_and_local_only(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     identity = EncoderIdentity(
         kind="pretrained",
         model_id="org/backbone",
         revision="1" * 40,
-        tokenizer_id="org/tokenizer",
-        tokenizer_revision="2" * 40,
+        tokenizer=_tokenizer_identity("org/tokenizer", "2" * 40),
         trust_remote_code=False,
     )
     calls: list[tuple[str, str, dict[str, object]]] = []
+    snapshot = tmp_path / "models--org--tokenizer" / "snapshots" / ("2" * 40)
+    snapshot.mkdir(parents=True)
+
+    class SnapshotLoader:
+        @staticmethod
+        def resolve(
+            model_id: str,
+            **kwargs: object,
+        ) -> str:
+            calls.append(("snapshot", model_id, kwargs))
+            return str(snapshot)
 
     class TokenizerLoader:
         @staticmethod
@@ -593,6 +593,11 @@ def test_production_factory_is_lazy_pinned_and_local_only(
 
     monkeypatch.setitem(
         sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=SnapshotLoader.resolve),
+    )
+    monkeypatch.setitem(
+        sys.modules,
         "transformers",
         SimpleNamespace(AutoModel=ModelLoader, AutoTokenizer=TokenizerLoader),
     )
@@ -602,11 +607,18 @@ def test_production_factory_is_lazy_pinned_and_local_only(
     assert tokenizer is not None
     assert calls == [
         (
-            "tokenizer",
+            "snapshot",
             "org/tokenizer",
             {
-                "local_files_only": True,
                 "revision": "2" * 40,
+                "local_files_only": True,
+            },
+        ),
+        (
+            "tokenizer",
+            str(snapshot.resolve()),
+            {
+                "local_files_only": True,
                 "trust_remote_code": False,
             },
         ),

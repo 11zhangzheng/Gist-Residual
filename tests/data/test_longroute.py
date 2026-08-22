@@ -40,12 +40,18 @@ def _manifest(root: Path, *, videos: int = 12, seconds: float = 61.0) -> TrainSp
 
 
 def _builder(root: Path, manifest: TrainSplitManifest, *, audit_size: int = 1, **config: object) -> LongRouteBuilder:
+    def sheet(example: object) -> Path:
+        path = root / "sheets" / f"{getattr(example, 'question_id')}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"contact-sheet")
+        return path
+
     return LongRouteBuilder(
         (manifest,),
         eval_assets=(),
         leakage_auditor=LeakageAuditor(root / "leakage.parquet"),
         config=LongRouteConfig(output_dir=root / "output", audit_size=audit_size, **config),
-        contact_sheet_provider=lambda example: f"sheets/{example.question_id}.jpg",
+        contact_sheet_provider=sheet,
     )
 
 
@@ -75,7 +81,7 @@ def test_eval_duplicate_writes_machine_audit_and_never_writes_manifest(tmp_path:
     copied.write_bytes((tmp_path / "video-0.bin").read_bytes())
     builder = LongRouteBuilder(
         (manifest,),
-        eval_assets=(VideoAsset("held-out", copied),),
+        eval_assets=(VideoAsset("held-out", copied, ((1.0, 0.0),) * 8),),
         leakage_auditor=LeakageAuditor(tmp_path / "leakage.parquet"),
         config=LongRouteConfig(output_dir=tmp_path / "output", audit_size=1),
         contact_sheet_provider=lambda example: "sheet.jpg",
@@ -117,17 +123,77 @@ def test_nearest_neighbor_order_is_stable_and_multi_event_answers_are_programmat
     assert all(item.answer in item.options for item in multi)
     # Equal cosine similarities are resolved by canonical event id, not input order.
     first = result.examples[0]
-    non_target = [segment.event_id for segment in first.segments if segment.event_id != first.target_event_id]
+    non_target = [segment.event_id for segment in first.segments if f"{segment.source_video_id}:{segment.event_id}" != first.target_event_id]
     assert non_target == sorted(non_target)
 
 
 def test_audit_bundle_has_exact_size_stable_fields_and_insufficient_input_fails(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     result = _builder(tmp_path / "good", manifest, audit_size=3).build(6)
-    bundle = tmp_path / "good" / "output" / "audit"
+    current = json.loads((tmp_path / "good" / "output" / "current-generation.json").read_text())
+    bundle = tmp_path / "good" / "output" / current["generation"] / "audit"
     assert len((bundle / "samples.jsonl").read_text().splitlines()) == 3
     with (bundle / "review.csv").open(newline="", encoding="utf-8") as source:
         assert csv.DictReader(source).fieldnames == ["question_id", "valid", "invalid", "reason"]
     assert all(item.audit_status == "pending" for item in result.examples)
     with pytest.raises(LongRouteDataError, match="audit"):
         _builder(tmp_path / "small", _manifest(tmp_path / "small-src", videos=12), audit_size=11).build(6)
+
+
+def test_multi_event_supports_only_canonical_ids_present_in_route_and_immediate_order(tmp_path: Path) -> None:
+    result = _builder(tmp_path / "out", _manifest(tmp_path), multi_event_ratio=0.25).build(8)
+    multi = next(item for item in result.examples if item.template != "single_event")
+    route = {f"{segment.source_video_id}:{segment.event_id}": segment for segment in multi.segments}
+    assert set(multi.supporting_event_ids) <= set(route)
+    assert multi.target_event_id in route
+    left, right = (route[event_id] for event_id in multi.supporting_event_ids)
+    assert right.global_start_sec == left.global_end_sec
+    assert multi.answer in multi.options
+
+
+def test_missing_centroid_coverage_fails_closed_and_missing_contact_sheet_is_rejected(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    strict = LongRouteBuilder(
+        (manifest,), eval_assets=(VideoAsset("eval", tmp_path / "video-1.bin"),),
+        leakage_auditor=LeakageAuditor(tmp_path / "audit.parquet"),
+        config=LongRouteConfig(output_dir=tmp_path / "strict", audit_size=1),
+        contact_sheet_provider=lambda _example: tmp_path / "does-not-exist.jpg",
+    )
+    with pytest.raises(LongRouteDataError, match="centroid|contact"):
+        strict.build(1)
+
+
+def test_failed_attempt_does_not_replace_current_generation_and_writes_last_attempt(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    output = tmp_path / "out"
+    _builder(output, manifest).build(1)
+    current = (output / "output" / "current-generation.json").read_text()
+    copied = tmp_path / "eval.bin"
+    copied.write_bytes((tmp_path / "video-0.bin").read_bytes())
+    broken = LongRouteBuilder(
+        (manifest,), eval_assets=(VideoAsset("eval", copied, ((1.0, 0.0),) * 8),),
+        leakage_auditor=LeakageAuditor(tmp_path / "audit.parquet"),
+        config=LongRouteConfig(output_dir=output / "output", audit_size=1),
+        contact_sheet_provider=lambda example: (output / "sheets" / f"{example.question_id}.jpg"),
+    )
+    with pytest.raises(LongRouteLeakageError):
+        broken.build(2)
+    assert (output / "output" / "current-generation.json").read_text() == current
+    assert json.loads((output / "output" / "last-attempt.json").read_text())["status"] == "failed"
+
+
+def test_route_backtracks_around_oversize_nearest_and_ratio_uses_final_integer_bounds(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, videos=102, seconds=61)
+    result = _builder(tmp_path / "out", manifest, audit_size=1).build(4)
+    multi = sum(item.template != "single_event" for item in result.examples)
+    assert multi >= 21
+    assert 0.2 <= multi / len(result.examples) <= 0.3
+
+
+def test_nested_reordering_does_not_change_canonical_manifest_and_duplicate_question_is_rejected(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    shuffled = manifest.model_copy(update={"videos": tuple(reversed(manifest.videos))})
+    assert _builder(tmp_path / "one", manifest).build(5).canonical_json() == _builder(tmp_path / "two", shuffled).build(5).canonical_json()
+    duplicate = manifest.model_copy(update={"videos": manifest.videos + (manifest.videos[0].model_copy(update={"video_id": "new-video"}),)})
+    with pytest.raises(LongRouteDataError, match="question"):
+        _builder(tmp_path / "duplicate", duplicate).build(5)

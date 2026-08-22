@@ -181,6 +181,8 @@ class DatasetManifest(BaseModel):
     multi_event_ratio: float
     leakage_audit_uri: str
     examples: tuple[LongRouteExample, ...]
+    asset_sha256s: dict[str, str] = {}
+    generation_uri: str = ""
 
     def canonical_json(self) -> str:
         return json.dumps(self.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -207,6 +209,14 @@ def _atomic_write(path: Path, payload: str) -> None:
         if temporary:
             Path(temporary).unlink(missing_ok=True)
         raise
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _seeded_index(seed: int, key: str, upper: int) -> int:
@@ -245,50 +255,45 @@ class LongRouteBuilder:
 
     def build(self, seed: int) -> DatasetManifest:
         videos = self._validated_videos()
-        audit_path = self.config.output_dir / "leakage-audit.json"
-        report = self.leakage_auditor.audit(
-            tuple(VideoAsset(video.video_id, video.path) for video in videos), self.eval_assets
-        )
-        audit_payload = {
-            "complete": not bool(report.findings), "seed": seed,
-            "parquet_uri": report.parquet_path.name,
-            "findings": [finding.__dict__ for finding in report.findings],
-        }
-        _atomic_write(audit_path, _canonical_json(audit_payload))
-        if report.findings:
-            raise LongRouteLeakageError("formal evaluation leakage detected; no training manifest was written")
-
-        groups = self._groups(videos, seed)
-        examples = self._examples(videos, groups, seed)
-        if len(examples) < self.config.audit_size:
-            raise LongRouteDataError(f"audit requires {self.config.audit_size} examples, found {len(examples)}")
-        self._write_audit_bundle(examples, seed)
-        source_hashes = {
-            manifest.name: hashlib.sha256(
-                _canonical_json(
-                    manifest.model_copy(
-                        update={"videos": tuple(sorted(manifest.videos, key=lambda video: video.video_id))}
-                    ).model_dump(mode="json")
-                ).encode("utf-8")
-            ).hexdigest()
-            for manifest in sorted(self.train_manifests, key=lambda item: item.name)
-        }
-        manifest = DatasetManifest(
-            manifest_version=MANIFEST_VERSION, seed=seed, source_manifest_hashes=source_hashes,
-            builder_config=self.config.model_dump(mode="json", exclude={"output_dir"}), group_assignment=groups,
-            split_statistics={split: sum(item.split == split for item in examples) for split in ("train", "dev")},
-            multi_event_ratio=(sum(item.template != "single_event" for item in examples) / len(examples)),
-            leakage_audit_uri=audit_path.name, examples=tuple(examples),
-        )
-        _atomic_write(self.config.output_dir / "longroute-manifest.json", manifest.canonical_json())
-        return manifest
+        root = self.config.output_dir; root.mkdir(parents=True, exist_ok=True)
+        hashes = {video.video_id: _sha256(video.path) for video in videos}
+        attempt = hashlib.sha256(f"{seed}:{_canonical_json(hashes)}".encode()).hexdigest()[:20]
+        payload: dict[str, object] = {"attempt_id": attempt, "seed": seed, "complete": False, "findings": []}
+        try:
+            assets = tuple(VideoAsset(video.video_id, video.path, (video.events[0].embedding,) * 8) for video in videos)
+            report = self.leakage_auditor.audit(assets, self.eval_assets, require_coverage=True)
+            payload.update({"parquet_uri": str(report.parquet_path.resolve()), "findings": [item.__dict__ for item in report.findings]})
+            if report.findings:
+                _atomic_write(root / "leakage-audit.json", _canonical_json(payload))
+                raise LongRouteLeakageError("formal evaluation leakage detected; no training manifest was written")
+            groups = self._groups(videos, seed); examples = self._examples(videos, groups, seed)
+            if len(examples) < self.config.audit_size: raise LongRouteDataError(f"audit requires {self.config.audit_size} examples, found {len(examples)}")
+            stage = root / ".staging" / attempt; stage.mkdir(parents=True, exist_ok=False)
+            payload["complete"] = True; _atomic_write(stage / "leakage-audit.json", _canonical_json(payload))
+            self._write_audit_bundle(examples, seed, stage / "audit")
+            if hashes != {video.video_id: _sha256(video.path) for video in videos}: raise LongRouteDataError("source file changed after leakage audit")
+            source_hashes = {m.name: hashlib.sha256(_canonical_json(m.model_copy(update={"videos": tuple(sorted(m.videos, key=lambda v: v.video_id))}).model_dump(mode="json")).encode()).hexdigest() for m in sorted(self.train_manifests, key=lambda m: m.name)}
+            uri = f"generations/{attempt}"
+            manifest = DatasetManifest(manifest_version=MANIFEST_VERSION, seed=seed, source_manifest_hashes=source_hashes, builder_config=self.config.model_dump(mode="json", exclude={"output_dir"}), group_assignment=groups, split_statistics={s: sum(e.split == s for e in examples) for s in ("train", "dev")}, multi_event_ratio=sum(e.template != "single_event" for e in examples) / len(examples), leakage_audit_uri=f"{uri}/leakage-audit.json", examples=tuple(examples), asset_sha256s=hashes, generation_uri=uri)
+            _atomic_write(stage / "manifest.json", manifest.canonical_json())
+            final = root / uri; final.parent.mkdir(parents=True, exist_ok=True); os.replace(stage, final)
+            _atomic_write(root / "current-generation.json", _canonical_json({"generation": uri, "seed": seed}))
+            _atomic_write(root / "last-attempt.json", _canonical_json({"attempt_id": attempt, "seed": seed, "status": "complete", "audit_uri": manifest.leakage_audit_uri}))
+            return manifest
+        except (LongRouteError, ValueError, OSError) as error:
+            failed = root / f"failed-audit-{attempt}.json"; _atomic_write(failed, _canonical_json(payload | {"error": type(error).__name__, "message": str(error)}))
+            _atomic_write(root / "last-attempt.json", _canonical_json({"attempt_id": attempt, "seed": seed, "status": "failed", "error": type(error).__name__, "audit_uri": str(failed)}))
+            if isinstance(error, ValueError): raise LongRouteDataError(str(error)) from error
+            raise
 
     def _validated_videos(self) -> tuple[SourceVideo, ...]:
         if not self.train_manifests:
             raise LongRouteDataError("at least one train split manifest is required")
-        ids: set[str] = set()
+        ids: set[str] = set(); questions: set[str] = set(); names: set[str] = set()
         videos: list[SourceVideo] = []
         for manifest in self.train_manifests:
+            if manifest.name in names: raise LongRouteDataError("duplicate manifest identity/name")
+            names.add(manifest.name)
             if manifest.split != "train":
                 raise LongRouteDataError("LongRoute accepts train split manifests only")
             for video in manifest.videos:
@@ -296,6 +301,9 @@ class LongRouteBuilder:
                     raise LongRouteDataError("duplicate video_id across train manifests")
                 if not video.path.is_file():
                     raise LongRouteDataError(f"source video path is unavailable: {video.path}")
+                for question in video.questions:
+                    if question.question_id in questions: raise LongRouteDataError("duplicate global question_id")
+                    questions.add(question.question_id)
                 ids.add(video.video_id)
                 videos.append(video)
         return tuple(sorted(videos, key=lambda item: item.video_id))
@@ -320,18 +328,19 @@ class LongRouteBuilder:
                 continue
         if not basic:
             raise LongRouteDataError("no split group can produce a 10 minutes route with 9-19 distractors")
-        multi_count = round(len(basic) * self.config.multi_event_ratio)
+        lower, upper = math.ceil(0.2 * len(basic)), math.floor(0.3 * len(basic))
+        if lower > upper: raise LongRouteDataError("final sample count cannot satisfy the 20-30% multi-event ratio")
+        multi_count = min(max(round(len(basic) * self.config.multi_event_ratio), lower), upper)
         ordered_ids = sorted(item.question_id for item in basic)
         random.Random(seed).shuffle(ordered_ids)
         multi_ids = set(ordered_ids[:multi_count])
         output: list[LongRouteExample] = []
-        source_by_id = {video.video_id: video for video in videos}
-        question_by_id = {question.question_id: question for _, question in targets}
+        labels = {f"{video.video_id}:{event.event_id}": event.label for video in videos for event in video.events}
         for item in basic:
             if item.question_id not in multi_ids:
                 output.append(item)
                 continue
-            upgraded = self._multi_event(item, source_by_id[item.target_source_video_id], question_by_id[item.question_id])
+            upgraded = self._multi_event(item, labels)
             output.append(upgraded)
         return output
 
@@ -347,14 +356,13 @@ class LongRouteBuilder:
         for candidate in ranked:
             if len(chosen) == self.config.max_distractors:
                 break
-            chosen.append(candidate)
-            duration += candidate[1].end_sec - candidate[1].start_sec
+            length = candidate[1].end_sec - candidate[1].start_sec
+            if duration + length > 3600: continue
+            chosen.append(candidate); duration += length
             if len(chosen) >= self.config.min_distractors and duration >= 600:
                 break
         if len(chosen) < self.config.min_distractors or duration < 600:
             raise LongRouteDataError("cannot reach 10 minutes with no more than 19 distractors")
-        if duration > 3600:
-            raise LongRouteDataError("route exceeds 60 minutes without permitted source range")
         position = _seeded_index(seed, question.question_id, len(chosen) + 1)
         entries = chosen[:]
         entries.insert(position, (video, target))
@@ -364,32 +372,29 @@ class LongRouteBuilder:
             length = event.end_sec - event.start_sec
             segments.append(VirtualSegment(source_video_id=source.video_id, event_id=event.event_id, source_start_sec=event.start_sec, source_end_sec=event.end_sec, global_start_sec=offset, global_end_sec=offset + length))
             offset += length
-        return LongRouteExample(question_id=question.question_id, split=split, question=question.question, options=question.options, answer=question.answer, target_source_video_id=video.video_id, target_event_id=target.event_id, target_position=position, supporting_event_ids=(target.event_id,), template="single_event", segments=tuple(segments), duration_sec=offset)
+        target_id = f"{video.video_id}:{target.event_id}"
+        return LongRouteExample(question_id=question.question_id, split=split, question=question.question, options=question.options, answer=question.answer, target_source_video_id=video.video_id, target_event_id=target_id, target_position=position, supporting_event_ids=(target_id,), template="single_event", segments=tuple(segments), duration_sec=offset)
 
-    def _multi_event(self, item: LongRouteExample, video: SourceVideo, question: SourceQuestion) -> LongRouteExample:
-        target = next(event for event in video.events if event.event_id == question.target_event_id)
-        other = next((event for event in sorted(video.events, key=lambda event: (event.start_sec, event.event_id)) if event.event_id != target.event_id), None)
-        if other is None:
-            return item
-        if target.start_sec <= other.start_sec:
-            prompt = f"Which event happens after {target.label}?"
-            answer = other.label
-        else:
-            prompt = f"Which event happens before {target.label}?"
-            answer = other.label
-        return item.model_copy(update={"question": prompt, "options": (answer, "None of these"), "answer": answer, "supporting_event_ids": (target.event_id, other.event_id), "template": "before_after"})
+    def _multi_event(self, item: LongRouteExample, labels: dict[str, str]) -> LongRouteExample:
+        pos = item.target_position; left_i, right_i = (pos, pos + 1) if pos + 1 < len(item.segments) else (pos - 1, pos)
+        left, right = item.segments[left_i], item.segments[right_i]
+        left_id, right_id = f"{left.source_video_id}:{left.event_id}", f"{right.source_video_id}:{right.event_id}"
+        if right.global_start_sec != left.global_end_sec: raise LongRouteDataError("multi-event supporting segments must be adjacent")
+        answer = labels[right_id]
+        return item.model_copy(update={"question": f"Which event happens immediately after {labels[left_id]}?", "options": (answer, "None of these"), "answer": answer, "supporting_event_ids": (left_id, right_id), "template": "before_after"})
 
-    def _write_audit_bundle(self, examples: Sequence[LongRouteExample], seed: int) -> None:
+    def _write_audit_bundle(self, examples: Sequence[LongRouteExample], seed: int, bundle: Path) -> None:
         if self.contact_sheet_provider is None:
             raise LongRouteDataError("a contact_sheet_provider is required for the human audit package")
         selected = sorted(examples, key=lambda item: item.question_id)[: self.config.audit_size]
         records = []
         for example in selected:
             contact = str(self.contact_sheet_provider(example))
-            if not contact:
+            local = Path(contact)
+            remote = contact.startswith("https://") or contact.startswith("s3://")
+            if not contact or (not remote and (not local.is_file() or not os.access(local, os.R_OK) or local.stat().st_size == 0)):
                 raise LongRouteDataError("contact sheet provider returned an empty path")
             records.append({"question_id": example.question_id, "question": example.question, "options": list(example.options), "answer": example.answer, "source_events": [segment.model_dump(mode="json") for segment in example.segments], "global_offsets": [[segment.global_start_sec, segment.global_end_sec] for segment in example.segments], "contact_sheet": contact, "seed": seed})
-        bundle = self.config.output_dir / "audit"
         _atomic_write(bundle / "samples.json", _canonical_json(records))
         _atomic_write(bundle / "samples.jsonl", "".join(_canonical_json(record) + "\n" for record in records))
         import io

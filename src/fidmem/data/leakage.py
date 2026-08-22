@@ -147,13 +147,19 @@ class LeakageAuditor:
             connection.close()
 
     def audit(
-        self, train: Iterable[VideoAsset], eval: Iterable[VideoAsset]
+        self, train: Iterable[VideoAsset], eval: Iterable[VideoAsset], *, require_coverage: bool = False
     ) -> LeakageReport:
         """Compare split pairs by normalized ID, SHA-256, then cosine similarity."""
         train_assets = tuple(train)
         eval_assets = tuple(eval)
         hashes = {asset: _sha256(asset.path) for asset in (*train_assets, *eval_assets)}
         centroids: dict[VideoAsset, tuple[float, ...] | None] = {}
+        if require_coverage:
+            for asset in (*train_assets, *eval_assets):
+                centroid = self._embedding_centroid(asset)
+                if centroid is None:
+                    raise ValueError("eight-frame centroid coverage is required for every audited asset")
+                centroids[asset] = centroid
         findings: list[LeakageFinding] = []
 
         for train_asset in train_assets:

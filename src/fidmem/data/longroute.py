@@ -218,6 +218,12 @@ def _sha256(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+def _canonical_source_manifest(manifest: TrainSplitManifest) -> TrainSplitManifest:
+    videos = tuple(video.model_copy(update={"events": tuple(sorted(video.events, key=lambda event: event.event_id)), "questions": tuple(sorted(video.questions, key=lambda question: question.question_id))}) for video in sorted(manifest.videos, key=lambda video: video.video_id))
+    return manifest.model_copy(update={"videos": videos})
+
+
+
 
 def _seeded_index(seed: int, key: str, upper: int) -> int:
     digest = hashlib.sha256(f"{seed}:{key}".encode("utf-8")).digest()
@@ -272,7 +278,7 @@ class LongRouteBuilder:
             payload["complete"] = True; _atomic_write(stage / "leakage-audit.json", _canonical_json(payload))
             self._write_audit_bundle(examples, seed, stage / "audit")
             if hashes != {video.video_id: _sha256(video.path) for video in videos}: raise LongRouteDataError("source file changed after leakage audit")
-            source_hashes = {m.name: hashlib.sha256(_canonical_json(m.model_copy(update={"videos": tuple(sorted(m.videos, key=lambda v: v.video_id))}).model_dump(mode="json")).encode()).hexdigest() for m in sorted(self.train_manifests, key=lambda m: m.name)}
+            source_hashes = {m.name: hashlib.sha256(_canonical_json(_canonical_source_manifest(m).model_dump(mode="json")).encode()).hexdigest() for m in sorted(self.train_manifests, key=lambda m: m.name)}
             uri = f"generations/{attempt}"
             manifest = DatasetManifest(manifest_version=MANIFEST_VERSION, seed=seed, source_manifest_hashes=source_hashes, builder_config=self.config.model_dump(mode="json", exclude={"output_dir"}), group_assignment=groups, split_statistics={s: sum(e.split == s for e in examples) for s in ("train", "dev")}, multi_event_ratio=sum(e.template != "single_event" for e in examples) / len(examples), leakage_audit_uri=f"{uri}/leakage-audit.json", examples=tuple(examples), asset_sha256s=hashes, generation_uri=uri)
             _atomic_write(stage / "manifest.json", manifest.canonical_json())

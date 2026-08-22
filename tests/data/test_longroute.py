@@ -197,3 +197,32 @@ def test_nested_reordering_does_not_change_canonical_manifest_and_duplicate_ques
     duplicate = manifest.model_copy(update={"videos": manifest.videos + (manifest.videos[0].model_copy(update={"video_id": "new-video"}),)})
     with pytest.raises(LongRouteDataError, match="question"):
         _builder(tmp_path / "duplicate", duplicate).build(5)
+
+def test_review_c2_toctou_mutation_after_audit_fails_without_repointing_current(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    output = tmp_path / "out"
+    _builder(output, manifest).build(1)
+    old_pointer = (output / "output" / "current-generation.json").read_text()
+    def mutate(example: object) -> Path:
+        (tmp_path / "video-0.bin").write_bytes(b"mutated-after-audit")
+        path = output / "sheets" / f"{getattr(example, 'question_id')}.jpg"; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"sheet"); return path
+    builder = LongRouteBuilder((manifest,), eval_assets=(), leakage_auditor=LeakageAuditor(tmp_path / "audit.parquet"), config=LongRouteConfig(output_dir=output / "output", audit_size=1), contact_sheet_provider=mutate)
+    with pytest.raises(LongRouteDataError, match="changed"):
+        builder.build(2)
+    assert (output / "output" / "current-generation.json").read_text() == old_pointer
+    assert json.loads((output / "output" / "last-attempt.json").read_text())["status"] == "failed"
+
+
+def test_review_c8_contact_sheet_local_and_remote_contract(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    rejected = LongRouteBuilder((manifest,), eval_assets=(), leakage_auditor=LeakageAuditor(tmp_path / "audit.parquet"), config=LongRouteConfig(output_dir=tmp_path / "bad", audit_size=1), contact_sheet_provider=lambda _example: tmp_path / "missing.jpg")
+    with pytest.raises(LongRouteDataError, match="contact"):
+        rejected.build(1)
+    accepted = LongRouteBuilder((manifest,), eval_assets=(), leakage_auditor=LeakageAuditor(tmp_path / "remote.parquet"), config=LongRouteConfig(output_dir=tmp_path / "remote", audit_size=1), contact_sheet_provider=lambda _example: "https://example.invalid/sheet.jpg")
+    assert accepted.build(2).examples
+
+
+def test_review_c6_nested_event_order_keeps_source_hashes_identical(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    altered = manifest.model_copy(update={"videos": tuple(video.model_copy(update={"events": tuple(reversed(video.events)), "questions": tuple(reversed(video.questions))}) for video in reversed(manifest.videos))})
+    assert _builder(tmp_path / "one", manifest).build(1).source_manifest_hashes == _builder(tmp_path / "two", altered).build(1).source_manifest_hashes

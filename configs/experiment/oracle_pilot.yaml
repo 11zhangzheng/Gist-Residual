@@ -1,0 +1,10 @@
+oracle_pilot:
+  question_count: 100
+  device: A800
+  beam_size: 8
+  max_depth: 5
+  exhaustive_subset_size: 20
+  stability_state_count: 100
+  stability_repeats: 3
+  flip_rate_threshold: 0.02
+  cost_preferences: [0.0, 0.1, 0.3, 1.0]

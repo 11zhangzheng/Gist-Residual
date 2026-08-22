@@ -240,6 +240,145 @@ def test_audit_models_reject_directly_forged_summaries() -> None:
         )
 
 
+def test_audit_subsummaries_revalidate_constructed_and_mutated_leaves() -> None:
+    bad_timing = PilotQuestionTiming.model_construct(
+        question_id="q000", a800_gpu_seconds=-1
+    )
+    timings = (bad_timing,) + tuple(
+        PilotQuestionTiming(question_id=f"q{i:03d}", a800_gpu_seconds=1)
+        for i in range(1, 100)
+    )
+    with pytest.raises(ValidationError):
+        PilotTimingAudit(
+            question_count=100,
+            mean_a800_gpu_seconds=0.98,
+            p90_a800_gpu_seconds=1,
+            per_question=timings,
+        )
+
+    bad_case = BeamAuditCase(
+        question_id="q0",
+        beam_action_signature=("A",),
+        exhaustive_action_signature=("A",),
+        beam_cost=1,
+        exhaustive_cost=0,
+    )
+    object.__setattr__(bad_case, "beam_cost", -5)
+    with pytest.raises(ValidationError):
+        BeamSearchAudit(
+            case_count=1,
+            path_hit_rate=1,
+            mean_cost_gap=-5,
+            cases=(bad_case,),
+        )
+
+    bad_sample = StabilitySample.model_construct(state_id="s000", answers=("A", "A"))
+    samples = (bad_sample,) + tuple(
+        StabilitySample(state_id=f"s{i:03d}", answers=("A", "A", "A"))
+        for i in range(1, 100)
+    )
+    with pytest.raises(ValidationError):
+        AnswerStabilityAudit(
+            state_count=100,
+            repeats_per_state=3,
+            flipped_state_count=0,
+            answer_flip_rate=0,
+            samples=samples,
+        )
+
+
+def test_final_oracle_audit_revalidates_every_injected_leaf() -> None:
+    valid_timing = summarize_pilot_timings(
+        tuple(
+            PilotQuestionTiming(question_id=f"q{i:03d}", a800_gpu_seconds=1)
+            for i in range(100)
+        )
+    )
+    valid_beam = compare_beam_to_exhaustive(
+        (
+            BeamAuditCase(
+                question_id="q0",
+                beam_action_signature=("A",),
+                exhaustive_action_signature=("A",),
+                beam_cost=1,
+                exhaustive_cost=1,
+            ),
+        )
+    )
+    valid_stability = answer_stability_audit(
+        tuple(
+            StabilitySample(state_id=f"s{i:03d}", answers=("A", "A", "A"))
+            for i in range(100)
+        )
+    )
+
+    bad_timing_leaf = PilotQuestionTiming.model_construct(
+        question_id="q000", a800_gpu_seconds=-1
+    )
+    forged_timing = PilotTimingAudit.model_construct(
+        question_count=100,
+        mean_a800_gpu_seconds=0.98,
+        p90_a800_gpu_seconds=1,
+        per_question=(bad_timing_leaf,) + valid_timing.per_question[1:],
+    )
+    bad_beam_leaf = BeamAuditCase.model_construct(
+        question_id="q0",
+        beam_action_signature=("A",),
+        exhaustive_action_signature=("A",),
+        beam_cost=-5,
+        exhaustive_cost=0,
+    )
+    forged_beam = BeamSearchAudit.model_construct(
+        case_count=1,
+        path_hit_rate=1,
+        mean_cost_gap=-5,
+        cases=(bad_beam_leaf,),
+    )
+    bad_stability_leaf = StabilitySample.model_construct(
+        state_id="s000", answers=("A", "A")
+    )
+    forged_stability = AnswerStabilityAudit.model_construct(
+        state_count=100,
+        repeats_per_state=3,
+        flipped_state_count=0,
+        answer_flip_rate=0,
+        samples=(bad_stability_leaf,) + valid_stability.samples[1:],
+    )
+
+    for timing, beam, stability in (
+        (forged_timing, valid_beam, valid_stability),
+        (valid_timing, forged_beam, valid_stability),
+        (valid_timing, valid_beam, forged_stability),
+    ):
+        with pytest.raises(ValidationError):
+            OraclePilotAudit(timing=timing, beam=beam, stability=stability)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    (
+        (PilotQuestionTiming, {"question_id": "", "a800_gpu_seconds": 1}),
+        (
+            BeamAuditCase,
+            {
+                "question_id": "",
+                "beam_action_signature": ["A"],
+                "exhaustive_action_signature": ["A"],
+                "beam_cost": 1,
+                "exhaustive_cost": 1,
+            },
+        ),
+        (StabilitySample, {"state_id": "", "answers": ["A", "A", "A"]}),
+    ),
+)
+def test_audit_leaf_ids_must_not_be_empty(
+    model: type[PilotQuestionTiming | BeamAuditCase | StabilitySample],
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
 def test_oracle_pilot_json_rejects_nested_raw_summary_mismatches() -> None:
     payload = {
         "timing": {
@@ -285,6 +424,8 @@ def test_oracle_pilot_json_rejects_nested_raw_summary_mismatches() -> None:
     (
         {"constant": 1, "sample_count": 1},
         {"constant": 1, "sample_count": 1, "source_split": "dev"},
+        {"constant": 1, "sample_count": True, "source_split": "train"},
+        {"constant": 1, "sample_count": 1.0, "source_split": "train"},
         {"constant": float("nan"), "sample_count": 1, "source_split": "train"},
         {"constant": 1, "sample_count": 0, "source_split": "train"},
     ),

@@ -32,7 +32,7 @@ class CostNormalization(BaseModel):
 
     constant: float = Field(gt=0)
     method: Literal["max_train_total_cost"] = "max_train_total_cost"
-    sample_count: int = Field(ge=1)
+    sample_count: int = Field(ge=1, strict=True)
     source_split: Literal["train"]
 
 
@@ -180,9 +180,11 @@ def sufficiency_label(
 
 
 class PilotQuestionTiming(BaseModel):
-    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, allow_inf_nan=False, revalidate_instances="always"
+    )
 
-    question_id: str
+    question_id: str = Field(min_length=1)
     a800_gpu_seconds: float = Field(ge=0)
 
 
@@ -237,9 +239,11 @@ def summarize_pilot_timings(
 
 
 class BeamAuditCase(BaseModel):
-    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, allow_inf_nan=False, revalidate_instances="always"
+    )
 
-    question_id: str
+    question_id: str = Field(min_length=1)
     beam_action_signature: tuple[str, ...]
     exhaustive_action_signature: tuple[str, ...]
     beam_cost: float = Field(ge=0)
@@ -306,9 +310,9 @@ def compare_beam_to_exhaustive(
 
 
 class StabilitySample(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, revalidate_instances="always")
 
-    state_id: str
+    state_id: str = Field(min_length=1)
     answers: tuple[str, str, str]
 
 

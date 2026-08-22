@@ -5,12 +5,17 @@ from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 from fidmem.agent.answerer import FrozenAnswerer
 from fidmem.oracle.labels import (
+    AnswerStabilityAudit,
     BeamAuditCase,
+    BeamSearchAudit,
+    CostNormalization,
     OraclePilotAudit,
     PilotQuestionTiming,
+    PilotTimingAudit,
     StabilitySample,
     answer_stability_audit,
     compare_beam_to_exhaustive,
@@ -189,6 +194,106 @@ def test_pilot_beam_and_stability_audits_have_fixed_reviewable_shapes() -> None:
         report.stability.repeats_per_state,
         report.stability.answer_flip_rate,
     ) == (100, 3, 0.01)
+
+
+def test_audit_models_reject_directly_forged_summaries() -> None:
+    timings = tuple(
+        PilotQuestionTiming(question_id=f"q{i:03d}", a800_gpu_seconds=1)
+        for i in range(100)
+    )
+    with pytest.raises(ValidationError, match="mean_a800_gpu_seconds"):
+        PilotTimingAudit(
+            question_count=100,
+            mean_a800_gpu_seconds=999,
+            p90_a800_gpu_seconds=999,
+            per_question=timings,
+        )
+
+    beam_cases = (
+        BeamAuditCase(
+            question_id="q0",
+            beam_action_signature=("A",),
+            exhaustive_action_signature=("A",),
+            beam_cost=3,
+            exhaustive_cost=3,
+        ),
+    )
+    with pytest.raises(ValidationError, match="case_count"):
+        BeamSearchAudit(
+            case_count=99,
+            path_hit_rate=0,
+            mean_cost_gap=999,
+            cases=beam_cases,
+        )
+
+    samples = tuple(
+        StabilitySample(state_id=f"s{i:03d}", answers=("A", "B", "A"))
+        for i in range(100)
+    )
+    with pytest.raises(ValidationError, match="flipped_state_count"):
+        AnswerStabilityAudit(
+            state_count=100,
+            repeats_per_state=3,
+            flipped_state_count=0,
+            answer_flip_rate=0,
+            samples=samples,
+        )
+
+
+def test_oracle_pilot_json_rejects_nested_raw_summary_mismatches() -> None:
+    payload = {
+        "timing": {
+            "question_count": 100,
+            "mean_a800_gpu_seconds": 999,
+            "p90_a800_gpu_seconds": 999,
+            "per_question": [
+                {"question_id": f"q{i:03d}", "a800_gpu_seconds": 1} for i in range(100)
+            ],
+        },
+        "beam": {
+            "case_count": 99,
+            "path_hit_rate": 0,
+            "mean_cost_gap": 999,
+            "cases": [
+                {
+                    "question_id": "q0",
+                    "beam_action_signature": ["A"],
+                    "exhaustive_action_signature": ["A"],
+                    "beam_cost": 3,
+                    "exhaustive_cost": 3,
+                }
+            ],
+        },
+        "stability": {
+            "state_count": 100,
+            "repeats_per_state": 3,
+            "flipped_state_count": 0,
+            "answer_flip_rate": 0,
+            "samples": [
+                {"state_id": f"s{i:03d}", "answers": ["A", "B", "A"]}
+                for i in range(100)
+            ],
+        },
+    }
+
+    with pytest.raises(ValidationError):
+        OraclePilotAudit.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"constant": 1, "sample_count": 1},
+        {"constant": 1, "sample_count": 1, "source_split": "dev"},
+        {"constant": float("nan"), "sample_count": 1, "source_split": "train"},
+        {"constant": 1, "sample_count": 0, "source_split": "train"},
+    ),
+)
+def test_cost_normalization_json_rejects_untrusted_provenance_or_scale(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        CostNormalization.model_validate_json(json.dumps(payload))
 
 
 def test_oracle_pilot_config_preregisters_counts_search_bounds_and_device() -> None:

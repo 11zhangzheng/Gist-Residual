@@ -17,6 +17,14 @@ from .search import OraclePath
 
 
 COST_PREFERENCES = (0.0, 0.1, 0.3, 1.0)
+_SUMMARY_REL_TOL = 1e-9
+_SUMMARY_ABS_TOL = 1e-12
+
+
+def _summary_matches(reported: float, expected: float) -> bool:
+    return math.isclose(
+        reported, expected, rel_tol=_SUMMARY_REL_TOL, abs_tol=_SUMMARY_ABS_TOL
+    )
 
 
 class CostNormalization(BaseModel):
@@ -25,7 +33,7 @@ class CostNormalization(BaseModel):
     constant: float = Field(gt=0)
     method: Literal["max_train_total_cost"] = "max_train_total_cost"
     sample_count: int = Field(ge=1)
-    source_split: Literal["train"] = "train"
+    source_split: Literal["train"]
 
 
 def _normalization_payload(normalization: CostNormalization) -> dict[str, object]:
@@ -86,6 +94,7 @@ def fit_train_cost_normalization(
     normalization = CostNormalization(
         constant=constant,
         sample_count=len(costs),
+        source_split="train",
     )
     _write_manifest(run_manifest, normalization)
     return normalization
@@ -178,12 +187,35 @@ class PilotQuestionTiming(BaseModel):
 
 
 class PilotTimingAudit(BaseModel):
-    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, allow_inf_nan=False, revalidate_instances="always"
+    )
 
-    question_count: int
+    question_count: int = Field(ge=1, strict=True)
     mean_a800_gpu_seconds: float = Field(ge=0)
     p90_a800_gpu_seconds: float = Field(ge=0)
     per_question: tuple[PilotQuestionTiming, ...]
+
+    def validate_consistency(self) -> None:
+        if self.question_count != len(self.per_question):
+            raise ValueError("question_count does not match per_question")
+        if self.question_count != 100:
+            raise ValueError("question_count must be exactly 100")
+        ids = tuple(record.question_id for record in self.per_question)
+        if len(set(ids)) != len(ids):
+            raise ValueError("per_question question ids must be unique")
+        ordered = sorted(record.a800_gpu_seconds for record in self.per_question)
+        expected_mean = sum(ordered) / len(ordered)
+        expected_p90 = ordered[math.ceil(0.9 * len(ordered)) - 1]
+        if not _summary_matches(self.mean_a800_gpu_seconds, expected_mean):
+            raise ValueError("mean_a800_gpu_seconds does not match per_question")
+        if not _summary_matches(self.p90_a800_gpu_seconds, expected_p90):
+            raise ValueError("p90_a800_gpu_seconds does not match per_question")
+
+    @model_validator(mode="after")
+    def summary_must_match_raw_timings(self) -> "PilotTimingAudit":
+        self.validate_consistency()
+        return self
 
 
 def summarize_pilot_timings(
@@ -215,12 +247,38 @@ class BeamAuditCase(BaseModel):
 
 
 class BeamSearchAudit(BaseModel):
-    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, allow_inf_nan=False, revalidate_instances="always"
+    )
 
-    case_count: int = Field(ge=1)
+    case_count: int = Field(ge=1, strict=True)
     path_hit_rate: float = Field(ge=0, le=1)
     mean_cost_gap: float
     cases: tuple[BeamAuditCase, ...]
+
+    def validate_consistency(self) -> None:
+        if self.case_count != len(self.cases):
+            raise ValueError("case_count does not match cases")
+        ids = tuple(record.question_id for record in self.cases)
+        if len(set(ids)) != len(ids):
+            raise ValueError("Beam audit question ids must be unique")
+        hits = sum(
+            record.beam_action_signature == record.exhaustive_action_signature
+            for record in self.cases
+        )
+        expected_hit_rate = hits / len(self.cases)
+        expected_cost_gap = sum(
+            record.beam_cost - record.exhaustive_cost for record in self.cases
+        ) / len(self.cases)
+        if not _summary_matches(self.path_hit_rate, expected_hit_rate):
+            raise ValueError("path_hit_rate does not match cases")
+        if not _summary_matches(self.mean_cost_gap, expected_cost_gap):
+            raise ValueError("mean_cost_gap does not match cases")
+
+    @model_validator(mode="after")
+    def summary_must_match_raw_cases(self) -> "BeamSearchAudit":
+        self.validate_consistency()
+        return self
 
 
 def compare_beam_to_exhaustive(
@@ -255,13 +313,35 @@ class StabilitySample(BaseModel):
 
 
 class AnswerStabilityAudit(BaseModel):
-    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True, allow_inf_nan=False, revalidate_instances="always"
+    )
 
-    state_count: int
+    state_count: int = Field(ge=1, strict=True)
     repeats_per_state: Literal[3]
-    flipped_state_count: int
+    flipped_state_count: int = Field(ge=0, strict=True)
     answer_flip_rate: float = Field(ge=0, le=1)
     samples: tuple[StabilitySample, ...]
+
+    def validate_consistency(self) -> None:
+        if self.state_count != len(self.samples):
+            raise ValueError("state_count does not match samples")
+        if self.state_count != 100:
+            raise ValueError("state_count must be exactly 100")
+        ids = tuple(record.state_id for record in self.samples)
+        if len(set(ids)) != len(ids):
+            raise ValueError("stability state ids must be unique")
+        expected_flips = sum(len(set(record.answers)) > 1 for record in self.samples)
+        if self.flipped_state_count != expected_flips:
+            raise ValueError("flipped_state_count does not match samples")
+        expected_flip_rate = expected_flips / len(self.samples)
+        if not _summary_matches(self.answer_flip_rate, expected_flip_rate):
+            raise ValueError("answer_flip_rate does not match samples")
+
+    @model_validator(mode="after")
+    def summary_must_match_raw_samples(self) -> "AnswerStabilityAudit":
+        self.validate_consistency()
+        return self
 
 
 def answer_stability_audit(
@@ -286,8 +366,15 @@ def answer_stability_audit(
 class OraclePilotAudit(BaseModel):
     """Serializable artifact schema for the preregistered Task 9 pilot."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, revalidate_instances="always")
 
     timing: PilotTimingAudit
     beam: BeamSearchAudit
     stability: AnswerStabilityAudit
+
+    @model_validator(mode="after")
+    def nested_audits_must_remain_consistent(self) -> "OraclePilotAudit":
+        self.timing.validate_consistency()
+        self.beam.validate_consistency()
+        self.stability.validate_consistency()
+        return self

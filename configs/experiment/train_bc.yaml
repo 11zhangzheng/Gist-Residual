@@ -1,0 +1,33 @@
+model_config_path: ../model/router.yaml
+model_overrides:
+  hidden_dim: 64
+  token_embedding_dim: 48
+  action_type_embedding_dim: 16
+  fidelity_embedding_dim: 8
+  num_encoder_layers: 1
+  num_attention_heads: 4
+  feedforward_multiplier: 2
+  dropout: 0.0
+  max_question_bytes: 128
+  max_item_bytes: 96
+  enforce_parameter_range: false
+training:
+  seed: 13
+  max_steps: 200
+  batch_size: 32
+  learning_rate: 0.003
+  weight_decay: 0.0
+  scheduler_gamma: 1.0
+  checkpoint_path: artifacts/router-bc-smoke.pt
+  checkpoint_every: 20
+  device: cpu
+  split_seed: 2026
+  train_fraction: 0.8
+  dev_fraction: 0.1
+  loss_weights:
+    action: 1.0
+    sufficiency: 0.3
+    cost_to_go: 0.1
+dataset_path: null
+smoke_dataset_size: 32
+seeds: [13, 37, 73]

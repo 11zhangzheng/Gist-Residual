@@ -12,10 +12,10 @@ import json
 import math
 import os
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import duckdb
 import torch
@@ -30,8 +30,8 @@ from pydantic import (
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
 from fidmem.types import ActionInstance, ActionType, FidelityLevel, RouterState
-
 
 _ACTION_INDEX = {action: index for index, action in enumerate(ActionType)}
 _FIDELITY_INDEX = {level: index for index, level in enumerate(FidelityLevel)}
@@ -49,6 +49,81 @@ def _canonical_json(value: object) -> str:
     )
 
 
+class TextTokenizer(Protocol):
+    identity: object
+
+    def encode(self, text: str, *, maximum: int, label: str) -> list[int]:
+        ...
+
+
+class TestByteTokenizer:
+    identity = "offline-byte-tokenizer-v1"
+
+    def encode(self, text: str, *, maximum: int, label: str) -> list[int]:
+        encoded = text.encode("utf-8")
+        if len(encoded) > maximum:
+            raise ValueError(f"{label} exceeds configured maximum of {maximum} tokens")
+        return [value + 1 for value in encoded]
+
+
+class HFTokenizerAdapter:
+    """No-truncation adapter around a pinned Hugging Face tokenizer."""
+
+    def __init__(self, identity: object, tokenizer: object) -> None:
+        self.identity = identity
+        self._tokenizer = tokenizer
+
+    def encode(self, text: str, *, maximum: int, label: str) -> list[int]:
+        encode = getattr(self._tokenizer, "encode", None)
+        if not callable(encode):
+            raise ValueError("pretrained tokenizer does not expose encode")
+        token_ids = list(encode(text, add_special_tokens=True, truncation=False))
+        if len(token_ids) > maximum:
+            raise ValueError(f"{label} exceeds configured maximum of {maximum} tokens")
+        if any(not isinstance(token_id, int) or token_id < 0 for token_id in token_ids):
+            raise ValueError("pretrained tokenizer emitted invalid token ids")
+        return token_ids
+
+
+class LongRouteSourceIdentity(BaseModel):
+    """Immutable lineage extracted from a published LongRoute manifest."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    dataset_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    split: Literal["train", "dev"]
+    video_group_id: str = Field(min_length=1)
+    example_id: str = Field(min_length=1)
+
+
+class OracleRecordProvenance(BaseModel):
+    """Auditable Task8/Task9 lineage carried by every BC row."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+    dataset_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_split: Literal["train", "dev"]
+    video_group_id: str = Field(min_length=1)
+    longroute_example_id: str = Field(min_length=1)
+    normalization_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    normalization: CostNormalization
+    preference_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preference_values: tuple[float, float, float, float]
+    selected_preference: float = Field(ge=0, le=1)
+    oracle_utility: float
+    optimal_action_tie_count: int = Field(ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def validate_frozen_preferences(self) -> "OracleRecordProvenance":
+        if self.preference_values != COST_PREFERENCES:
+            raise ValueError("preference_values must match Task9 COST_PREFERENCES")
+        if self.selected_preference not in self.preference_values:
+            raise ValueError("selected preference is not in the four-value set")
+        return self
+
+
 class OracleBCRecord(BaseModel):
     """One supervised state with a complete candidate-instance action set."""
 
@@ -60,6 +135,7 @@ class OracleBCRecord(BaseModel):
     video_id: str = Field(min_length=1)
     question_id: str = Field(min_length=1)
     observation_snapshot_id: str = Field(min_length=1)
+    provenance: OracleRecordProvenance
     state: RouterState
     action_instances: tuple[ActionInstance, ...] = Field(min_length=1)
     legal_action_mask: tuple[StrictBool, ...] = Field(min_length=1)
@@ -84,7 +160,102 @@ class OracleBCRecord(BaseModel):
             raise ValueError("target action must be legal")
         if not math.isfinite(self.cost_to_go):
             raise ValueError("cost_to_go must be finite")
+        if self.video_id != self.provenance.video_group_id:
+            raise ValueError("video_id must equal provenance video_group_id")
+        if self.state.cost_preference != self.provenance.selected_preference:
+            raise ValueError("state preference must match provenance")
         return self
+
+
+def materialize_oracle_record(
+    *,
+    record_id: str,
+    question_id: str,
+    observation_snapshot_id: str,
+    state: RouterState,
+    action_instances: Sequence[ActionInstance],
+    legal_action_mask: Sequence[bool],
+    preference_labels: Sequence[PreferenceLabel],
+    selected_preference: float,
+    oracle_action: ActionInstance,
+    sufficiency_target: int,
+    cost_to_go: float,
+    normalization: CostNormalization,
+    normalization_manifest: Mapping[str, object],
+    source_identity: LongRouteSourceIdentity,
+) -> OracleBCRecord:
+    """Convert Task9 labels plus Task8 lineage into one strict BC row."""
+
+    labels = tuple(
+        PreferenceLabel.model_validate(label.model_dump(mode="python"))
+        for label in preference_labels
+    )
+    if tuple(label.cost_preference for label in labels) != COST_PREFERENCES:
+        raise ValueError("preference labels must contain the four Task9 preferences")
+    selected = next(
+        (label for label in labels if label.cost_preference == selected_preference),
+        None,
+    )
+    if selected is None:
+        raise ValueError("selected preference has no Task9 label")
+    if state.cost_preference != selected_preference:
+        raise ValueError("state cost preference does not match selected label")
+    optimal_actions = selected.optimal_first_actions
+    if oracle_action not in optimal_actions:
+        raise ValueError("oracle action is not optimal for the selected preference")
+    actions = tuple(action_instances)
+    mask = tuple(legal_action_mask)
+    if oracle_action not in actions:
+        raise ValueError("oracle action is absent from action_instances")
+    target_index = actions.index(oracle_action)
+    if target_index >= len(mask) or not mask[target_index]:
+        raise ValueError("oracle action is not legal in the supplied mask")
+    normalization_payload = normalization.model_dump(mode="json")
+    expected_manifest = {"oracle_cost_normalization": normalization_payload}
+    if dict(normalization_manifest) != expected_manifest:
+        raise ValueError("normalization manifest does not match Task9 normalization")
+    normalization_hash = hashlib.sha256(
+        _canonical_json(normalization_manifest).encode("utf-8")
+    ).hexdigest()
+    preference_payload = tuple(
+        {
+            "cost_preference": label.cost_preference,
+            "utility": label.utility,
+            "optimal_first_actions": tuple(
+                action.model_dump(mode="json") for action in label.optimal_first_actions
+            ),
+        }
+        for label in labels
+    )
+    preference_hash = hashlib.sha256(
+        _canonical_json(preference_payload).encode("utf-8")
+    ).hexdigest()
+    return OracleBCRecord(
+        record_id=record_id,
+        video_id=source_identity.video_group_id,
+        question_id=question_id,
+        observation_snapshot_id=observation_snapshot_id,
+        provenance=OracleRecordProvenance(
+            dataset_manifest_hash=source_identity.dataset_manifest_hash,
+            source_manifest_hash=source_identity.source_manifest_hash,
+            source_split=source_identity.split,
+            video_group_id=source_identity.video_group_id,
+            longroute_example_id=source_identity.example_id,
+            normalization_manifest_hash=normalization_hash,
+            normalization=normalization,
+            preference_set_hash=preference_hash,
+            preference_values=COST_PREFERENCES,
+            selected_preference=selected_preference,
+            oracle_utility=selected.utility,
+            optimal_action_tie_count=len(optimal_actions),
+        ),
+        state=state,
+        action_instances=actions,
+        legal_action_mask=mask,
+        target_action_index=target_index,
+        sufficiency_target=sufficiency_target,
+        cost_to_go=cost_to_go,
+    )
 
 
 class SplitManifest(BaseModel):
@@ -115,6 +286,21 @@ class OracleBCDataset(Dataset[OracleBCRecord]):
         if len(set(ids)) != len(ids):
             raise ValueError("Oracle BC record ids must be unique")
         self._records = tuple(sorted(validated, key=lambda record: record.record_id))
+        video_splits: dict[str, set[str]] = {}
+        for record in self._records:
+            video_splits.setdefault(record.video_id, set()).add(
+                record.provenance.source_split
+            )
+        if any(len(splits) != 1 for splits in video_splits.values()):
+            raise ValueError("one video group cannot cross LongRoute source splits")
+        self.normalization_manifest_hashes = tuple(
+            sorted(
+                {
+                    record.provenance.normalization_manifest_hash
+                    for record in self._records
+                }
+            )
+        )
         payload = "\n".join(
             _canonical_json(record.model_dump(mode="json")) for record in self._records
         )
@@ -216,15 +402,27 @@ def _atomic_write(path: Path, payload: bytes) -> None:
 
 
 def write_oracle_records(path: str | Path, records: Sequence[OracleBCRecord]) -> None:
-    """Write strict JSONL or a one-column Parquet without pickle payloads."""
+    """Write strict JSONL or auditable structured Parquet without pickle."""
 
     target = Path(path)
     dataset = OracleBCDataset(records)
     rows = tuple(
-        _canonical_json(record.model_dump(mode="json")) for record in dataset.records
+        (
+            record.record_id,
+            record.video_id,
+            record.question_id,
+            record.provenance.source_split,
+            record.provenance.source_manifest_hash,
+            record.provenance.normalization_manifest_hash,
+            record.provenance.selected_preference,
+            _canonical_json(record.model_dump(mode="json")),
+        )
+        for record in dataset.records
     )
     if target.suffix.casefold() == ".jsonl":
-        _atomic_write(target, ("\n".join(rows) + "\n").encode("utf-8"))
+        _atomic_write(
+            target, ("\n".join(row[-1] for row in rows) + "\n").encode("utf-8")
+        )
         return
     if target.suffix.casefold() != ".parquet":
         raise ValueError("Oracle records path must end in jsonl or parquet")
@@ -238,10 +436,19 @@ def write_oracle_records(path: str | Path, records: Sequence[OracleBCRecord]) ->
         connection = duckdb.connect()
         try:
             connection.execute(
-                "CREATE TABLE oracle_records(record_json VARCHAR NOT NULL)"
+                """CREATE TABLE oracle_records(
+                    record_id VARCHAR NOT NULL,
+                    video_id VARCHAR NOT NULL,
+                    question_id VARCHAR NOT NULL,
+                    source_split VARCHAR NOT NULL,
+                    source_manifest_hash VARCHAR NOT NULL,
+                    normalization_manifest_hash VARCHAR NOT NULL,
+                    selected_preference DOUBLE NOT NULL,
+                    record_json VARCHAR NOT NULL
+                )"""
             )
             connection.executemany(
-                "INSERT INTO oracle_records VALUES (?)", ((row,) for row in rows)
+                "INSERT INTO oracle_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
             )
             quoted = str(temporary.resolve()).replace("'", "''")
             connection.execute(f"COPY oracle_records TO '{quoted}' (FORMAT PARQUET)")
@@ -257,6 +464,7 @@ def load_oracle_records(path: str | Path) -> tuple[OracleBCRecord, ...]:
     if not source.is_file():
         raise FileNotFoundError(source)
     suffix = source.suffix.casefold()
+    structured_rows: tuple[tuple[object, ...], ...] = ()
     if suffix == ".jsonl":
         raw_rows = tuple(
             line
@@ -270,18 +478,43 @@ def load_oracle_records(path: str | Path) -> tuple[OracleBCRecord, ...]:
                 "SELECT * FROM read_parquet(?)", [str(source.resolve())]
             )
             columns = tuple(item[0] for item in cursor.description)
-            if columns != ("record_json",):
-                raise ValueError("Oracle parquet must contain exactly record_json")
-            raw_rows = tuple(row[0] for row in cursor.fetchall())
+            expected_columns = (
+                "record_id",
+                "video_id",
+                "question_id",
+                "source_split",
+                "source_manifest_hash",
+                "normalization_manifest_hash",
+                "selected_preference",
+                "record_json",
+            )
+            if columns != expected_columns:
+                raise ValueError("Oracle parquet structured columns are invalid")
+            structured_rows = tuple(cursor.fetchall())
+            raw_rows = tuple(row[-1] for row in structured_rows)
         finally:
             connection.close()
     else:
         raise ValueError("Oracle records path must end in jsonl or parquet")
     if not raw_rows or any(not isinstance(row, str) for row in raw_rows):
         raise ValueError("Oracle record source must contain non-empty JSON strings")
-    return OracleBCDataset(
-        tuple(OracleBCRecord.model_validate_json(row) for row in raw_rows)
-    ).records
+    records = tuple(OracleBCRecord.model_validate_json(row) for row in raw_rows)
+    if suffix == ".parquet":
+        for structured, record in zip(structured_rows, records, strict=True):
+            expected = (
+                record.record_id,
+                record.video_id,
+                record.question_id,
+                record.provenance.source_split,
+                record.provenance.source_manifest_hash,
+                record.provenance.normalization_manifest_hash,
+                record.provenance.selected_preference,
+            )
+            if structured[:-1] != expected:
+                raise ValueError(
+                    "structured Parquet provenance does not match record_json"
+                )
+    return OracleBCDataset(records).records
 
 
 @dataclass
@@ -325,15 +558,12 @@ def _action_text(action: ActionInstance) -> str:
     )
 
 
-def _encode_bytes(text: str, *, maximum: int, label: str) -> list[int]:
-    encoded = text.encode("utf-8")
-    if len(encoded) > maximum:
-        raise ValueError(f"{label} exceeds configured maximum of {maximum} UTF-8 bytes")
-    return [value + 1 for value in encoded]
-
-
 def _padded_tokens(
-    items: Sequence[Sequence[str]], *, maximum: int, label: str
+    items: Sequence[Sequence[str]],
+    *,
+    maximum: int,
+    label: str,
+    tokenizer: TextTokenizer,
 ) -> tuple[Tensor, Tensor, Tensor]:
     batch_size = len(items)
     max_items = max(1, max((len(row) for row in items), default=0))
@@ -341,7 +571,7 @@ def _padded_tokens(
     max_tokens = 1
     for row in items:
         encoded_row = [
-            _encode_bytes(text, maximum=maximum, label=label) for text in row
+            tokenizer.encode(text, maximum=maximum, label=label) for text in row
         ]
         encoded.append(encoded_row)
         for item in encoded_row:
@@ -359,11 +589,34 @@ def _padded_tokens(
 
 
 class RouterCollator:
-    def __init__(self, *, max_question_bytes: int, max_item_bytes: int) -> None:
-        if max_question_bytes < 1 or max_item_bytes < 1:
-            raise ValueError("text byte limits must be positive")
-        self.max_question_bytes = max_question_bytes
-        self.max_item_bytes = max_item_bytes
+    def __init__(
+        self,
+        *,
+        max_question_tokens: int | None = None,
+        max_item_tokens: int | None = None,
+        tokenizer: TextTokenizer | None = None,
+        max_question_bytes: int | None = None,
+        max_item_bytes: int | None = None,
+    ) -> None:
+        question_limit = max_question_tokens or max_question_bytes
+        item_limit = max_item_tokens or max_item_bytes
+        if question_limit is None or item_limit is None:
+            raise ValueError("token limits are required")
+        if question_limit < 1 or item_limit < 1:
+            raise ValueError("text token limits must be positive")
+        self.max_question_tokens = question_limit
+        self.max_item_tokens = item_limit
+        self.tokenizer = tokenizer or TestByteTokenizer()
+
+    @classmethod
+    def for_test(
+        cls, *, max_question_tokens: int, max_item_tokens: int
+    ) -> "RouterCollator":
+        return cls(
+            max_question_tokens=max_question_tokens,
+            max_item_tokens=max_item_tokens,
+            tokenizer=TestByteTokenizer(),
+        )
 
     def __call__(self, records: Sequence[OracleBCRecord]) -> RouterBatch:
         validated = tuple(
@@ -377,27 +630,39 @@ class RouterCollator:
             for record in validated
         ]
         question_ids, question_mask, _ = _padded_tokens(
-            question_rows, maximum=self.max_question_bytes, label="question"
+            question_rows,
+            maximum=self.max_question_tokens,
+            label="question",
+            tokenizer=self.tokenizer,
         )
         evidence_rows = [
             [item.content for item in record.state.evidence] for record in validated
         ]
         evidence_ids, evidence_token_mask, evidence_item_mask = _padded_tokens(
-            evidence_rows, maximum=self.max_item_bytes, label="evidence item"
+            evidence_rows,
+            maximum=self.max_item_tokens,
+            label="evidence item",
+            tokenizer=self.tokenizer,
         )
         history_rows = [
             [_action_text(action) for action in record.state.action_history]
             for record in validated
         ]
         history_ids, history_token_mask, history_item_mask = _padded_tokens(
-            history_rows, maximum=self.max_item_bytes, label="history action"
+            history_rows,
+            maximum=self.max_item_tokens,
+            label="history action",
+            tokenizer=self.tokenizer,
         )
         action_rows = [
             [_action_text(action) for action in record.action_instances]
             for record in validated
         ]
         action_ids, action_token_mask, action_item_mask = _padded_tokens(
-            action_rows, maximum=self.max_item_bytes, label="action instance"
+            action_rows,
+            maximum=self.max_item_tokens,
+            label="action instance",
+            tokenizer=self.tokenizer,
         )
         batch_size, max_actions = action_item_mask.shape
         max_evidence = evidence_item_mask.shape[1]

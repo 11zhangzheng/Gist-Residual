@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import pytest
 import torch
-
-from fidmem.router.dataset import OracleBCRecord, RouterCollator
-from fidmem.router.model import MemoryRouter, RouterModelConfig
+from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization
+from fidmem.router.dataset import (
+    OracleBCRecord,
+    OracleRecordProvenance,
+    RouterCollator,
+)
+from fidmem.router.model import (
+    EncoderIdentity,
+    MemoryRouter,
+    RouterModelConfig,
+    TestTextEncoder,
+)
 from fidmem.types import (
     ActionInstance,
     ActionType,
@@ -56,11 +65,29 @@ def _record(index: int, *, with_candidates: bool = True) -> OracleBCRecord:
             ActionInstance(ActionType.STOP, None, None),
         )
     )
+    video_id = f"v{index // 2}"
+    provenance = OracleRecordProvenance(
+        dataset_manifest_hash="a" * 64,
+        source_manifest_hash="b" * 64,
+        source_split="train",
+        video_group_id=video_id,
+        longroute_example_id=f"example-{index}",
+        normalization_manifest_hash="c" * 64,
+        normalization=CostNormalization(
+            constant=10.0, sample_count=2, source_split="train"
+        ),
+        preference_set_hash="d" * 64,
+        preference_values=COST_PREFERENCES,
+        selected_preference=0.3,
+        oracle_utility=1.0,
+        optimal_action_tie_count=1,
+    )
     return OracleBCRecord(
         record_id=f"r{index}",
-        video_id=f"v{index // 2}",
+        video_id=video_id,
         question_id=f"q{index}",
         observation_snapshot_id="cached-graph-sha256",
+        provenance=provenance,
         state=state,
         action_instances=actions,
         legal_action_mask=(False, True, True) if with_candidates else (True, True),
@@ -71,15 +98,19 @@ def _record(index: int, *, with_candidates: bool = True) -> OracleBCRecord:
 
 
 def _model() -> MemoryRouter:
+    identity = EncoderIdentity.test_identity("model-test-v1")
+    config = RouterModelConfig(
+        encoder=identity,
+        encoder_output_dim=16,
+        hidden_dim=24,
+        action_type_embedding_dim=8,
+        fidelity_embedding_dim=4,
+        max_question_tokens=128,
+        max_item_tokens=96,
+    )
     return MemoryRouter(
-        RouterModelConfig(
-            hidden_dim=24,
-            token_embedding_dim=16,
-            action_type_embedding_dim=8,
-            fidelity_embedding_dim=4,
-            max_question_bytes=128,
-            max_item_bytes=96,
-        )
+        config,
+        text_encoder=TestTextEncoder(identity, vocab_size=257, output_dim=16),
     )
 
 

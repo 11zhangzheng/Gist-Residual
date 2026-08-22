@@ -1,14 +1,17 @@
-byte_vocab_size: 257
-hidden_dim: 768
-token_embedding_dim: 384
+encoder:
+  kind: pretrained
+  model_id: FacebookAI/roberta-base
+  revision: e2da8e2f811d1448a5b465c236feacd80ffbac7b
+  tokenizer_id: FacebookAI/roberta-base
+  tokenizer_revision: e2da8e2f811d1448a5b465c236feacd80ffbac7b
+  trust_remote_code: false
+encoder_output_dim: 768
+hidden_dim: 384
 action_type_embedding_dim: 64
 fidelity_embedding_dim: 32
-num_encoder_layers: 16
-num_attention_heads: 12
-feedforward_multiplier: 4
-dropout: 0.1
-max_question_bytes: 512
-max_item_bytes: 256
+max_question_tokens: 512
+max_item_tokens: 256
+production: true
 enforce_parameter_range: true
-min_trainable_parameters: 100000000
-max_trainable_parameters: 300000000
+min_total_parameters: 100000000
+max_total_parameters: 150000000

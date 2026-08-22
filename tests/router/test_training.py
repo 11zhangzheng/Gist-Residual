@@ -5,65 +5,100 @@ from pathlib import Path
 
 import pytest
 import torch
-from pydantic import ValidationError
-
+from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization
 from fidmem.router.dataset import (
-    OracleBCRecord,
     OracleBCDataset,
-    RouterCollator,
+    OracleBCRecord,
+    OracleRecordProvenance,
     build_grouped_split,
     load_oracle_records,
     write_oracle_records,
 )
 from fidmem.router.model import MemoryRouter, RouterModelConfig, RouterOutput
 from fidmem.router.train_bc import (
-    LossWeights,
+    LossProfile,
     TrainConfig,
     behavior_cloning_loss,
     load_checkpoint,
-    save_checkpoint,
     train_bc,
 )
-from fidmem.types import ActionInstance, ActionType, RouterState
+from fidmem.types import (
+    ActionInstance,
+    ActionType,
+    EvidenceItem,
+    FidelityLevel,
+    RouterState,
+)
+from pydantic import ValidationError
 
 
 def _record(index: int, *, video_id: str | None = None) -> OracleBCRecord:
-    target = index % 2
+    resolved_video_id = video_id or f"v{index // 2:03d}"
+    candidates = ("event-a", "event-b")
+    target_event = candidates[index % 2]
+    actions = (
+        ActionInstance(ActionType.EXPAND_RESIDUAL, candidates[0], None),
+        ActionInstance(ActionType.EXPAND_RESIDUAL, candidates[1], None),
+        ActionInstance(ActionType.STOP, None, None),
+    )
+    provenance = OracleRecordProvenance(
+        dataset_manifest_hash="a" * 64,
+        source_manifest_hash="b" * 64,
+        source_split="train",
+        video_group_id=resolved_video_id,
+        longroute_example_id=f"example-{index:03d}",
+        normalization_manifest_hash="c" * 64,
+        normalization=CostNormalization(
+            constant=10.0, sample_count=32, source_split="train"
+        ),
+        preference_set_hash="d" * 64,
+        preference_values=COST_PREFERENCES,
+        selected_preference=0.3,
+        oracle_utility=1.0,
+        optimal_action_tie_count=1,
+    )
     return OracleBCRecord(
         record_id=f"r{index:03d}",
-        video_id=video_id or f"v{index // 2:03d}",
+        video_id=resolved_video_id,
         question_id=f"q{index:03d}",
         observation_snapshot_id="cached-observations-v1",
+        provenance=provenance,
         state=RouterState(
-            question="alpha" if target == 0 else "omega",
-            options=("A", "B"),
-            evidence=(),
+            question="Which candidate matches the acquired evidence?",
+            options=("candidate A", "candidate B"),
+            evidence=(
+                EvidenceItem(
+                    event_id=target_event,
+                    fidelity_level=FidelityLevel.GIST,
+                    content="the acquired evidence",
+                    score=1.0,
+                ),
+            ),
             action_history=(),
             remaining_budget=10,
-            candidate_event_ids=(),
-            candidate_fidelity_levels={},
-            context_frontiers={},
-            cost_preference=0.1 * target,
+            candidate_event_ids=candidates,
+            candidate_fidelity_levels={
+                event_id: FidelityLevel.GIST for event_id in candidates
+            },
+            context_frontiers={event_id: (0, 0) for event_id in candidates},
+            cost_preference=0.3,
         ),
-        action_instances=(
-            ActionInstance(ActionType.SEARCH_GIST, None, None),
-            ActionInstance(ActionType.STOP, None, None),
-        ),
-        legal_action_mask=(True, True),
-        target_action_index=target,
-        sufficiency_target=target,
-        cost_to_go=float(1 - target),
+        action_instances=actions,
+        legal_action_mask=(True, True, True),
+        target_action_index=index % 2,
+        sufficiency_target=0,
+        cost_to_go=1.0,
     )
 
 
 def _model_config() -> RouterModelConfig:
     return RouterModelConfig(
+        encoder_output_dim=16,
         hidden_dim=24,
-        token_embedding_dim=16,
         action_type_embedding_dim=8,
         fidelity_embedding_dim=4,
-        max_question_bytes=64,
-        max_item_bytes=64,
+        max_question_tokens=128,
+        max_item_tokens=96,
     )
 
 
@@ -73,20 +108,21 @@ def _train_config(path: Path, *, max_steps: int) -> TrainConfig:
         max_steps=max_steps,
         batch_size=32,
         learning_rate=0.02,
-        checkpoint_path=path,
+        artifact_root=path.parent,
+        checkpoint_path=Path(path.name),
         checkpoint_every=max_steps,
         device="cpu",
-        loss_weights=LossWeights(action=1.0, sufficiency=0.3, cost_to_go=0.1),
+        loss_profile=LossProfile.main(),
     )
 
 
 @pytest.mark.parametrize(
     "update",
     (
-        {"legal_action_mask": (False, False)},
+        {"legal_action_mask": (False, False, False)},
         {"legal_action_mask": (True,)},
-        {"target_action_index": 2},
-        {"target_action_index": 1, "legal_action_mask": (True, False)},
+        {"target_action_index": 3},
+        {"target_action_index": 1, "legal_action_mask": (True, False, True)},
         {"cost_to_go": float("nan")},
         {"observation_snapshot_id": ""},
         {"sufficiency_target": True},
@@ -156,11 +192,12 @@ def test_behavior_cloning_loss_uses_the_frozen_three_weights() -> None:
         cost_to_go=torch.tensor([1.5, 0.5]),
     )
     targets = {
+        "legal_action_mask": torch.ones((2, 2), dtype=torch.bool),
         "target_action_index": torch.tensor([0, 1]),
         "sufficiency_target": torch.tensor([1.0, 0.0]),
         "cost_to_go_target": torch.tensor([1.0, 1.0]),
     }
-    losses = behavior_cloning_loss(output, targets, LossWeights())
+    losses = behavior_cloning_loss(output, targets, LossProfile.main())
     expected = (
         torch.nn.functional.cross_entropy(
             output.action_logits, targets["target_action_index"]
@@ -251,17 +288,19 @@ def test_checkpoint_manifest_contains_weights_config_split_and_all_rng_states(
         expected_config_hash=result.config_hash,
         expected_dataset_identity=dataset.identity,
         expected_split_manifest=result.split_manifest,
+        expected_encoder_identity=model.config.encoder,
+        expected_loss_profile=config.loss_profile,
+        expected_device="cpu",
     )
     assert checkpoint["step"] == 1
     assert checkpoint["git_commit"]
     assert checkpoint["config_hash"] == result.config_hash
     assert checkpoint["split_manifest"] == result.split_manifest.model_dump(mode="json")
-    assert checkpoint["loss_weights"] == {
-        "action": 1.0,
-        "sufficiency": 0.3,
-        "cost_to_go": 0.1,
-    }
+    assert checkpoint["loss_profile"] == config.loss_profile.model_dump(mode="json")
+    assert checkpoint["checkpoint_self_hash"]
     assert set(checkpoint["rng_state"]) == {
+        "source_device",
+        "cuda_device_count",
         "python",
         "numpy",
         "torch_cpu",
@@ -286,7 +325,7 @@ def test_training_seed_controls_initial_weights_as_well_as_batch_sampling(
     train_bc(
         second,
         dataset,
-        config.model_copy(update={"checkpoint_path": tmp_path / "seed-b.pt"}),
+        config.model_copy(update={"checkpoint_path": Path("seed-b.pt")}),
     )
 
     for key, value in first.state_dict().items():

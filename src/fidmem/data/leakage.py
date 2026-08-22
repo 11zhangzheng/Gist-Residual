@@ -159,7 +159,14 @@ class LeakageAuditor:
         self.parquet_path = Path(parquet_path)
         self.embedding_provider = embedding_provider
         self.sample_count = sample_count
-        self.near_duplicate_threshold = near_duplicate_threshold
+        threshold = float(near_duplicate_threshold)
+        if not math.isfinite(threshold):
+            raise ValueError("near-duplicate threshold must be finite")
+        if not 0 <= threshold <= 1:
+            raise ValueError(
+                "near-duplicate threshold must be between 0 and 1"
+            )
+        self.near_duplicate_threshold = threshold
 
     def _embedding_centroid(self, asset: VideoAsset) -> tuple[float, ...] | None:
         if asset.frame_embeddings is not None:

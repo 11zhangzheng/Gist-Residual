@@ -95,6 +95,10 @@ class FaultingPublicationBackend(PublicationBackend):
             raise OSError(f"injected {name} #{self.ordinal}")
         return super()._run_operation(name, action)
 
+    def _before_pointer_replace(self, *args: object) -> None:
+        del args
+        self._run_operation(self.POINTER_WRITE, lambda: None)
+
 
 class RecordingContactSheetValidator:
     def __init__(self) -> None:
@@ -767,3 +771,85 @@ def test_review_round2_success_attempt_and_current_name_the_same_generation(
     assert attempt["status"] == "complete"
     assert attempt["generation"] == result.generation_uri
     assert (output / pointer["generation"] / "manifest.json").is_file()
+
+
+class AfterActionPointerBackend(PublicationBackend):
+    def _run_operation(self, name: str, action: Callable[[], object]) -> object:
+        result = super()._run_operation(name, action)
+        if name == self.POINTER_WRITE:
+            raise OSError("injected after pointer action")
+        return result
+
+
+class BeforePointerReplaceFailureBackend(PublicationBackend):
+    def _before_pointer_replace(self, *_args: object) -> None:
+        raise OSError("injected before pointer replace")
+
+
+class AfterCommitFailureBackend(PublicationBackend):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.abort_calls = 0
+
+    def abort(self, *args: object, **kwargs: object) -> None:
+        self.abort_calls += 1
+        super().abort(*args, **kwargs)
+
+    def publish_current(self, *args: object, **kwargs: object) -> None:
+        super().publish_current(*args, **kwargs)
+        raise OSError("injected after committed pointer")
+
+
+def test_review_round3_pointer_replace_is_not_inside_action_wrapper(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+    output = root / "output"
+    backend = AfterActionPointerBackend(output)
+
+    result = _builder(root, manifest, publication_backend=backend).build(1)
+
+    pointer = json.loads((output / "current-generation.json").read_text())
+    assert pointer["generation"] == result.generation_uri
+    assert (output / result.generation_uri / "manifest.json").is_file()
+
+
+def test_review_round3_pre_replace_fault_preserves_previous_current(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+    output = root / "output"
+    first = _builder(root, manifest).build(1)
+    previous_pointer = (output / "current-generation.json").read_bytes()
+    previous_generations = _public_generation_names(output)
+    backend = BeforePointerReplaceFailureBackend(output)
+
+    with pytest.raises(OSError, match="before pointer replace"):
+        _builder(root, manifest, publication_backend=backend).build(2)
+
+    assert (output / "current-generation.json").read_bytes() == previous_pointer
+    assert _public_generation_names(output) == previous_generations
+    assert (output / first.generation_uri / "manifest.json").is_file()
+    assert json.loads((output / "last-attempt.json").read_text())["status"] == "failed"
+
+
+def test_review_round3_committed_transaction_is_never_aborted_by_builder(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+    output = root / "output"
+    backend = AfterCommitFailureBackend(output)
+
+    with pytest.raises(OSError, match="after committed pointer"):
+        _builder(root, manifest, publication_backend=backend).build(3)
+
+    pointer = json.loads((output / "current-generation.json").read_text())
+    generation = pointer["generation"]
+    assert (output / generation / "manifest.json").is_file()
+    assert backend.abort_calls == 0
+    attempt = json.loads((output / "last-attempt.json").read_text())
+    assert attempt["status"] == "complete"
+    assert attempt["generation"] == generation

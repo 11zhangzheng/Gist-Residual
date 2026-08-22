@@ -601,11 +601,16 @@ class LongRouteBuilder:
                 ),
             )
             self.publication_backend.publish_current(
-                _canonical_json({"generation": uri, "seed": seed}),
-                transaction=transaction,
+                transaction,
+                seed=seed,
             )
             return manifest
         except Exception as error:
+            if (
+                transaction is not None
+                and self.publication_backend.transaction_committed(transaction)
+            ):
+                raise
             self.publication_backend.abort(transaction)
             audit_payload["complete"] = False
             failed_uri = f"failed-audit-{attempt}.json"

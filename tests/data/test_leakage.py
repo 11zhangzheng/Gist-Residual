@@ -208,3 +208,36 @@ def test_cosine_rejects_non_finite_arithmetic(
 ) -> None:
     with pytest.raises(ValueError, match="finite"):
         _cosine(left, right)
+
+
+@pytest.mark.parametrize(
+    "threshold",
+    (math.nan, math.inf, -math.inf, -0.001, 1.001),
+)
+def test_auditor_rejects_non_finite_or_out_of_cosine_range_thresholds(
+    tmp_path: Path, threshold: float
+) -> None:
+    with pytest.raises(ValueError, match="threshold.*finite|threshold.*0.*1"):
+        LeakageAuditor(
+            tmp_path / "leakage.parquet",
+            near_duplicate_threshold=threshold,
+        )
+
+
+def test_identical_embeddings_with_distinct_hashes_meet_a_legal_threshold(
+    tmp_path: Path,
+) -> None:
+    train_path = tmp_path / "train.mp4"
+    train_path.write_bytes(b"train")
+    eval_path = tmp_path / "eval.mp4"
+    eval_path.write_bytes(b"eval")
+
+    report = LeakageAuditor(
+        tmp_path / "leakage.parquet",
+        near_duplicate_threshold=1.0,
+    ).audit(
+        (VideoAsset("train", train_path, ((1.0, 0.0),) * 8),),
+        (VideoAsset("eval", eval_path, ((1.0, 0.0),) * 8),),
+    )
+
+    assert [finding.kind for finding in report.findings] == ["near_duplicate"]

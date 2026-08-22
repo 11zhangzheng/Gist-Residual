@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
 import re
@@ -10,10 +11,13 @@ import shutil
 import secrets
 import tempfile
 from typing import Callable, TypeVar
+import weakref
 
 
 T = TypeVar("T")
 _GENERATION_ID = re.compile(r"^[0-9a-f]{20}$")
+_ROOT_TELEMETRY_NAMES = frozenset({"last-attempt.json", "leakage-audit.json"})
+_FAILED_AUDIT_NAME = re.compile(r"^failed-audit-[0-9a-f]{20}\.json$")
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -52,13 +56,14 @@ class PublicationTransaction:
 
 @dataclass
 class _TransactionRecord:
-    transaction: PublicationTransaction
+    transaction_ref: weakref.ReferenceType[PublicationTransaction]
     transaction_id: str
     generation_id: str
     generation_uri: str
     staging_dir: Path
     final_dir: Path
     published: bool = False
+    committed: bool = False
 
 
 class PublicationBackend:
@@ -111,7 +116,7 @@ class PublicationBackend:
             ) from error
         if (
             record is None
-            or record.transaction is not transaction
+            or record.transaction_ref() is not transaction
             or not capability_matches
             or record.transaction_id != transaction_id
             or transaction.generation_id != record.generation_id
@@ -161,8 +166,15 @@ class PublicationBackend:
             final_dir=final,
             _capability=self._capability,
         )
+        backend_ref = weakref.ref(self)
+
+        def retire(_: weakref.ReferenceType[PublicationTransaction]) -> None:
+            backend = backend_ref()
+            if backend is not None:
+                backend._transactions.pop(transaction_id, None)
+
         self._transactions[transaction_id] = _TransactionRecord(
-            transaction=transaction,
+            transaction_ref=weakref.ref(transaction, retire),
             transaction_id=transaction_id,
             generation_id=generation_id,
             generation_uri=generation_uri,
@@ -216,23 +228,46 @@ class PublicationBackend:
 
     def publish_current(
         self,
-        payload: str,
-        *,
         transaction: PublicationTransaction,
+        *,
+        seed: int,
     ) -> None:
         record = self._validated_transaction(transaction)
         if not record.published or not record.final_dir.is_dir():
             raise ValueError(
                 "publication transaction generation is not ready to commit"
             )
-        pointer = self._resolve_under(self.output_root, "current-generation.json")
-        self._run_operation(
-            self.POINTER_WRITE,
-            lambda: _atomic_write_bytes(pointer, payload.encode("utf-8")),
+        payload = json.dumps(
+            {"generation": record.generation_uri, "seed": seed},
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        self._transactions.pop(record.transaction_id, None)
+        pointer = self._resolve_under(self.output_root, "current-generation.json")
+        self._before_pointer_replace(transaction, payload)
+        _atomic_write_bytes(pointer, payload.encode("utf-8"))
+        record.committed = True
+
+    def _before_pointer_replace(
+        self,
+        transaction: PublicationTransaction,
+        payload: str,
+    ) -> None:
+        """Run fault/tracing hooks before the irreversible pointer replace."""
+        del transaction, payload
+
+    def transaction_committed(self, transaction: PublicationTransaction) -> bool:
+        return self._validated_transaction(transaction).committed
 
     def write_root_text(self, relative: str | Path, payload: str) -> Path:
+        candidate = Path(relative)
+        name = candidate.name
+        if candidate.parent != Path(".") or (
+            name not in _ROOT_TELEMETRY_NAMES
+            and _FAILED_AUDIT_NAME.fullmatch(name) is None
+        ):
+            raise ValueError(
+                "root writes are restricted to explicit telemetry files"
+            )
         target = self._resolve_under(self.output_root, relative)
 
         def write() -> Path:
@@ -245,6 +280,8 @@ class PublicationBackend:
         if transaction is None:
             return
         record = self._validated_transaction(transaction)
+        if record.committed:
+            return
         if record.staging_dir.is_dir():
             shutil.rmtree(record.staging_dir)
         if record.published and record.final_dir.is_dir():

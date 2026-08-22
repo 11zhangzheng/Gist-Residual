@@ -1,0 +1,7 @@
+# LongRoute is virtual concatenation only: no media is decoded or materialized.
+longroute:
+  audit_size: 100
+  min_distractors: 9
+  max_distractors: 19
+  multi_event_ratio: 0.25
+  dev_fraction: 0.20

@@ -1,22 +1,31 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
+from typing import Callable
 
+import duckdb
 import pytest
 
 from fidmem.data.leakage import LeakageAuditor, VideoAsset
 from fidmem.data.longroute import (
+    DefaultContactSheetValidator,
     LongRouteBuilder,
     LongRouteConfig,
     LongRouteDataError,
     LongRouteLeakageError,
+    PublicationBackend,
     SourceEvent,
     SourceQuestion,
     SourceVideo,
     TrainSplitManifest,
 )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _manifest(root: Path, *, videos: int = 12, seconds: float = 61.0) -> TrainSplitManifest:
@@ -31,15 +40,29 @@ def _manifest(root: Path, *, videos: int = 12, seconds: float = 61.0) -> TrainSp
         )
         source_videos.append(
             SourceVideo(
-                video_id=f"v-{index}", path=path, split="train", licensed=True,
+                video_id=f"v-{index}", path=path,
+                source_uri=f"https://datasets.example/videos/v-{index}.mp4",
+                content_sha256=_sha256(path), split="train", licensed=True,
+                frame_embeddings=((1.0, float(index + 1)),) * 8,
                 events=events,
                 questions=(SourceQuestion(question_id=f"q-{index}", question=f"What happens in {index}?", options=("yes", "no"), answer="yes", target_event_id=events[0].event_id),),
             )
         )
-    return TrainSplitManifest(name="nextqa-train", split="train", videos=tuple(source_videos))
+    return TrainSplitManifest(
+        name="nextqa", dataset_version="1.0", source_uri="https://datasets.example/nextqa/v1",
+        license="CC-BY-4.0", split="train", videos=tuple(source_videos),
+    )
 
 
-def _builder(root: Path, manifest: TrainSplitManifest, *, audit_size: int = 1, **config: object) -> LongRouteBuilder:
+def _builder(
+    root: Path,
+    manifest: TrainSplitManifest | tuple[TrainSplitManifest, ...],
+    *,
+    audit_size: int = 1,
+    publication_backend: PublicationBackend | None = None,
+    contact_sheet_validator: object | None = None,
+    **config: object,
+) -> LongRouteBuilder:
     def sheet(example: object) -> Path:
         path = root / "sheets" / f"{getattr(example, 'question_id')}.jpg"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,12 +70,40 @@ def _builder(root: Path, manifest: TrainSplitManifest, *, audit_size: int = 1, *
         return path
 
     return LongRouteBuilder(
-        (manifest,),
+        manifest if isinstance(manifest, tuple) else (manifest,),
         eval_assets=(),
         leakage_auditor=LeakageAuditor(root / "leakage.parquet"),
         config=LongRouteConfig(output_dir=root / "output", audit_size=audit_size, **config),
         contact_sheet_provider=sheet,
+        publication_backend=publication_backend,
+        contact_sheet_validator=contact_sheet_validator,
     )
+
+
+class FaultingPublicationBackend(PublicationBackend):
+    """Inject one filesystem failure while preserving the real local backend."""
+
+    def __init__(self, output_root: Path, operation: str, ordinal: int) -> None:
+        super().__init__(output_root)
+        self.operation = operation
+        self.ordinal = ordinal
+        self.counts: dict[str, int] = {}
+
+    def _run_operation(self, name: str, action: Callable[[], object]) -> object:
+        self.counts[name] = self.counts.get(name, 0) + 1
+        if name == self.operation and self.counts[name] == self.ordinal:
+            raise OSError(f"injected {name} #{self.ordinal}")
+        return super()._run_operation(name, action)
+
+
+class RecordingContactSheetValidator:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def validate(self, uri: str | Path) -> str:
+        canonical = str(uri)
+        self.calls.append(canonical)
+        return canonical
 
 
 def test_same_seed_is_byte_identical_despite_input_order_and_keeps_sources_grouped(tmp_path: Path) -> None:
@@ -182,19 +233,41 @@ def test_failed_attempt_does_not_replace_current_generation_and_writes_last_atte
     assert json.loads((output / "output" / "last-attempt.json").read_text())["status"] == "failed"
 
 
-def test_route_backtracks_around_oversize_nearest_and_ratio_uses_final_integer_bounds(tmp_path: Path) -> None:
+def test_review_c5_102_examples_use_exact_integer_multi_event_bounds(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, videos=102, seconds=61)
     result = _builder(tmp_path / "out", manifest, audit_size=1).build(4)
     multi = sum(item.template != "single_event" for item in result.examples)
+    assert len(result.examples) == 102
+    assert 21 <= multi <= 30
     assert multi >= 21
-    assert 0.2 <= multi / len(result.examples) <= 0.3
 
 
 def test_nested_reordering_does_not_change_canonical_manifest_and_duplicate_question_is_rejected(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     shuffled = manifest.model_copy(update={"videos": tuple(reversed(manifest.videos))})
     assert _builder(tmp_path / "one", manifest).build(5).canonical_json() == _builder(tmp_path / "two", shuffled).build(5).canonical_json()
-    duplicate = manifest.model_copy(update={"videos": manifest.videos + (manifest.videos[0].model_copy(update={"video_id": "new-video"}),)})
+    original = manifest.videos[0]
+    copied_events = tuple(
+        event.model_copy(update={"event_id": f"{event.event_id}-copy"})
+        for event in original.events
+    )
+    copied_questions = tuple(
+        question.model_copy(
+            update={"target_event_id": f"{question.target_event_id}-copy"}
+        )
+        for question in original.questions
+    )
+    duplicate_video = original.model_copy(
+        update={
+            "video_id": "new-video",
+            "source_uri": f"{original.source_uri}-copy",
+            "events": copied_events,
+            "questions": copied_questions,
+        }
+    )
+    duplicate = manifest.model_copy(
+        update={"videos": manifest.videos + (duplicate_video,)}
+    )
     with pytest.raises(LongRouteDataError, match="question"):
         _builder(tmp_path / "duplicate", duplicate).build(5)
 
@@ -218,8 +291,428 @@ def test_review_c8_contact_sheet_local_and_remote_contract(tmp_path: Path) -> No
     rejected = LongRouteBuilder((manifest,), eval_assets=(), leakage_auditor=LeakageAuditor(tmp_path / "audit.parquet"), config=LongRouteConfig(output_dir=tmp_path / "bad", audit_size=1), contact_sheet_provider=lambda _example: tmp_path / "missing.jpg")
     with pytest.raises(LongRouteDataError, match="contact"):
         rejected.build(1)
-    accepted = LongRouteBuilder((manifest,), eval_assets=(), leakage_auditor=LeakageAuditor(tmp_path / "remote.parquet"), config=LongRouteConfig(output_dir=tmp_path / "remote", audit_size=1), contact_sheet_provider=lambda _example: "https://example.invalid/sheet.jpg")
+    accepted = LongRouteBuilder(
+        (manifest,), eval_assets=(), leakage_auditor=LeakageAuditor(tmp_path / "remote.parquet"),
+        config=LongRouteConfig(output_dir=tmp_path / "remote", audit_size=1),
+        contact_sheet_provider=lambda _example: "https://example.invalid/sheet.jpg",
+        contact_sheet_validator=DefaultContactSheetValidator(
+            remote_probes={"https": lambda _uri: None}
+        ),
+    )
     assert accepted.build(2).examples
+
+
+def _public_generation_names(output_root: Path) -> set[str]:
+    generations = output_root / "generations"
+    return {entry.name for entry in generations.iterdir()} if generations.is_dir() else set()
+
+
+@pytest.mark.parametrize(
+    ("operation", "ordinal"),
+    (
+        ("generation_write", 2),
+        ("generation_write", 3),
+        ("directory_publish", 1),
+        ("pointer_write", 1),
+    ),
+)
+def test_review_c3_publication_fault_matrix_is_atomic(
+    tmp_path: Path, operation: str, ordinal: int
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+    _builder(root, manifest).build(1)
+    output = root / "output"
+    previous_pointer = (output / "current-generation.json").read_bytes()
+    previous_generations = _public_generation_names(output)
+    backend = FaultingPublicationBackend(output, operation, ordinal)
+
+    with pytest.raises(OSError, match="injected"):
+        _builder(root, manifest, publication_backend=backend).build(2)
+
+    assert (output / "current-generation.json").read_bytes() == previous_pointer
+    assert _public_generation_names(output) == previous_generations
+    staging = output / ".staging"
+    assert not staging.exists() or not any(staging.iterdir())
+    attempt = json.loads((output / "last-attempt.json").read_text(encoding="utf-8"))
+    assert attempt["status"] == "failed"
+
+
+def test_review_c3_eval_hit_has_the_same_failed_transaction_semantics(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+    _builder(root, manifest).build(1)
+    output = root / "output"
+    previous_pointer = (output / "current-generation.json").read_bytes()
+    previous_generations = _public_generation_names(output)
+    copied = tmp_path / "held-out.bin"
+    copied.write_bytes(manifest.videos[0].path.read_bytes())
+    builder = LongRouteBuilder(
+        (manifest,),
+        eval_assets=(VideoAsset("held-out", copied, ((0.0, 1.0),) * 8),),
+        leakage_auditor=LeakageAuditor(tmp_path / "eval-hit.parquet"),
+        config=LongRouteConfig(output_dir=output, audit_size=1),
+        contact_sheet_provider=lambda _example: tmp_path / "unused.jpg",
+    )
+
+    with pytest.raises(LongRouteLeakageError):
+        builder.build(2)
+
+    assert (output / "current-generation.json").read_bytes() == previous_pointer
+    assert _public_generation_names(output) == previous_generations
+    assert json.loads((output / "last-attempt.json").read_text())["status"] == "failed"
+    failed_audit = json.loads((output / "leakage-audit.json").read_text())
+    assert failed_audit["findings"][0]["kind"] == "hash_duplicate"
+
+
+
+def test_review_c4_skips_3550_second_top_neighbor_for_a_legal_combination(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources", videos=60, seconds=50.0)
+    first = manifest.videos[0]
+    target = first.events[0]
+    oversized = SourceEvent(
+        event_id="e-0-00-oversized",
+        start_sec=100.0,
+        end_sec=3650.0,
+        label="oversized nearest neighbor",
+        embedding=target.embedding,
+    )
+    changed_first = first.model_copy(update={"events": (target, oversized, first.events[1])})
+    changed = manifest.model_copy(
+        update={"videos": (changed_first, *manifest.videos[1:])}
+    )
+
+    result = _builder(tmp_path / "out", changed).build(4)
+
+    example = next(item for item in result.examples if item.question_id == "q-0")
+    assert "e-0-00-oversized" not in {segment.event_id for segment in example.segments}
+    assert 9 <= len(example.segments) - 1 <= 19
+    assert 600 <= example.duration_sec <= 3600
+
+
+def test_review_c5_single_event_sources_upgrade_via_route_distractors(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    single_event = manifest.model_copy(
+        update={
+            "videos": tuple(
+                video.model_copy(update={"events": (video.events[0],)})
+                for video in manifest.videos
+            )
+        }
+    )
+
+    result = _builder(tmp_path / "out", single_event).build(7)
+
+    multi = next(item for item in result.examples if item.template == "before_after")
+    route = {
+        f"{segment.source_video_id}:{segment.event_id}": segment
+        for segment in multi.segments
+    }
+    left, right = (route[event_id] for event_id in multi.supporting_event_ids)
+    labels = {
+        f"{video.video_id}:{event.event_id}": event.label
+        for video in single_event.videos
+        for event in video.events
+    }
+    assert left.source_video_id != right.source_video_id
+    assert right.global_start_sec == left.global_end_sec
+    if "immediately after" in multi.question:
+        assert multi.answer == labels[multi.supporting_event_ids[1]]
+    else:
+        assert "immediately before" in multi.question
+        assert multi.answer == labels[multi.supporting_event_ids[0]]
+
+
+def test_review_c5_fails_when_multi_event_eligible_set_is_too_small(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    ambiguous = manifest.model_copy(
+        update={
+            "videos": tuple(
+                video.model_copy(
+                    update={
+                        "events": (
+                            video.events[0].model_copy(update={"label": "same event"}),
+                        )
+                    }
+                )
+                for video in manifest.videos
+            )
+        }
+    )
+
+    with pytest.raises(LongRouteDataError, match="eligible"):
+        _builder(tmp_path / "out", ambiguous).build(7)
+
+
+
+def _two_manifests(
+    manifest: TrainSplitManifest,
+) -> tuple[TrainSplitManifest, TrainSplitManifest]:
+    midpoint = len(manifest.videos) // 2
+    left = manifest.model_copy(update={"videos": manifest.videos[:midpoint]})
+    right = manifest.model_copy(
+        update={
+            "name": "activitynet-qa",
+            "dataset_version": "2.0",
+            "source_uri": "https://datasets.example/activitynet-qa/v2",
+            "license": "CC-BY-4.0",
+            "videos": manifest.videos[midpoint:],
+        }
+    )
+    return left, right
+
+
+def test_review_c6_all_nested_input_permutations_are_byte_identical(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    enriched_videos = []
+    for index, video in enumerate(manifest.videos):
+        events = tuple(
+            event.model_copy(
+                update={"attributes": {"zeta": index, "alpha": event.label}}
+            )
+            for event in video.events
+        )
+        questions = (
+            video.questions[0].model_copy(update={"options": ("yes", "maybe", "no")}),
+            SourceQuestion(
+                question_id=f"q-{index}-secondary",
+                question=f"What finishes in {index}?",
+                options=("third", "finish", "first"),
+                answer="finish",
+                target_event_id=events[1].event_id,
+            ),
+        )
+        enriched_videos.append(
+            video.model_copy(update={"events": events, "questions": questions})
+        )
+    enriched = manifest.model_copy(update={"videos": tuple(enriched_videos)})
+    baseline_sources = _two_manifests(enriched)
+
+    def permute(source: TrainSplitManifest) -> TrainSplitManifest:
+        videos = []
+        for video in reversed(source.videos):
+            events = tuple(
+                event.model_copy(
+                    update={"attributes": dict(reversed(tuple(event.attributes.items())))}
+                )
+                for event in reversed(video.events)
+            )
+            questions = tuple(
+                question.model_copy(update={"options": tuple(reversed(question.options))})
+                for question in reversed(video.questions)
+            )
+            videos.append(
+                video.model_copy(update={"events": events, "questions": questions})
+            )
+        return source.model_copy(update={"videos": tuple(videos)})
+
+    permuted_sources = tuple(permute(source) for source in reversed(baseline_sources))
+    first = _builder(tmp_path / "one", baseline_sources).build(13)
+    second = _builder(tmp_path / "two", permuted_sources).build(13)
+
+    assert first.canonical_json().encode() == second.canonical_json().encode()
+    first_file = tmp_path / "one" / "output" / first.generation_uri / "manifest.json"
+    second_file = tmp_path / "two" / "output" / second.generation_uri / "manifest.json"
+    assert first_file.read_bytes() == second_file.read_bytes()
+
+
+def test_review_c6_rejects_duplicate_manifest_video_event_and_question_identities(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    left, right = _two_manifests(manifest)
+
+    with pytest.raises(LongRouteDataError, match="manifest.*name"):
+        _builder(
+            tmp_path / "duplicate-name",
+            (left, right.model_copy(update={"name": left.name})),
+        ).build(1)
+    with pytest.raises(LongRouteDataError, match="manifest.*identity"):
+        _builder(
+            tmp_path / "duplicate-source",
+            (left, right.model_copy(update={"source_uri": left.source_uri})),
+        ).build(1)
+
+    duplicate_video = right.model_copy(
+        update={
+            "videos": (
+                right.videos[0].model_copy(update={"video_id": left.videos[0].video_id}),
+                *right.videos[1:],
+            )
+        }
+    )
+    with pytest.raises(LongRouteDataError, match="video"):
+        _builder(tmp_path / "duplicate-video", (left, duplicate_video)).build(1)
+
+    duplicate_event_id = left.videos[0].events[0].event_id
+    duplicate_event_video = right.videos[0].model_copy(
+        update={
+            "events": (
+                right.videos[0].events[0].model_copy(
+                    update={"event_id": duplicate_event_id}
+                ),
+                *right.videos[0].events[1:],
+            ),
+            "questions": tuple(
+                question.model_copy(update={"target_event_id": duplicate_event_id})
+                for question in right.videos[0].questions
+            ),
+        }
+    )
+    duplicate_event = right.model_copy(
+        update={"videos": (duplicate_event_video, *right.videos[1:])}
+    )
+    with pytest.raises(LongRouteDataError, match="event"):
+        _builder(tmp_path / "duplicate-event", (left, duplicate_event)).build(1)
+
+    duplicate_question_video = right.videos[0].model_copy(
+        update={
+            "questions": (
+                right.videos[0].questions[0].model_copy(
+                    update={"question_id": left.videos[0].questions[0].question_id}
+                ),
+            )
+        }
+    )
+    duplicate_question = right.model_copy(
+        update={"videos": (duplicate_question_video, *right.videos[1:])}
+    )
+    with pytest.raises(LongRouteDataError, match="question"):
+        _builder(tmp_path / "duplicate-question", (left, duplicate_question)).build(1)
+
+
+def test_review_c7_published_manifest_has_complete_parseable_provenance(
+    tmp_path: Path,
+) -> None:
+    source = _manifest(tmp_path / "sources")
+    result = _builder(tmp_path / "case", source).build(3)
+    output = tmp_path / "case" / "output"
+
+    assert result.schema_version
+    assert result.builder_version
+    assert len(result.source_manifests) == 1
+    provenance = result.source_manifests[0]
+    assert provenance.dataset_name == source.name
+    assert provenance.dataset_version == source.dataset_version
+    assert provenance.source_uri == source.source_uri
+    assert provenance.license == source.license
+    assert result.source_manifest_hashes[provenance.identity] == provenance.canonical_sha256
+    assert {
+        (video.video_id, video.source_uri, video.content_sha256)
+        for video in provenance.videos
+    } == {
+        (video.video_id, video.source_uri, video.content_sha256)
+        for video in source.videos
+    }
+
+    manifest_path = output / result.generation_uri / "manifest.json"
+    parquet_path = output / result.leakage_parquet_uri
+    audit_path = output / result.leakage_audit_uri
+    assert manifest_path.is_file()
+    assert parquet_path.is_file()
+    assert audit_path.is_file()
+    assert duckdb.sql(
+        "SELECT count(*) FROM read_parquet(?)", params=[str(parquet_path)]
+    ).fetchone() == (0,)
+    assert json.loads(audit_path.read_text())["parquet_uri"] == result.leakage_parquet_uri
+
+
+def test_review_c7_rejects_duplicate_video_source_identity_and_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    source = _manifest(tmp_path / "sources")
+    duplicated_uri = source.model_copy(
+        update={
+            "videos": (
+                source.videos[0],
+                source.videos[1].model_copy(
+                    update={"source_uri": source.videos[0].source_uri}
+                ),
+                *source.videos[2:],
+            )
+        }
+    )
+    with pytest.raises(LongRouteDataError, match="source identity"):
+        _builder(tmp_path / "duplicate-uri", duplicated_uri).build(1)
+
+    bad_hash = source.model_copy(
+        update={
+            "videos": (
+                source.videos[0].model_copy(update={"content_sha256": "0" * 64}),
+                *source.videos[1:],
+            )
+        }
+    )
+    with pytest.raises(LongRouteDataError, match="SHA-256"):
+        _builder(tmp_path / "bad-hash", bad_hash).build(1)
+
+
+def test_review_c8_default_validator_checks_local_and_configured_remote_sheets(
+    tmp_path: Path,
+) -> None:
+    validator = DefaultContactSheetValidator()
+    missing = tmp_path / "missing.jpg"
+    empty = tmp_path / "empty.jpg"
+    empty.write_bytes(b"")
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    valid = tmp_path / "valid.jpg"
+    valid.write_bytes(b"sheet")
+
+    for invalid in (missing, empty, directory):
+        with pytest.raises(LongRouteDataError, match="contact sheet"):
+            validator.validate(invalid)
+    assert validator.validate(valid) == str(valid.resolve())
+
+    remote_calls: list[str] = []
+    remote = DefaultContactSheetValidator(
+        remote_probes={"https": lambda uri: remote_calls.append(uri)}
+    )
+    uri = "https://sheets.example/audit/q-1.jpg"
+    assert remote.validate(uri) == uri
+    assert remote_calls == [uri]
+    with pytest.raises(LongRouteDataError, match="scheme"):
+        remote.validate("ftp://sheets.example/audit/q-1.jpg")
+
+
+def test_review_c8_permission_failure_is_portable_and_every_sheet_is_validated(
+    tmp_path: Path,
+) -> None:
+    source = _manifest(tmp_path / "sources")
+    recording = RecordingContactSheetValidator()
+    result = _builder(
+        tmp_path / "ok",
+        source,
+        audit_size=3,
+        contact_sheet_validator=recording,
+    ).build(5)
+    bundle = tmp_path / "ok" / "output" / result.generation_uri / "audit"
+    records = json.loads((bundle / "samples.json").read_text())
+    assert len(records) == 3
+    assert len(recording.calls) == 3
+    assert {Path(str(record["contact_sheet"])).name for record in records} == {
+        Path(call).name for call in recording.calls
+    }
+
+    class PermissionDeniedValidator:
+        def validate(self, _uri: str | Path) -> str:
+            raise PermissionError("portable unreadable fixture")
+
+    output = tmp_path / "denied"
+    with pytest.raises(LongRouteDataError, match="contact sheet.*readable"):
+        _builder(
+            output,
+            source,
+            contact_sheet_validator=PermissionDeniedValidator(),
+        ).build(6)
+    assert json.loads(
+        (output / "output" / "last-attempt.json").read_text()
+    )["status"] == "failed"
+
 
 
 def test_review_c6_nested_event_order_keeps_source_hashes_identical(tmp_path: Path) -> None:

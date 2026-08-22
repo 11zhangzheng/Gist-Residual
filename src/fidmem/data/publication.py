@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
 import shutil
+import secrets
 import tempfile
 from typing import Callable, TypeVar
 
@@ -37,10 +38,22 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
         raise
 
 
-@dataclass
+@dataclass(frozen=True)
 class PublicationTransaction:
-    """One private staging tree and its immutable public destination."""
+    """Opaque handle for one backend-owned publication transaction."""
 
+    transaction_id: str
+    generation_id: str
+    generation_uri: str
+    staging_dir: Path
+    final_dir: Path
+    _capability: object = field(repr=False, compare=False)
+
+
+@dataclass
+class _TransactionRecord:
+    transaction: PublicationTransaction
+    transaction_id: str
     generation_id: str
     generation_uri: str
     staging_dir: Path
@@ -58,9 +71,12 @@ class PublicationBackend:
     GENERATION_WRITE = "generation_write"
     DIRECTORY_PUBLISH = "directory_publish"
     POINTER_WRITE = "pointer_write"
+    ROOT_WRITE = "root_write"
 
     def __init__(self, output_root: str | Path) -> None:
         self.output_root = Path(output_root).resolve()
+        self._capability = object()
+        self._transactions: dict[str, _TransactionRecord] = {}
 
     def _run_operation(self, name: str, action: Callable[[], T]) -> T:
         del name
@@ -78,6 +94,46 @@ class PublicationBackend:
             raise ValueError("publication path escapes its configured root") from error
         return resolved
 
+    def _validated_transaction(
+        self, transaction: PublicationTransaction
+    ) -> _TransactionRecord:
+        if type(transaction) is not PublicationTransaction:
+            raise ValueError("untrusted publication transaction")
+        try:
+            transaction_id = transaction.transaction_id
+            record = self._transactions.get(transaction_id)
+            staging = Path(transaction.staging_dir).resolve()
+            final = Path(transaction.final_dir).resolve()
+            capability_matches = transaction._capability is self._capability
+        except (AttributeError, OSError, TypeError) as error:
+            raise ValueError(
+                "untrusted or mutated publication transaction"
+            ) from error
+        if (
+            record is None
+            or record.transaction is not transaction
+            or not capability_matches
+            or record.transaction_id != transaction_id
+            or transaction.generation_id != record.generation_id
+            or transaction.generation_uri != record.generation_uri
+            or staging != record.staging_dir
+            or final != record.final_dir
+        ):
+            raise ValueError("untrusted or mutated publication transaction")
+
+        staging_root = self._resolve_under(self.output_root, ".staging")
+        expected_final = self._resolve_under(
+            self.output_root, Path("generations") / record.generation_id
+        )
+        if (
+            record.staging_dir.resolve() != record.staging_dir
+            or record.staging_dir.parent != staging_root
+            or record.final_dir != expected_final
+            or record.generation_uri != f"generations/{record.generation_id}"
+        ):
+            raise ValueError("publication transaction registry is invalid")
+        return record
+
     def begin_generation(self, generation_id: str) -> PublicationTransaction:
         if _GENERATION_ID.fullmatch(generation_id) is None:
             raise ValueError("generation_id must be exactly twenty lowercase hex characters")
@@ -93,12 +149,27 @@ class PublicationBackend:
         if final.exists():
             shutil.rmtree(staging)
             raise FileExistsError(f"immutable generation already exists: {generation_id}")
-        return PublicationTransaction(
+        transaction_id = secrets.token_hex(16)
+        while transaction_id in self._transactions:
+            transaction_id = secrets.token_hex(16)
+        generation_uri = f"generations/{generation_id}"
+        transaction = PublicationTransaction(
+            transaction_id=transaction_id,
             generation_id=generation_id,
-            generation_uri=f"generations/{generation_id}",
+            generation_uri=generation_uri,
+            staging_dir=staging,
+            final_dir=final,
+            _capability=self._capability,
+        )
+        self._transactions[transaction_id] = _TransactionRecord(
+            transaction=transaction,
+            transaction_id=transaction_id,
+            generation_id=generation_id,
+            generation_uri=generation_uri,
             staging_dir=staging,
             final_dir=final,
         )
+        return transaction
 
     def write_generation_bytes(
         self,
@@ -106,7 +177,10 @@ class PublicationBackend:
         relative: str | Path,
         payload: bytes,
     ) -> Path:
-        target = self._resolve_under(transaction.staging_dir, relative)
+        record = self._validated_transaction(transaction)
+        if record.published or not record.staging_dir.is_dir():
+            raise ValueError("publication transaction is not writable")
+        target = self._resolve_under(record.staging_dir, relative)
 
         def write() -> Path:
             _atomic_write_bytes(target, payload)
@@ -125,31 +199,54 @@ class PublicationBackend:
         )
 
     def publish_generation(self, transaction: PublicationTransaction) -> None:
-        transaction.final_dir.parent.mkdir(parents=True, exist_ok=True)
+        record = self._validated_transaction(transaction)
+        if (
+            record.published
+            or not record.staging_dir.is_dir()
+            or record.final_dir.exists()
+        ):
+            raise ValueError("publication transaction cannot be published")
+        record.final_dir.parent.mkdir(parents=True, exist_ok=True)
 
         def publish() -> None:
-            os.replace(transaction.staging_dir, transaction.final_dir)
+            os.replace(record.staging_dir, record.final_dir)
 
         self._run_operation(self.DIRECTORY_PUBLISH, publish)
-        transaction.published = True
+        record.published = True
 
-    def publish_current(self, payload: str) -> None:
+    def publish_current(
+        self,
+        payload: str,
+        *,
+        transaction: PublicationTransaction,
+    ) -> None:
+        record = self._validated_transaction(transaction)
+        if not record.published or not record.final_dir.is_dir():
+            raise ValueError(
+                "publication transaction generation is not ready to commit"
+            )
         pointer = self._resolve_under(self.output_root, "current-generation.json")
         self._run_operation(
             self.POINTER_WRITE,
             lambda: _atomic_write_bytes(pointer, payload.encode("utf-8")),
         )
+        self._transactions.pop(record.transaction_id, None)
 
     def write_root_text(self, relative: str | Path, payload: str) -> Path:
         target = self._resolve_under(self.output_root, relative)
-        _atomic_write_bytes(target, payload.encode("utf-8"))
-        return target
+
+        def write() -> Path:
+            _atomic_write_bytes(target, payload.encode("utf-8"))
+            return target
+
+        return self._run_operation(self.ROOT_WRITE, write)
 
     def abort(self, transaction: PublicationTransaction | None) -> None:
         if transaction is None:
             return
-        if transaction.staging_dir.is_dir():
-            shutil.rmtree(transaction.staging_dir)
-        if transaction.published and transaction.final_dir.is_dir():
-            shutil.rmtree(transaction.final_dir)
-            transaction.published = False
+        record = self._validated_transaction(transaction)
+        if record.staging_dir.is_dir():
+            shutil.rmtree(record.staging_dir)
+        if record.published and record.final_dir.is_dir():
+            shutil.rmtree(record.final_dir)
+        self._transactions.pop(record.transaction_id, None)

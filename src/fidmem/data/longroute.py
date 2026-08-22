@@ -588,9 +588,6 @@ class LongRouteBuilder:
                     "source or evaluation file changed after leakage audit"
                 )
             self.publication_backend.publish_generation(transaction)
-            self.publication_backend.publish_current(
-                _canonical_json({"generation": uri, "seed": seed})
-            )
             self.publication_backend.write_root_text(
                 "last-attempt.json",
                 _canonical_json(
@@ -598,9 +595,14 @@ class LongRouteBuilder:
                         "attempt_id": attempt,
                         "seed": seed,
                         "status": "complete",
+                        "generation": uri,
                         "audit_uri": leakage_audit_uri,
                     }
                 ),
+            )
+            self.publication_backend.publish_current(
+                _canonical_json({"generation": uri, "seed": seed}),
+                transaction=transaction,
             )
             return manifest
         except Exception as error:

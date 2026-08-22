@@ -719,3 +719,51 @@ def test_review_c6_nested_event_order_keeps_source_hashes_identical(tmp_path: Pa
     manifest = _manifest(tmp_path)
     altered = manifest.model_copy(update={"videos": tuple(video.model_copy(update={"events": tuple(reversed(video.events)), "questions": tuple(reversed(video.questions))}) for video in reversed(manifest.videos))})
     assert _builder(tmp_path / "one", manifest).build(1).source_manifest_hashes == _builder(tmp_path / "two", altered).build(1).source_manifest_hashes
+
+
+@pytest.mark.parametrize("previous_success", (False, True))
+def test_review_round2_complete_attempt_write_fails_before_current_commit(
+    tmp_path: Path, previous_success: bool
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+    output = root / "output"
+    if previous_success:
+        first = _builder(root, manifest).build(1)
+        previous_pointer = (output / "current-generation.json").read_bytes()
+        previous_generations = _public_generation_names(output)
+        assert (output / first.generation_uri / "manifest.json").is_file()
+    else:
+        previous_pointer = None
+        previous_generations = set()
+    backend = FaultingPublicationBackend(output, "root_write", 1)
+
+    with pytest.raises(OSError, match="root_write"):
+        _builder(root, manifest, publication_backend=backend).build(2)
+
+    pointer = output / "current-generation.json"
+    if previous_pointer is None:
+        assert not pointer.exists()
+    else:
+        assert pointer.read_bytes() == previous_pointer
+        generation = json.loads(previous_pointer)["generation"]
+        assert (output / generation / "manifest.json").is_file()
+    assert _public_generation_names(output) == previous_generations
+    assert json.loads((output / "last-attempt.json").read_text())["status"] == "failed"
+
+
+def test_review_round2_success_attempt_and_current_name_the_same_generation(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path / "sources")
+    root = tmp_path / "case"
+
+    result = _builder(root, manifest).build(3)
+
+    output = root / "output"
+    pointer = json.loads((output / "current-generation.json").read_text())
+    attempt = json.loads((output / "last-attempt.json").read_text())
+    assert pointer == {"generation": result.generation_uri, "seed": 3}
+    assert attempt["status"] == "complete"
+    assert attempt["generation"] == result.generation_uri
+    assert (output / pointer["generation"] / "manifest.json").is_file()

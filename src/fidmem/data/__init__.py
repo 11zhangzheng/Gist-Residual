@@ -1,6 +1,6 @@
 """Video ingestion, segmentation, and data-split audit utilities."""
 
-from .leakage import LeakageAuditor, VideoAsset
+from .leakage import LeakageAuditError, LeakageAuditor, VideoAsset
 from .longroute import (
     ContactSheetValidator,
     DatasetManifest,
@@ -16,6 +16,7 @@ __all__ = [
     "ContactSheetValidator",
     "DefaultContactSheetValidator",
     "LeakageAuditor",
+    "LeakageAuditError",
     "DatasetManifest",
     "LongRouteBuilder",
     "LongRouteConfig",

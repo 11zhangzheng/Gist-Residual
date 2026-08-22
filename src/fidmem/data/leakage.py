@@ -14,6 +14,43 @@ from .video import probe_video, sample_frames
 
 EmbeddingProvider = Callable[[Path, tuple[Path, ...]], Sequence[Sequence[float]]]
 
+class LeakageAuditError(ValueError):
+    """Malformed numeric audit evidence that must fail closed."""
+
+
+def _validated_vector(
+    vector: Sequence[float],
+    *,
+    label: str,
+) -> tuple[tuple[float, ...], float]:
+    values = tuple(float(value) for value in vector)
+    if not values:
+        raise LeakageAuditError(f"{label} must be non-empty")
+    if not all(math.isfinite(value) for value in values):
+        raise LeakageAuditError(f"{label} values must be finite")
+    norm = math.hypot(*values)
+    if not math.isfinite(norm):
+        raise LeakageAuditError(f"{label} norm must be finite")
+    if norm <= 0:
+        raise LeakageAuditError(f"{label} must be a non-zero vector")
+    return values, norm
+
+
+def _validated_embeddings(
+    embeddings: Sequence[Sequence[float]],
+) -> tuple[tuple[float, ...], ...]:
+    rows = tuple(tuple(float(value) for value in row) for row in embeddings)
+    if not rows:
+        raise LeakageAuditError("at least one frame embedding is required")
+    width = len(rows[0])
+    if width == 0 or any(len(row) != width for row in rows):
+        raise LeakageAuditError(
+            "frame embeddings must be non-empty and equal-width"
+        )
+    for row in rows:
+        _validated_vector(row, label="frame embedding")
+    return rows
+
 
 @dataclass(frozen=True)
 class VideoAsset:
@@ -26,10 +63,11 @@ class VideoAsset:
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", Path(self.path))
         if self.frame_embeddings is not None:
+            embeddings = _validated_embeddings(self.frame_embeddings)
             object.__setattr__(
                 self,
                 "frame_embeddings",
-                tuple(tuple(float(value) for value in row) for row in self.frame_embeddings),
+                embeddings,
             )
 
 
@@ -62,23 +100,47 @@ def _sha256(path: Path) -> str:
 
 
 def _centroid(embeddings: Sequence[Sequence[float]]) -> tuple[float, ...]:
-    if not embeddings:
-        raise ValueError("at least one frame embedding is required")
-    width = len(embeddings[0])
-    if width == 0 or any(len(row) != width for row in embeddings):
-        raise ValueError("frame embeddings must be non-empty and equal-width")
-    return tuple(sum(row[index] for row in embeddings) / len(embeddings) for index in range(width))
+    rows = _validated_embeddings(embeddings)
+    values: list[float] = []
+    for index in range(len(rows[0])):
+        total = sum(row[index] for row in rows)
+        if not math.isfinite(total):
+            raise LeakageAuditError("embedding centroid arithmetic must be finite")
+        value = total / len(rows)
+        if not math.isfinite(value):
+            raise LeakageAuditError("embedding centroid values must be finite")
+        values.append(value)
+    centroid, _ = _validated_vector(values, label="embedding centroid")
+    return centroid
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
     if len(left) != len(right):
-        raise ValueError("embedding centroids must have matching dimensions")
-    denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(
-        sum(value * value for value in right)
+        raise LeakageAuditError(
+            "embedding centroids must have matching dimensions"
+        )
+    left_values, left_norm = _validated_vector(
+        left, label="left embedding centroid"
     )
-    if denominator == 0:
-        raise ValueError("embedding centroids must not be zero vectors")
-    return sum(left_value * right_value for left_value, right_value in zip(left, right, strict=True)) / denominator
+    right_values, right_norm = _validated_vector(
+        right, label="right embedding centroid"
+    )
+    denominator = left_norm * right_norm
+    if not math.isfinite(denominator) or denominator <= 0:
+        raise LeakageAuditError("cosine denominator must be finite and positive")
+    products = tuple(
+        left_value * right_value
+        for left_value, right_value in zip(left_values, right_values, strict=True)
+    )
+    if not all(math.isfinite(value) for value in products):
+        raise LeakageAuditError("cosine numerator terms must be finite")
+    numerator = sum(products)
+    if not math.isfinite(numerator):
+        raise LeakageAuditError("cosine numerator must be finite")
+    similarity = numerator / denominator
+    if not math.isfinite(similarity):
+        raise LeakageAuditError("cosine similarity must be finite")
+    return similarity
 
 
 class LeakageAuditor:

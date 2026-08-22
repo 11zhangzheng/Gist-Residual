@@ -1,9 +1,10 @@
 from pathlib import Path
+import math
 
 import duckdb
 import pytest
 
-from fidmem.data.leakage import LeakageAuditor, VideoAsset
+from fidmem.data.leakage import LeakageAuditor, VideoAsset, _centroid, _cosine
 
 
 def test_audit_reports_a_copied_file_as_a_hash_duplicate(tmp_path: Path) -> None:
@@ -118,3 +119,92 @@ def test_audit_does_not_collide_distinct_unicode_or_empty_normalized_ids(
     )
 
     assert report.findings == ()
+
+
+@pytest.mark.parametrize("invalid", (math.nan, math.inf, -math.inf))
+@pytest.mark.parametrize("invalid_split", ("train", "eval"))
+def test_audit_rejects_non_finite_precomputed_embeddings_on_both_splits(
+    tmp_path: Path, invalid: float, invalid_split: str
+) -> None:
+    train_path = tmp_path / "train.mp4"
+    train_path.write_bytes(b"train")
+    eval_path = tmp_path / "eval.mp4"
+    eval_path.write_bytes(b"eval")
+    valid = ((1.0, 0.0),) * 8
+    malformed = ((invalid, 0.0),) * 8
+
+    with pytest.raises(ValueError, match="finite"):
+        LeakageAuditor(tmp_path / "leakage.parquet").audit(
+            (
+                VideoAsset(
+                    "train",
+                    train_path,
+                    malformed if invalid_split == "train" else valid,
+                ),
+            ),
+            (
+                VideoAsset(
+                    "eval",
+                    eval_path,
+                    malformed if invalid_split == "eval" else valid,
+                ),
+            ),
+            require_coverage=True,
+        )
+
+
+@pytest.mark.parametrize("invalid_split", ("train", "eval"))
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        ((math.nan, 0.0),) * 8,
+        ((0.0, 0.0),) + ((1.0, 0.0),) * 7,
+        ((1.0, 0.0),) * 4 + ((-1.0, 0.0),) * 4,
+    ),
+)
+def test_audit_rejects_malformed_provider_embeddings_on_both_splits(
+    tmp_path: Path,
+    invalid_split: str,
+    malformed: tuple[tuple[float, float], ...],
+) -> None:
+    train_path = Path(__file__).parents[1] / "fixtures" / "tiny_video.mp4"
+    eval_path = tmp_path / "eval.mp4"
+    eval_path.write_bytes(train_path.read_bytes() + b"\0")
+    valid = ((1.0, 0.0),) * 8
+
+    def provider(
+        path: Path, _frames: tuple[Path, ...]
+    ) -> tuple[tuple[float, float], ...]:
+        is_train = path.resolve() == train_path.resolve()
+        return malformed if (is_train == (invalid_split == "train")) else valid
+
+    with pytest.raises(ValueError, match="finite|zero"):
+        LeakageAuditor(
+            tmp_path / "leakage.parquet",
+            embedding_provider=provider,
+        ).audit(
+            (VideoAsset("train", train_path),),
+            (VideoAsset("eval", eval_path),),
+            require_coverage=True,
+        )
+
+
+def test_centroid_rejects_a_zero_frame_and_non_finite_result() -> None:
+    with pytest.raises(ValueError, match="zero"):
+        _centroid(((0.0, 0.0), (1.0, 0.0)))
+    with pytest.raises(ValueError, match="finite"):
+        _centroid(((1e308,),) * 8)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    (
+        ((1e308, 0.0), (0.0, 1e308)),
+        ((1e308, 1e308), (1e308, 1e308)),
+    ),
+)
+def test_cosine_rejects_non_finite_arithmetic(
+    left: tuple[float, ...], right: tuple[float, ...]
+) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _cosine(left, right)

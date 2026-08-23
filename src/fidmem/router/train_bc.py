@@ -28,9 +28,13 @@ from fidmem.data.longroute import (
     MANIFEST_VERSION,
     DatasetManifest,
     LongRouteExample,
-    SourceManifestProvenance,
-    SourceVideoProvenance,
+    SourceEvent,
+    SourceQuestion,
+    SourceVideo,
+    TrainSplitManifest,
     VirtualSegment,
+    _canonical_source_manifest,
+    _source_provenance,
 )
 from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
 from fidmem.oracle.search import OraclePath
@@ -330,9 +334,20 @@ def canonical_config_hash(model: MemoryRouter, config: TrainConfig) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _validate_git_commit(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or value != value.casefold()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be exactly 40 lowercase hexadecimal characters")
+    return value
+
+
 def _git_commit() -> str:
     try:
-        return subprocess.run(
+        repository_commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
@@ -340,7 +355,13 @@ def _git_commit() -> str:
             timeout=5,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        build_commit = os.environ.get("FIDMEM_BUILD_GIT_COMMIT")
+        if build_commit is None:
+            raise RuntimeError(
+                "Git commit identity is unavailable; set explicit build metadata"
+            ) from None
+        return _validate_git_commit(build_commit, label="build Git commit")
+    return _validate_git_commit(repository_commit, label="repository Git commit")
 
 
 def _hash_semantic_value(hasher: "hashlib._Hash", value: object) -> None:
@@ -626,11 +647,13 @@ def load_checkpoint(
         raise ValueError("current runtime does not match expected runtime identity")
     if payload["device"] != expected_device:
         raise ValueError("checkpoint device does not match")
-    if not isinstance(expected_git_commit, str) or not expected_git_commit:
-        raise ValueError("expected git commit is required")
-    if not isinstance(payload["git_commit"], str) or not payload["git_commit"]:
-        raise ValueError("checkpoint git commit is invalid")
-    if payload["git_commit"] != expected_git_commit:
+    expected_git_commit = _validate_git_commit(
+        expected_git_commit, label="expected Git commit"
+    )
+    checkpoint_git_commit = _validate_git_commit(
+        payload["git_commit"], label="checkpoint Git commit"
+    )
+    if checkpoint_git_commit != expected_git_commit:
         raise ValueError(
             "checkpoint git commit does not match; cross-commit exact resume is forbidden"
         )
@@ -670,6 +693,7 @@ def _checkpoint_payload(
     runtime_identity: RuntimeIdentity,
     git_commit: str,
 ) -> dict[str, object]:
+    git_commit = _validate_git_commit(git_commit, label="checkpoint Git commit")
     payload: dict[str, object] = {
         "schema_version": 3,
         "model": model.state_dict(),
@@ -913,7 +937,7 @@ def _smoke_dataset(size: int) -> OracleBCDataset:
             LongRouteExample,
         ]
     ] = []
-    videos: list[SourceVideoProvenance] = []
+    source_videos: list[SourceVideo] = []
     examples: list[LongRouteExample] = []
     asset_hashes: dict[str, str] = {}
     group_assignment: dict[str, Literal["train"]] = {}
@@ -974,31 +998,51 @@ def _smoke_dataset(size: int) -> OracleBCDataset:
         asset_hash = hashlib.sha256(
             f"smoke-asset:{video_id}".encode("utf-8")
         ).hexdigest()
-        videos.append(
-            SourceVideoProvenance(
+        source_videos.append(
+            SourceVideo(
                 video_id=video_id,
+                path=Path(f"{video_id}.mp4"),
                 source_uri=f"file:///{video_id}.mp4",
                 content_sha256=asset_hash,
+                split="train",
+                licensed=True,
+                frame_embeddings=tuple((1.0, float(frame + 1)) for frame in range(8)),
+                events=tuple(
+                    SourceEvent(
+                        event_id=event_id,
+                        start_sec=position * 300,
+                        end_sec=(position + 1) * 300,
+                        label=f"smoke event {event_id}",
+                        embedding=(1.0, float(position + 1)),
+                    )
+                    for position, event_id in enumerate(candidates)
+                ),
+                questions=(
+                    SourceQuestion(
+                        question_id=example.question_id,
+                        question=example.question,
+                        options=example.options,
+                        answer=example.answer,
+                        target_event_id=target_event,
+                    ),
+                ),
             )
         )
         examples.append(example)
         asset_hashes[video_id] = asset_hash
         group_assignment[video_id] = "train"
         prepared.append((state, actions, target_action, example))
-    source_hash = hashlib.sha256(
-        _canonical_json(
-            tuple(video.model_dump(mode="json") for video in videos)
-        ).encode("utf-8")
-    ).hexdigest()
-    source = SourceManifestProvenance(
-        identity="fidmem-smoke-source",
-        dataset_name="fidmem-smoke",
+    source_manifest = TrainSplitManifest(
+        name="fidmem-smoke",
         dataset_version="v1",
         source_uri="file:///fidmem-smoke-source.json",
         license="test-only",
-        canonical_sha256=source_hash,
-        videos=tuple(videos),
+        split="train",
+        videos=tuple(source_videos),
     )
+    source = _source_provenance(_canonical_source_manifest(source_manifest))
+    source_hash = source.canonical_sha256
+
     manifest = DatasetManifest(
         manifest_version=MANIFEST_VERSION,
         schema_version=MANIFEST_VERSION,
@@ -1050,7 +1094,7 @@ def _smoke_dataset(size: int) -> OracleBCDataset:
             state=state,
             question_id=example.question_id,
             gold_answer=example.answer,
-            answerer=FrozenAnswerer(lambda _: "__incorrect__"),
+            answerer=FrozenAnswerer(lambda _: example.options[1]),
             answerer_identity=FrozenComponentIdentity(
                 implementation="fidmem.smoke-answerer.v1",
                 model_id="deterministic-wrong-answer",
@@ -1068,6 +1112,7 @@ def _smoke_dataset(size: int) -> OracleBCDataset:
                 normalization=normalization,
                 manifest=manifest,
                 example=example,
+                source_manifests=(source_manifest,),
                 sufficiency_artifact=artifact,
             )
         )

@@ -15,7 +15,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Callable, Literal, Protocol
+from typing import Literal, Protocol
 
 import duckdb
 import torch
@@ -31,7 +31,18 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from fidmem.agent.answerer import FrozenAnswerer
-from fidmem.data.longroute import DatasetManifest, LongRouteExample
+from fidmem.data.longroute import (
+    DatasetManifest,
+    LongRouteExample,
+    SourceEvent,
+    SourceManifestProvenance,
+    SourceQuestion,
+    SourceVideo,
+    SourceVideoProvenance,
+    TrainSplitManifest,
+    _canonical_source_manifest,
+    _source_manifest_hash,
+)
 from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
 from fidmem.types import ActionInstance, ActionType, FidelityLevel, RouterState
 
@@ -231,18 +242,54 @@ def _question_sha256(question_id: str, state: RouterState) -> str:
 
 
 class SufficiencyLabelArtifact(BaseModel):
-    """Sealed STOP label with frozen answerer and judge identities."""
+    """Content-addressed deterministic multiple-choice STOP label."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    schema_version: Literal[1] = 1
     question_id: str = Field(min_length=1)
     state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     question_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     answerer_identity: FrozenComponentIdentity
-    judge_identity: FrozenComponentIdentity
-    stop_answer: str = Field(min_length=1)
-    gold_answer: str = Field(min_length=1)
-    label: Literal[0, 1]
+    answerer_template_version: Literal[
+        "frozen-answerer-prompt/v1"
+    ] = "frozen-answerer-prompt/v1"
+    judge_version: Literal[
+        "normalized-multiple-choice-exact-match/v1"
+    ] = "normalized-multiple-choice-exact-match/v1"
+    normalized_stop_answer: str = Field(min_length=1)
+    normalized_gold_answer: str = Field(min_length=1)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_self_hash(self) -> "SufficiencyLabelArtifact":
+        expected = hashlib.sha256(
+            _canonical_json(
+                self.model_dump(mode="json", exclude={"artifact_sha256"})
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.artifact_sha256 != expected:
+            raise ValueError("sufficiency artifact self hash mismatch")
+        return self
+
+    @property
+    def label(self) -> int:
+        return int(self.normalized_stop_answer == self.normalized_gold_answer)
+
+    @property
+    def stop_answer(self) -> str:
+        return self.normalized_stop_answer
+
+    @property
+    def gold_answer(self) -> str:
+        return self.normalized_gold_answer
+
+
+def _normalize_answer(answer: str) -> str:
+    normalized = answer.strip().casefold()
+    if not normalized:
+        raise ValueError("multiple-choice answer must be non-empty")
+    return normalized
 
 
 def seal_sufficiency_label(
@@ -252,37 +299,110 @@ def seal_sufficiency_label(
     gold_answer: str,
     answerer: FrozenAnswerer,
     answerer_identity: FrozenComponentIdentity,
-    judge: Callable[[str, str], bool] | None = None,
-    judge_identity: FrozenComponentIdentity | None = None,
 ) -> SufficiencyLabelArtifact:
-    """Adapt Task9 STOP evaluation into a self-identifying artifact."""
+    """Seal the only supported v1 judge: normalized MC exact match."""
 
-    if judge is None:
-
-        def judge(predicted, gold):
-            return predicted.strip().casefold() == gold.strip().casefold()
-
-        judge_identity = FrozenComponentIdentity(
-            implementation="fidmem.exact_match.v1",
-            model_id="unicode-casefold-exact-match",
-            revision="1",
-            artifact_sha256=hashlib.sha256(
-                b"strip+unicode-casefold+exact-match/v1"
-            ).hexdigest(),
-        )
-    if judge_identity is None:
-        raise ValueError("a custom sufficiency judge requires a frozen identity")
+    normalized_options = tuple(_normalize_answer(option) for option in state.options)
+    if len(set(normalized_options)) != len(normalized_options):
+        raise ValueError("multiple-choice options must be unique after normalization")
+    normalized_gold = _normalize_answer(gold_answer)
+    if normalized_gold not in normalized_options:
+        raise ValueError("gold answer must be one of the multiple-choice options")
     result = answerer.answer(state.question, state.options, state.evidence)
+    base: dict[str, object] = {
+        "schema_version": 1,
+        "question_id": question_id,
+        "state_sha256": _state_sha256(state),
+        "question_sha256": _question_sha256(question_id, state),
+        "answerer_identity": answerer_identity.model_dump(mode="json"),
+        "answerer_template_version": "frozen-answerer-prompt/v1",
+        "judge_version": "normalized-multiple-choice-exact-match/v1",
+        "normalized_stop_answer": _normalize_answer(result.answer),
+        "normalized_gold_answer": normalized_gold,
+    }
     return SufficiencyLabelArtifact(
-        question_id=question_id,
-        state_sha256=_state_sha256(state),
-        question_sha256=_question_sha256(question_id, state),
-        answerer_identity=answerer_identity,
-        judge_identity=judge_identity,
-        stop_answer=result.answer,
-        gold_answer=gold_answer,
-        label=int(judge(result.answer, gold_answer)),
+        **base,
+        artifact_sha256=hashlib.sha256(
+            _canonical_json(base).encode("utf-8")
+        ).hexdigest(),
     )
+
+
+class CanonicalSourceVideo(BaseModel):
+    """Task8 source-video payload with the machine-local path removed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    video_id: str
+    source_uri: str
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    split: Literal["train"]
+    licensed: bool
+    frame_embeddings: tuple[tuple[float, ...], ...]
+    events: tuple[SourceEvent, ...]
+    questions: tuple[SourceQuestion, ...]
+
+
+class CanonicalSourceManifest(BaseModel):
+    """Canonical, portable serialization of a real Task8 train manifest."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    dataset_version: str
+    source_uri: str
+    license: str
+    split: Literal["train"]
+    videos: tuple[CanonicalSourceVideo, ...]
+
+    @model_validator(mode="after")
+    def validate_task8_source_invariants(self) -> "CanonicalSourceManifest":
+        TrainSplitManifest(
+            name=self.name,
+            dataset_version=self.dataset_version,
+            source_uri=self.source_uri,
+            license=self.license,
+            split=self.split,
+            videos=tuple(
+                SourceVideo(
+                    **video.model_dump(mode="python"),
+                    path=Path(f"{video.video_id}.canonical-source"),
+                )
+                for video in self.videos
+            ),
+        )
+        return self
+
+
+def _canonical_source_manifest_json(source: TrainSplitManifest) -> str:
+    canonical = _canonical_source_manifest(
+        TrainSplitManifest.model_validate(source.model_dump(mode="python"))
+    )
+    payload = canonical.model_dump(mode="json")
+    for video in payload["videos"]:
+        video.pop("path", None)
+    canonical_json = _canonical_json(payload)
+    if hashlib.sha256(canonical_json.encode("utf-8")).hexdigest() != (
+        _source_manifest_hash(canonical)
+    ):
+        raise ValueError("portable source manifest bytes diverge from Task8 identity")
+    return canonical_json
+
+
+def _parse_canonical_source_manifest(payload: str) -> CanonicalSourceManifest:
+    source = CanonicalSourceManifest.model_validate_json(payload)
+    if _canonical_json(source.model_dump(mode="json")) != payload:
+        raise ValueError("source manifest is not canonical")
+    return source
+
+
+@dataclass(frozen=True)
+class DerivedLongRouteLineage:
+    source_split: Literal["train", "dev"]
+    video_group_id: str
+    source_manifest_hash: str
+    asset_sha256: str
+    group_assignment_sha256: str
 
 
 class OracleRecordProvenance(BaseModel):
@@ -294,6 +414,7 @@ class OracleRecordProvenance(BaseModel):
     dataset_manifest_canonical_json: str = Field(min_length=2, repr=False)
     longroute_example_canonical_json: str = Field(min_length=2, repr=False)
     longroute_example_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_manifests_canonical_json: tuple[str, ...] = Field(min_length=1, repr=False)
     group_assignment_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -349,7 +470,27 @@ class OracleRecordProvenance(BaseModel):
             raise ValueError("LongRoute example is not canonical")
         if example.question_id != self.longroute_example_id:
             raise ValueError("LongRoute example identity mismatch")
-        _validate_task8_lineage(manifest, example)
+        lineage = _validate_task8_lineage(
+            manifest, example, self.source_manifests_canonical_json
+        )
+        actual = {
+            "source_split": self.source_split,
+            "video_group_id": self.video_group_id,
+            "source_manifest_hash": self.source_manifest_hash,
+            "asset_sha256": self.asset_sha256,
+            "group_assignment_sha256": self.group_assignment_sha256,
+        }
+        expected = {
+            "source_split": lineage.source_split,
+            "video_group_id": lineage.video_group_id,
+            "source_manifest_hash": lineage.source_manifest_hash,
+            "asset_sha256": lineage.asset_sha256,
+            "group_assignment_sha256": lineage.group_assignment_sha256,
+        }
+        if actual != expected:
+            raise ValueError(
+                "record provenance does not match authoritative Task8 lineage"
+            )
         return self
 
 
@@ -411,7 +552,7 @@ class OracleBCRecord(BaseModel):
         if artifact.question_sha256 != _question_sha256(self.question_id, self.state):
             raise ValueError("sufficiency question hash mismatch")
         if (
-            artifact.gold_answer != example.answer
+            artifact.gold_answer != _normalize_answer(example.answer)
             or artifact.label != self.sufficiency_target
         ):
             raise ValueError("sufficiency artifact does not match the record label")
@@ -419,8 +560,10 @@ class OracleBCRecord(BaseModel):
 
 
 def _validate_task8_lineage(
-    manifest: DatasetManifest, example: LongRouteExample
-) -> tuple[str, str, str]:
+    manifest: DatasetManifest,
+    example: LongRouteExample,
+    source_manifest_payloads: Sequence[str],
+) -> DerivedLongRouteLineage:
     if manifest.source_manifest_hashes != {
         source.identity: source.canonical_sha256 for source in manifest.source_manifests
     }:
@@ -432,40 +575,128 @@ def _validate_task8_lineage(
         raise ValueError(
             "LongRoute example is not an exact member of the dataset manifest"
         )
-    segment_videos = {segment.source_video_id for segment in example.segments}
-    if not segment_videos or any(
-        manifest.group_assignment.get(video_id) != example.split
-        for video_id in segment_videos
-    ):
-        raise ValueError("LongRoute group assignment does not match example split")
-    if manifest.group_assignment.get(example.target_source_video_id) != example.split:
-        raise ValueError("target video group does not match example split")
-    canonical_events = {
-        f"{segment.source_video_id}:{segment.event_id}" for segment in example.segments
+
+    canonical_sources: list[tuple[str, CanonicalSourceManifest]] = []
+    for payload in source_manifest_payloads:
+        source = _parse_canonical_source_manifest(payload)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        canonical_sources.append((digest, source))
+    if len({digest for digest, _ in canonical_sources}) != len(canonical_sources):
+        raise ValueError("canonical source manifests must be unique")
+
+    expected_sources: dict[str, SourceManifestProvenance] = {}
+    for digest, source in canonical_sources:
+        identity = f"{source.name}@{source.dataset_version}|{source.source_uri}"
+        if identity in expected_sources:
+            raise ValueError("canonical source manifest identities must be unique")
+        expected_sources[identity] = SourceManifestProvenance(
+            identity=identity,
+            dataset_name=source.name,
+            dataset_version=source.dataset_version,
+            source_uri=source.source_uri,
+            license=source.license,
+            canonical_sha256=digest,
+            videos=tuple(
+                SourceVideoProvenance(
+                    video_id=video.video_id,
+                    source_uri=video.source_uri,
+                    content_sha256=video.content_sha256,
+                )
+                for video in source.videos
+            ),
+        )
+    published_sources = {
+        source.identity: source for source in manifest.source_manifests
     }
+    if expected_sources != published_sources:
+        raise ValueError("canonical source manifests do not match Task8 provenance")
+    if manifest.source_manifest_hashes != {
+        identity: source.canonical_sha256
+        for identity, source in expected_sources.items()
+    }:
+        raise ValueError("canonical source manifest hashes do not match Task8")
+
+    owners: dict[str, list[tuple[str, CanonicalSourceVideo]]] = {}
+    for digest, source in canonical_sources:
+        for video in source.videos:
+            owners.setdefault(video.video_id, []).append((digest, video))
+
+    canonical_events: set[str] = set()
+    previous_global_end = 0.0
+    target_owner: tuple[str, CanonicalSourceVideo] | None = None
+    for index, segment in enumerate(example.segments):
+        matches = owners.get(segment.source_video_id, [])
+        if len(matches) != 1:
+            raise ValueError(
+                "every LongRoute segment must have exactly one source owner"
+            )
+        digest, video = matches[0]
+        asset = manifest.asset_sha256s.get(segment.source_video_id)
+        if asset is None or asset != video.content_sha256:
+            raise ValueError("LongRoute segment asset hash is missing or mismatched")
+        if manifest.group_assignment.get(segment.source_video_id) != example.split:
+            raise ValueError("LongRoute group assignment does not match example split")
+        events = tuple(
+            event for event in video.events if event.event_id == segment.event_id
+        )
+        if len(events) != 1:
+            raise ValueError("LongRoute segment event is absent from its source owner")
+        event = events[0]
+        if (
+            not math.isclose(
+                segment.source_start_sec, event.start_sec, rel_tol=0, abs_tol=1e-12
+            )
+            or not math.isclose(
+                segment.source_end_sec, event.end_sec, rel_tol=0, abs_tol=1e-12
+            )
+            or segment.source_end_sec <= segment.source_start_sec
+            or segment.global_end_sec <= segment.global_start_sec
+            or not math.isclose(
+                segment.global_start_sec, previous_global_end, rel_tol=0, abs_tol=1e-12
+            )
+            or not math.isclose(
+                segment.global_end_sec - segment.global_start_sec,
+                event.end_sec - event.start_sec,
+                rel_tol=0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("LongRoute segment range does not match its source event")
+        previous_global_end = segment.global_end_sec
+        canonical_id = f"{segment.source_video_id}:{segment.event_id}"
+        canonical_events.add(canonical_id)
+        if index == example.target_position:
+            if canonical_id != example.target_event_id:
+                raise ValueError(
+                    "LongRoute target position does not match target event"
+                )
+            target_owner = (digest, video)
+
+    if target_owner is None:
+        raise ValueError("LongRoute target position is out of range")
+    if (
+        example.target_source_video_id
+        != example.segments[example.target_position].source_video_id
+    ):
+        raise ValueError("LongRoute target source video does not match target segment")
     if example.target_event_id not in canonical_events or not set(
         example.supporting_event_ids
     ).issubset(canonical_events):
         raise ValueError("LongRoute event identities do not match virtual segments")
-    owners = tuple(
-        source
-        for source in manifest.source_manifests
-        if any(
-            video.video_id == example.target_source_video_id for video in source.videos
-        )
-    )
-    if len(owners) != 1:
-        raise ValueError("target video must have exactly one source manifest owner")
-    owner = owners[0]
-    video = next(
-        item for item in owner.videos if item.video_id == example.target_source_video_id
-    )
-    if manifest.asset_sha256s.get(video.video_id) != video.content_sha256:
-        raise ValueError("target video asset hash does not match source provenance")
-    return (
-        owner.canonical_sha256,
-        example.target_source_video_id,
-        video.content_sha256,
+    if not math.isclose(
+        example.duration_sec, previous_global_end, rel_tol=0, abs_tol=1e-12
+    ):
+        raise ValueError("LongRoute duration does not match virtual segments")
+
+    target_digest, target_video = target_owner
+    return DerivedLongRouteLineage(
+        source_split=example.split,
+        video_group_id=example.target_source_video_id,
+        source_manifest_hash=target_digest,
+        asset_sha256=target_video.content_sha256,
+        group_assignment_sha256=hashlib.sha256(
+            _canonical_json(manifest.group_assignment).encode("utf-8")
+        ).hexdigest(),
     )
 
 
@@ -479,6 +710,7 @@ def materialize_oracle_record(
     normalization: CostNormalization,
     manifest: DatasetManifest,
     example: LongRouteExample,
+    source_manifests: Sequence[TrainSplitManifest],
     sufficiency_artifact: SufficiencyLabelArtifact,
 ) -> OracleBCRecord:
     """Derive one BC row exclusively from verified Task8/Task9 artifacts."""
@@ -494,9 +726,16 @@ def materialize_oracle_record(
     )
     manifest = DatasetManifest.model_validate(manifest.model_dump(mode="python"))
     example = LongRouteExample.model_validate(example.model_dump(mode="python"))
-    source_manifest_hash, video_group_id, asset_sha256 = _validate_task8_lineage(
-        manifest, example
+    if isinstance(source_manifests, (str, bytes)) or not all(
+        isinstance(source, TrainSplitManifest) for source in source_manifests
+    ):
+        raise TypeError(
+            "source_manifests must contain real Task8 TrainSplitManifest objects"
+        )
+    source_payloads = tuple(
+        _canonical_source_manifest_json(source) for source in source_manifests
     )
+    lineage = _validate_task8_lineage(manifest, example, source_payloads)
     if state.question != example.question or state.options != example.options:
         raise ValueError("Router state question does not match LongRoute example")
     canonical_events = {
@@ -596,7 +835,7 @@ def materialize_oracle_record(
         raise ValueError("sufficiency artifact state hash mismatch")
     if artifact.question_sha256 != _question_sha256(example.question_id, state):
         raise ValueError("sufficiency artifact question hash mismatch")
-    if artifact.gold_answer != example.answer:
+    if artifact.gold_answer != _normalize_answer(example.answer):
         raise ValueError("sufficiency artifact gold answer mismatch")
 
     manifest_json = manifest.canonical_json()
@@ -617,7 +856,7 @@ def materialize_oracle_record(
         raise ValueError("derived cost_to_go must be finite and non-negative")
     return OracleBCRecord(
         record_id=record_id,
-        video_id=video_group_id,
+        video_id=lineage.video_group_id,
         question_id=example.question_id,
         observation_snapshot_id=observation_snapshot_id,
         provenance=OracleRecordProvenance(
@@ -627,13 +866,12 @@ def materialize_oracle_record(
             longroute_example_sha256=hashlib.sha256(
                 example_json.encode("utf-8")
             ).hexdigest(),
-            group_assignment_sha256=hashlib.sha256(
-                _canonical_json(manifest.group_assignment).encode("utf-8")
-            ).hexdigest(),
-            source_manifest_hash=source_manifest_hash,
-            asset_sha256=asset_sha256,
-            source_split=example.split,
-            video_group_id=video_group_id,
+            source_manifests_canonical_json=source_payloads,
+            group_assignment_sha256=lineage.group_assignment_sha256,
+            source_manifest_hash=lineage.source_manifest_hash,
+            asset_sha256=lineage.asset_sha256,
+            source_split=lineage.source_split,
+            video_group_id=lineage.video_group_id,
             longroute_example_id=example.question_id,
             normalization_manifest_hash=normalization_hash,
             normalization=normalization,
@@ -812,6 +1050,7 @@ class OracleDatasetAuthority(BaseModel):
 
     schema_version: Literal[1] = 1
     dataset_manifests: dict[str, str]
+    source_manifests: dict[str, str]
     normalizations: dict[str, dict[str, object]]
     record_digests: dict[str, str]
     authority_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -824,6 +1063,10 @@ class OracleDatasetAuthority(BaseModel):
             manifest = DatasetManifest.model_validate_json(canonical)
             if manifest.canonical_json() != canonical:
                 raise ValueError("authority dataset manifest is not canonical")
+        for digest, canonical in self.source_manifests.items():
+            if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != digest:
+                raise ValueError("authority source manifest hash mismatch")
+            _parse_canonical_source_manifest(canonical)
         for digest, payload in self.normalizations.items():
             if (
                 hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
@@ -858,6 +1101,8 @@ def _stored_record_payload(record: OracleBCRecord) -> dict[str, object]:
         raise ValueError("record provenance must be a JSON object")
     provenance.pop("dataset_manifest_canonical_json", None)
     provenance.pop("longroute_example_canonical_json", None)
+    provenance.pop("source_manifests_canonical_json", None)
+    provenance.pop("normalization", None)
     return payload
 
 
@@ -869,6 +1114,7 @@ def _build_dataset_authority(
     records: Sequence[OracleBCRecord],
 ) -> OracleDatasetAuthority:
     manifests: dict[str, str] = {}
+    source_manifests: dict[str, str] = {}
     normalizations: dict[str, dict[str, object]] = {}
     record_digests: dict[str, str] = {}
     for record in records:
@@ -877,6 +1123,11 @@ def _build_dataset_authority(
         previous = manifests.setdefault(provenance.dataset_manifest_hash, canonical)
         if previous != canonical:
             raise ValueError("one dataset manifest hash has conflicting payloads")
+        for source_payload in provenance.source_manifests_canonical_json:
+            source_digest = hashlib.sha256(source_payload.encode("utf-8")).hexdigest()
+            previous_source = source_manifests.setdefault(source_digest, source_payload)
+            if previous_source != source_payload:
+                raise ValueError("one source manifest hash has conflicting payloads")
         normalization = provenance.normalization.model_dump(mode="json")
         previous_normalization = normalizations.setdefault(
             provenance.normalization_manifest_hash, normalization
@@ -889,6 +1140,7 @@ def _build_dataset_authority(
     base: dict[str, object] = {
         "schema_version": 1,
         "dataset_manifests": manifests,
+        "source_manifests": source_manifests,
         "normalizations": normalizations,
         "record_digests": record_digests,
     }
@@ -934,8 +1186,9 @@ def _inflate_stored_record(
     normalization_payload = authority.normalizations.get(normalization_hash)
     if normalization_payload is None:
         raise ValueError("Oracle normalization is absent from dataset authority")
-    if provenance.get("normalization") != normalization_payload:
-        raise ValueError("Oracle normalization does not match dataset authority")
+    if "normalization" in provenance:
+        raise ValueError("Oracle row must not duplicate authority normalization")
+    provenance["normalization"] = normalization_payload
     example_hash = provenance.get("longroute_example_sha256")
     question_id = payload.get("question_id")
     manifest = DatasetManifest.model_validate_json(manifest_json)
@@ -950,10 +1203,20 @@ def _inflate_stored_record(
     )
     if len(matches) != 1:
         raise ValueError("Oracle example is absent from dataset authority")
+    required_source_hashes = tuple(
+        source.canonical_sha256 for source in manifest.source_manifests
+    )
+    source_payloads = []
+    for source_hash in required_source_hashes:
+        source_payload = authority.source_manifests.get(source_hash)
+        if source_payload is None:
+            raise ValueError("Oracle source manifest is absent from dataset authority")
+        source_payloads.append(source_payload)
     provenance["dataset_manifest_canonical_json"] = manifest_json
     provenance["longroute_example_canonical_json"] = _canonical_json(
         matches[0].model_dump(mode="json")
     )
+    provenance["source_manifests_canonical_json"] = source_payloads
     return OracleBCRecord.model_validate(payload)
 
 

@@ -15,9 +15,13 @@ from fidmem.data.longroute import (
     MANIFEST_VERSION,
     DatasetManifest,
     LongRouteExample,
-    SourceManifestProvenance,
-    SourceVideoProvenance,
+    SourceEvent,
+    SourceQuestion,
+    SourceVideo,
+    TrainSplitManifest,
     VirtualSegment,
+    _canonical_source_manifest,
+    _source_provenance,
 )
 from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
 from fidmem.oracle.search import OraclePath
@@ -50,7 +54,7 @@ def _published(
     question_id: str = "q-1",
     video_id: str = "video-1",
     split: str = "train",
-) -> tuple[DatasetManifest, LongRouteExample]:
+) -> tuple[DatasetManifest, LongRouteExample, TrainSplitManifest]:
     event_id = f"{video_id}:event-1"
     example = LongRouteExample(
         question_id=question_id,
@@ -75,29 +79,52 @@ def _published(
         ),
         duration_sec=600,
     )
-    source_hash = "1" * 64
     asset_hash = "2" * 64
-    source = SourceManifestProvenance(
-        identity="source-1",
-        dataset_name="unit",
+    source_manifest = TrainSplitManifest(
+        name="unit",
         dataset_version="v1",
         source_uri="file:///source.json",
         license="test",
-        canonical_sha256=source_hash,
+        split="train",
         videos=(
-            SourceVideoProvenance(
+            SourceVideo(
                 video_id=video_id,
+                path=Path(f"{video_id}.mp4"),
                 source_uri=f"file:///{video_id}.mp4",
                 content_sha256=asset_hash,
+                split="train",
+                licensed=True,
+                frame_embeddings=tuple((1.0, float(index + 1)) for index in range(8)),
+                events=(
+                    SourceEvent(
+                        event_id="event-1",
+                        start_sec=0,
+                        end_sec=600,
+                        label="event one",
+                        embedding=(1.0, 0.5),
+                    ),
+                ),
+                questions=(
+                    SourceQuestion(
+                        question_id=question_id,
+                        question=example.question,
+                        options=example.options,
+                        answer=example.answer,
+                        target_event_id="event-1",
+                    ),
+                ),
             ),
         ),
     )
+    source = _source_provenance(_canonical_source_manifest(source_manifest))
+    source_hash = source.canonical_sha256
+
     manifest = DatasetManifest(
         manifest_version=MANIFEST_VERSION,
         schema_version=MANIFEST_VERSION,
         builder_version=BUILDER_VERSION,
         seed=7,
-        source_manifest_hashes={"source-1": source_hash},
+        source_manifest_hashes={source.identity: source_hash},
         source_manifests=(source,),
         builder_config={"dev_fraction": 0.2},
         group_assignment={video_id: split},
@@ -109,7 +136,7 @@ def _published(
         asset_sha256s={video_id: asset_hash},
         generation_uri="generation",
     )
-    return manifest, example
+    return manifest, example, source_manifest
 
 
 def _state(example: LongRouteExample) -> RouterState:
@@ -173,7 +200,7 @@ def _record(
     video_id: str = "video-1",
     normalization: CostNormalization | None = None,
 ):
-    manifest, example = _published(
+    manifest, example, source_manifest = _published(
         question_id=question_id,
         video_id=video_id,
         split=split,
@@ -208,6 +235,7 @@ def _record(
         normalization=resolved_normalization,
         manifest=manifest,
         example=example,
+        source_manifests=(source_manifest,),
         sufficiency_artifact=sufficiency,
     )
 
@@ -216,7 +244,7 @@ def test_materializer_derives_canonical_lineage_cost_and_sufficiency(
     tmp_path: Path,
 ) -> None:
     record = _record()
-    manifest, _ = _published()
+    manifest, _, _ = _published()
     expected_manifest_hash = hashlib.sha256(
         manifest.canonical_json().encode("utf-8")
     ).hexdigest()
@@ -241,7 +269,7 @@ def test_materializer_derives_canonical_lineage_cost_and_sufficiency(
 
 
 def test_materializer_rejects_forged_task8_path_cost_and_bare_sufficiency() -> None:
-    manifest, example = _published()
+    manifest, example, source_manifest = _published()
     state = _state(example)
     action = ActionInstance(ActionType.EXPAND_RESIDUAL, example.target_event_id, None)
     normalization = CostNormalization(
@@ -268,6 +296,7 @@ def test_materializer_rejects_forged_task8_path_cost_and_bare_sufficiency() -> N
         normalization=normalization,
         manifest=manifest,
         example=example,
+        source_manifests=(source_manifest,),
         sufficiency_artifact=artifact,
     )
 
@@ -451,19 +480,20 @@ def test_checkpoint_binds_git_tokenizer_and_deterministic_runtime(
     assert runtime.cudnn_deterministic
     assert not runtime.cudnn_benchmark
 
-    with pytest.raises(ValueError, match="git commit"):
-        load_checkpoint(
-            result.checkpoint_path,
-            expected_config_hash=result.config_hash,
-            expected_dataset_identity=dataset.identity,
-            expected_split_manifest=result.split_manifest,
-            expected_encoder_identity=model.config.encoder,
-            expected_tokenizer_identity=model.config.encoder.tokenizer,
-            expected_loss_profile=training.loss_profile,
-            expected_runtime_identity=runtime,
-            expected_git_commit="f" * 40,
-            expected_device="cpu",
-        )
+    for invalid_commit in ("0" * 40, "unknown", "A" * 40):
+        with pytest.raises(ValueError, match="git commit|40 lowercase"):
+            load_checkpoint(
+                result.checkpoint_path,
+                expected_config_hash=result.config_hash,
+                expected_dataset_identity=dataset.identity,
+                expected_split_manifest=result.split_manifest,
+                expected_encoder_identity=model.config.encoder,
+                expected_tokenizer_identity=model.config.encoder.tokenizer,
+                expected_loss_profile=training.loss_profile,
+                expected_runtime_identity=runtime,
+                expected_git_commit=invalid_commit,
+                expected_device="cpu",
+            )
 
     mismatched_runtime = runtime.model_copy(
         update={"torch_version": runtime.torch_version + "-different"}

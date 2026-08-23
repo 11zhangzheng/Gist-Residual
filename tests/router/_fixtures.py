@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fidmem.actions.environment import ActionObservation, EnvironmentTransition
 from fidmem.agent.answerer import FrozenAnswerer
 from fidmem.data.longroute import (
@@ -7,9 +9,13 @@ from fidmem.data.longroute import (
     MANIFEST_VERSION,
     DatasetManifest,
     LongRouteExample,
-    SourceManifestProvenance,
-    SourceVideoProvenance,
+    SourceEvent,
+    SourceQuestion,
+    SourceVideo,
+    TrainSplitManifest,
     VirtualSegment,
+    _canonical_source_manifest,
+    _source_provenance,
 )
 from fidmem.oracle.labels import COST_PREFERENCES, CostNormalization, PreferenceLabel
 from fidmem.oracle.search import OraclePath
@@ -88,23 +94,47 @@ def authoritative_record(
         segments=segments,
         duration_sec=600,
     )
-    source_hash = "1" * 64
     asset_hash = "2" * 64
-    source = SourceManifestProvenance(
-        identity="fixture-source",
-        dataset_name="unit",
+    source_manifest = TrainSplitManifest(
+        name="unit",
         dataset_version="v1",
         source_uri="file:///fixture-source.json",
         license="test",
-        canonical_sha256=source_hash,
+        split="train",
         videos=(
-            SourceVideoProvenance(
+            SourceVideo(
                 video_id=video_id,
+                path=Path(f"{video_id}.mp4"),
                 source_uri=f"file:///{video_id}.mp4",
                 content_sha256=asset_hash,
+                split="train",
+                licensed=True,
+                frame_embeddings=tuple((1.0, float(index + 1)) for index in range(8)),
+                events=tuple(
+                    SourceEvent(
+                        event_id=event_id,
+                        start_sec=index * duration,
+                        end_sec=(index + 1) * duration,
+                        label=f"fixture event {index}",
+                        embedding=(1.0, float(index + 1)),
+                    )
+                    for index, event_id in enumerate(local_ids)
+                ),
+                questions=(
+                    SourceQuestion(
+                        question_id=question_id,
+                        question=state.question,
+                        options=state.options,
+                        answer=example.answer,
+                        target_event_id=target_local,
+                    ),
+                ),
             ),
         ),
     )
+    source = _source_provenance(_canonical_source_manifest(source_manifest))
+    source_hash = source.canonical_sha256
+
     manifest = DatasetManifest(
         manifest_version=MANIFEST_VERSION,
         schema_version=MANIFEST_VERSION,
@@ -153,7 +183,11 @@ def authoritative_record(
         )
         for preference in COST_PREFERENCES
     )
-    predicted = example.answer if sufficiency_target else "__incorrect__"
+    predicted = (
+        example.answer
+        if sufficiency_target
+        else next(option for option in example.options if option != example.answer)
+    )
     artifact = seal_sufficiency_label(
         state=state,
         question_id=question_id,
@@ -175,5 +209,6 @@ def authoritative_record(
         normalization=normalization,
         manifest=manifest,
         example=example,
+        source_manifests=(source_manifest,),
         sufficiency_artifact=artifact,
     )

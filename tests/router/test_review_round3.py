@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from fidmem.agent.answerer import FrozenAnswerer
-from fidmem.data.longroute import _canonical_source_manifest, _source_provenance
+from fidmem.data.longroute import (
+    SourceEvent,
+    SourceVideo,
+    VirtualSegment,
+    _canonical_source_manifest,
+    _source_provenance,
+)
 from fidmem.oracle.labels import CostNormalization
 from fidmem.router.dataset import (
     FrozenComponentIdentity,
@@ -26,6 +32,74 @@ from tests.router.test_review_round2 import _labels, _published, _record, _state
 
 def _materializer_kwargs() -> dict[str, object]:
     manifest, example, source_manifest = _published()
+    target_video = source_manifest.videos[0]
+    target_event = target_video.events[0].model_copy(update={"end_sec": 300})
+    target_video = target_video.model_copy(update={"events": (target_event,)})
+    distractor_video = SourceVideo(
+        video_id="video-distractor",
+        path=Path("video-distractor.mp4"),
+        source_uri="file:///video-distractor.mp4",
+        content_sha256="4" * 64,
+        split="train",
+        licensed=True,
+        frame_embeddings=target_video.frame_embeddings,
+        events=(
+            SourceEvent(
+                event_id="event-distractor",
+                start_sec=0,
+                end_sec=300,
+                label="distractor event",
+                embedding=(0.5, 1.0),
+            ),
+        ),
+        questions=(),
+    )
+    source_manifest = source_manifest.model_copy(
+        update={"videos": (target_video, distractor_video)}
+    )
+    source_provenance = _source_provenance(
+        _canonical_source_manifest(source_manifest)
+    )
+    example = example.model_copy(
+        update={
+            "segments": (
+                VirtualSegment(
+                    source_video_id=target_video.video_id,
+                    event_id=target_event.event_id,
+                    source_start_sec=0,
+                    source_end_sec=300,
+                    global_start_sec=0,
+                    global_end_sec=300,
+                ),
+                VirtualSegment(
+                    source_video_id=distractor_video.video_id,
+                    event_id=distractor_video.events[0].event_id,
+                    source_start_sec=0,
+                    source_end_sec=300,
+                    global_start_sec=300,
+                    global_end_sec=600,
+                ),
+            ),
+            "duration_sec": 600,
+        }
+    )
+    manifest = manifest.model_copy(
+        update={
+            "source_manifest_hashes": {
+                source_provenance.identity: source_provenance.canonical_sha256
+            },
+            "source_manifests": (source_provenance,),
+            "group_assignment": {
+                target_video.video_id: "train",
+                distractor_video.video_id: "train",
+            },
+            "examples": (example,),
+            "asset_sha256s": {
+                target_video.video_id: target_video.content_sha256,
+                distractor_video.video_id: distractor_video.content_sha256,
+            },
+        }
+    )
     state = _state(example)
     action = ActionInstance(ActionType.EXPAND_RESIDUAL, example.target_event_id, None)
     artifact = seal_sufficiency_label(
@@ -66,7 +140,11 @@ def test_every_segment_requires_one_real_owner_asset_event_and_range() -> None:
         materialize_oracle_record(**(kwargs | {"source_manifests": ()}))
 
     duplicate = source.model_copy(
-        update={"name": "unit-duplicate", "source_uri": "file:///duplicate.json"}
+        update={
+            "name": "unit-duplicate",
+            "source_uri": "file:///duplicate.json",
+            "videos": (source.videos[1],),
+        }
     )
     duplicate_provenance = _source_provenance(_canonical_source_manifest(duplicate))
     duplicate_manifest = manifest.model_copy(
@@ -87,18 +165,24 @@ def test_every_segment_requires_one_real_owner_asset_event_and_range() -> None:
             )
         )
 
-    missing_asset = manifest.model_copy(update={"asset_sha256s": {}})
+    missing_asset = manifest.model_copy(
+        update={
+            "asset_sha256s": {
+                example.segments[0].source_video_id: manifest.asset_sha256s[
+                    example.segments[0].source_video_id
+                ]
+            }
+        }
+    )
     with pytest.raises(ValueError, match="asset hash"):
         materialize_oracle_record(**(kwargs | {"manifest": missing_asset}))
 
-    segment = example.segments[0]
+    segment = example.segments[1]
     fake_segment = segment.model_copy(update={"event_id": "forged-event"})
+    fake_segments = list(example.segments)
+    fake_segments[1] = fake_segment
     fake_example = example.model_copy(
-        update={
-            "segments": (fake_segment,),
-            "target_event_id": f"{segment.source_video_id}:forged-event",
-            "supporting_event_ids": (f"{segment.source_video_id}:forged-event",),
-        }
+        update={"segments": tuple(fake_segments)}
     )
     fake_manifest = manifest.model_copy(update={"examples": (fake_example,)})
     with pytest.raises(ValueError, match="event is absent"):
@@ -106,9 +190,11 @@ def test_every_segment_requires_one_real_owner_asset_event_and_range() -> None:
             **(kwargs | {"manifest": fake_manifest, "example": fake_example})
         )
 
-    wrong_range_segment = segment.model_copy(update={"source_end_sec": 599})
+    wrong_range_segment = segment.model_copy(update={"source_end_sec": 299})
+    wrong_range_segments = list(example.segments)
+    wrong_range_segments[1] = wrong_range_segment
     wrong_range_example = example.model_copy(
-        update={"segments": (wrong_range_segment,)}
+        update={"segments": tuple(wrong_range_segments)}
     )
     wrong_range_manifest = manifest.model_copy(
         update={"examples": (wrong_range_example,)}
@@ -120,6 +206,44 @@ def test_every_segment_requires_one_real_owner_asset_event_and_range() -> None:
                 | {
                     "manifest": wrong_range_manifest,
                     "example": wrong_range_example,
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize("segment_index", (0, 1), ids=("target", "distractor"))
+@pytest.mark.parametrize(
+    ("field", "delta"),
+    (
+        ("source_start_sec", 5e-13),
+        ("source_end_sec", 5e-13),
+        ("global_end_sec", 5e-13),
+    ),
+    ids=("start", "end", "duration"),
+)
+def test_segment_ranges_reject_subpicosecond_tampering(
+    segment_index: int,
+    field: str,
+    delta: float,
+) -> None:
+    kwargs = _materializer_kwargs()
+    manifest = kwargs["manifest"]
+    example = kwargs["example"]
+    segments = list(example.segments)
+    segment = segments[segment_index]
+    segments[segment_index] = segment.model_copy(
+        update={field: getattr(segment, field) + delta}
+    )
+    forged_example = example.model_copy(update={"segments": tuple(segments)})
+    forged_manifest = manifest.model_copy(update={"examples": (forged_example,)})
+
+    with pytest.raises(ValueError, match="range"):
+        materialize_oracle_record(
+            **(
+                kwargs
+                | {
+                    "manifest": forged_manifest,
+                    "example": forged_example,
                 }
             )
         )
@@ -155,7 +279,52 @@ def test_loader_requires_content_addressed_source_authority(
         + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="source manifest is absent"):
+    with pytest.raises(ValueError, match="source manifest.*missing"):
+        load_oracle_records(path)
+
+
+def test_loader_rejects_valid_but_unused_source_authority_payload(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "records.jsonl"
+    write_oracle_records(path, (_record(),))
+    authority_path = Path(f"{path}.authority.json")
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    source_payload = json.loads(next(iter(authority["source_manifests"].values())))
+    source_payload["name"] = "unused-unit"
+    source_payload["source_uri"] = "file:///unused-source.json"
+    canonical_source = json.dumps(
+        source_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    source_digest = hashlib.sha256(canonical_source.encode("utf-8")).hexdigest()
+    authority["source_manifests"][source_digest] = canonical_source
+    authority["authority_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in authority.items()
+                if key != "authority_sha256"
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    authority_path.write_text(
+        json.dumps(
+            authority,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source manifest.*unexpected"):
         load_oracle_records(path)
 
 

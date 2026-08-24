@@ -642,24 +642,16 @@ def _validate_task8_lineage(
         if len(events) != 1:
             raise ValueError("LongRoute segment event is absent from its source owner")
         event = events[0]
+        expected_global_end = previous_global_end + (
+            event.end_sec - event.start_sec
+        )
         if (
-            not math.isclose(
-                segment.source_start_sec, event.start_sec, rel_tol=0, abs_tol=1e-12
-            )
-            or not math.isclose(
-                segment.source_end_sec, event.end_sec, rel_tol=0, abs_tol=1e-12
-            )
+            segment.source_start_sec != event.start_sec
+            or segment.source_end_sec != event.end_sec
             or segment.source_end_sec <= segment.source_start_sec
             or segment.global_end_sec <= segment.global_start_sec
-            or not math.isclose(
-                segment.global_start_sec, previous_global_end, rel_tol=0, abs_tol=1e-12
-            )
-            or not math.isclose(
-                segment.global_end_sec - segment.global_start_sec,
-                event.end_sec - event.start_sec,
-                rel_tol=0,
-                abs_tol=1e-12,
-            )
+            or segment.global_start_sec != previous_global_end
+            or segment.global_end_sec != expected_global_end
         ):
             raise ValueError("LongRoute segment range does not match its source event")
         previous_global_end = segment.global_end_sec
@@ -683,9 +675,7 @@ def _validate_task8_lineage(
         example.supporting_event_ids
     ).issubset(canonical_events):
         raise ValueError("LongRoute event identities do not match virtual segments")
-    if not math.isclose(
-        example.duration_sec, previous_global_end, rel_tol=0, abs_tol=1e-12
-    ):
+    if example.duration_sec != previous_global_end:
         raise ValueError("LongRoute duration does not match virtual segments")
 
     target_digest, target_video = target_owner
@@ -1094,6 +1084,19 @@ def _authority_path(path: Path) -> Path:
     return Path(f"{path}.authority.json")
 
 
+def _validate_source_authority_keys(
+    required: set[str], authority: OracleDatasetAuthority
+) -> None:
+    actual = set(authority.source_manifests)
+    missing = sorted(required - actual)
+    unexpected = sorted(actual - required)
+    if missing or unexpected:
+        raise ValueError(
+            "dataset authority source manifest set does not match row data: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
 def _stored_record_payload(record: OracleBCRecord) -> dict[str, object]:
     payload = record.model_dump(mode="json")
     provenance = payload.get("provenance")
@@ -1304,6 +1307,14 @@ def load_oracle_records(path: str | Path) -> tuple[OracleBCRecord, ...]:
         raise ValueError(
             "Oracle dataset authority hash or content is invalid"
         ) from error
+    declared_source_hashes = {
+        source_manifest.canonical_sha256
+        for manifest_json in authority.dataset_manifests.values()
+        for source_manifest in DatasetManifest.model_validate_json(
+            manifest_json
+        ).source_manifests
+    }
+    _validate_source_authority_keys(declared_source_hashes, authority)
     structured_rows: tuple[tuple[object, ...], ...] = ()
     if suffix == ".jsonl":
         raw_rows = tuple(
@@ -1345,10 +1356,16 @@ def load_oracle_records(path: str | Path) -> tuple[OracleBCRecord, ...]:
     used_normalizations = {
         record.provenance.normalization_manifest_hash for record in records
     }
+    used_source_hashes = {
+        hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        for record in records
+        for payload in record.provenance.source_manifests_canonical_json
+    }
     if used_manifests != set(authority.dataset_manifests):
         raise ValueError("dataset authority manifest set does not match row data")
     if used_normalizations != set(authority.normalizations):
         raise ValueError("dataset authority normalization set does not match row data")
+    _validate_source_authority_keys(used_source_hashes, authority)
     if suffix == ".parquet":
         for structured, record in zip(structured_rows, records, strict=True):
             expected = (

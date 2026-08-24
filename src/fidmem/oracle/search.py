@@ -116,6 +116,37 @@ class CachedObservationGraph:
     def __len__(self) -> int:
         return len(self._observations)
 
+    def canonical_items(self) -> tuple[tuple[ObservationKey, ActionObservation], ...]:
+        """Return immutable, canonically ordered cache contents for attestation."""
+
+        return tuple(
+            (key, self._observations[key])
+            for key in sorted(
+                self._observations,
+                key=lambda item: (item.state_sha256, item.action_signature),
+            )
+        )
+
+    @property
+    def content_sha256(self) -> str:
+        """Hash actual keys and observations; callers cannot self-report identity."""
+
+        payload = tuple(
+            {
+                "key": key.model_dump(mode="json"),
+                "observation": observation.model_dump(mode="json"),
+            }
+            for key, observation in self.canonical_items()
+        )
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
 
 class PendingObservation(BaseModel):
     """One missing cache atom that an external generation job may materialize."""

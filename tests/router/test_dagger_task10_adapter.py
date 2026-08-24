@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
-from fidmem.router.dagger import Deviation, Task10PolicyTrainer, load_dagger_file
+import pytest
+
+from fidmem.oracle.search import action_signature
+from fidmem.router.dagger import (
+    Deviation,
+    DeviationAuthority,
+    MaterializedDeviationRecord,
+    Task10PolicyTrainer,
+    load_dagger_file,
+)
 from fidmem.router.dataset import OracleBCDataset, TestByteTokenizer
 from fidmem.router.model import EncoderIdentity, MemoryRouter, RouterModelConfig
 from fidmem.router.train_bc import TrainResult
@@ -99,23 +109,57 @@ def test_task10_policy_trainer_aggregates_and_calls_public_train_bc(
             TestByteTokenizer("dagger-adapter"),
         ),
         training=training,
-        record_materializer=lambda deviation: record.model_copy(
-            update={"record_id": f"deviation:{deviation.state_key}"}
+        record_materializer=lambda deviation: MaterializedDeviationRecord(
+            deviation_state_key=deviation.state_key,
+            deviation_state_sha256=deviation.state_sha256,
+            acquired_observation_keys=deviation.acquired_observation_keys,
+            action_signatures=deviation.action_signatures,
+            record=record.model_copy(
+                update={"record_id": f"deviation:{deviation.state_key}"}
+            ),
         ),
         train_function=fake_train_bc,
     )
     source = tmp_path / "source.pt"
     source.write_bytes(b"source")
     output = tmp_path / "round-1.pt"
+    provenance = record.provenance
+    state_sha = hashlib.sha256(
+        json.dumps(
+            record.state.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     fake_deviation = Deviation(
         state_key=hashlib.sha256(b"d").hexdigest(),
+        state_sha256=state_sha,
         question_id="question",
         state=record.state,
         action_instances=record.action_instances,
+        action_signatures=tuple(
+            action_signature(item) for item in record.action_instances
+        ),
         legal_action_mask=record.legal_action_mask,
         policy_action=_action(ActionType.STOP),
         oracle_action=_action(ActionType.SEARCH_GIST),
         acquired_observation_keys=(),
+        authority=DeviationAuthority(
+            context_identity="a" * 64,
+            video_group_id=record.video_id,
+            observation_snapshot_id=record.observation_snapshot_id,
+            base_dataset_identity=dataset.identity,
+            base_record_id=record.record_id,
+            dataset_manifest_hash=provenance.dataset_manifest_hash,
+            source_manifest_hash=provenance.source_manifest_hash,
+            asset_sha256=provenance.asset_sha256,
+            group_assignment_sha256=provenance.group_assignment_sha256,
+            longroute_example_sha256=provenance.longroute_example_sha256,
+            normalization_manifest_hash=provenance.normalization_manifest_hash,
+            preference_set_hash=provenance.preference_set_hash,
+        ),
     )
 
     result = trainer.train(
@@ -126,6 +170,24 @@ def test_task10_policy_trainer_aggregates_and_calls_public_train_bc(
         source_policy_checkpoint=source,
         output_checkpoint=output,
     )
+
+    opposite = record.model_copy(update={"target_action_index": 1})
+    wrong = Task10PolicyTrainer(
+        model_factory=lambda: (_model(), TestByteTokenizer("dagger-adapter")),
+        training=training,
+        record_materializer=lambda deviation: MaterializedDeviationRecord(
+            deviation_state_key=deviation.state_key,
+            deviation_state_sha256=deviation.state_sha256,
+            acquired_observation_keys=deviation.acquired_observation_keys,
+            action_signatures=deviation.action_signatures,
+            record=opposite.model_copy(
+                update={"record_id": f"opposite:{deviation.state_key}"}
+            ),
+        ),
+        train_function=fake_train_bc,
+    )
+    with pytest.raises(ValueError, match="Oracle action"):
+        wrong.dataset_identity(base_dataset=dataset, deviations=(fake_deviation,))
 
     assert seen_dataset_sizes == [2]
     assert result.checkpoint_path == output

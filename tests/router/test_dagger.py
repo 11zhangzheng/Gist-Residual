@@ -16,7 +16,6 @@ from fidmem.oracle.search import (
 )
 from fidmem.router.dagger import (
     BCPolicy,
-    CacheArtifactIdentity,
     CachedAnswerEvaluator,
     CachedUtilityGraph,
     DaggerRoundResult,
@@ -26,6 +25,7 @@ from fidmem.router.dagger import (
     evaluation_key,
     run_dagger_round,
 )
+from fidmem.router.dataset import FrozenComponentIdentity
 from fidmem.router.model import EncoderIdentity, MemoryRouter, RouterModelConfig
 from fidmem.types import (
     ActionInstance,
@@ -57,9 +57,12 @@ def _state() -> RouterState:
     )
 
 
-def _identity(label: str) -> CacheArtifactIdentity:
-    return CacheArtifactIdentity(
-        artifact_sha256=hashlib.sha256(label.encode()).hexdigest()
+def _identity(label: str) -> FrozenComponentIdentity:
+    return FrozenComponentIdentity(
+        implementation="unit-cached-evaluator",
+        model_id=label,
+        revision="frozen-v1",
+        artifact_sha256=hashlib.sha256(label.encode("utf-8")).hexdigest(),
     )
 
 
@@ -106,13 +109,11 @@ def _utility_graph(
     )
     searched = environment.replay(initial, search, observation).next_state
     return CachedUtilityGraph(
-        identity=_identity("utility"),
-        observation_identity=_identity("observations"),
         observations=CachedObservationGraph(
             {observation_key(initial, search): observation}
         ),
         evaluator=CachedAnswerEvaluator(
-            identity=_identity("evaluations"),
+            evaluator_identity=_identity("evaluations"),
             evaluations={
                 evaluation_key(initial): AnswerEvaluation(
                     answer="red", answer_score=0.2, correct=False
@@ -161,7 +162,9 @@ def test_seen_keys_persist_across_collection_calls() -> None:
         utility_graph=graph,
         normalization=_NORMALIZATION,
         question_ids=("q",),
+        initial_replay_transitions=((),),
         seen_keys=seen,
+        budget_bin_width=1.0,
     )
     second = collect_deviations(
         (initial,),
@@ -170,7 +173,9 @@ def test_seen_keys_persist_across_collection_calls() -> None:
         utility_graph=graph,
         normalization=_NORMALIZATION,
         question_ids=("q",),
+        initial_replay_transitions=((),),
         seen_keys=seen,
+        budget_bin_width=1.0,
     )
 
     assert len(first) == 1
@@ -208,6 +213,8 @@ def test_run_dagger_round_round_one_labels_and_continues() -> None:
         utility_graph=graph,
         normalization=_NORMALIZATION,
         question_ids=("q",),
+        initial_replay_transitions=((),),
+        budget_bin_width=1.0,
     )
 
     assert len(result.deviations) == 1

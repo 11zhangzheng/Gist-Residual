@@ -44,6 +44,10 @@ training:
     frozen: true
 dagger:
   artifact_root: artifacts/dagger
+  bootstrap_checkpoint: bootstrap.pt
+  generations_dir: generations
+  current_pointer: current.json
+  min_rounds: 2
   max_rounds: 3
   beam_size: 8
   max_depth: 5
@@ -52,7 +56,3 @@ dagger:
   train_question_subset_fraction: 1.0
   train_question_subset_seed: 2026
   budget_bin_width: 1.0
-  seen_keys_path: seen-keys.json
-  deviation_artifact_path: deviations.json
-  manifest_dir: manifests
-  checkpoint_dir: checkpoints

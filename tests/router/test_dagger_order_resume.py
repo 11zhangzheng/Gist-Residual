@@ -7,9 +7,9 @@ from tests.router.test_dagger_workflow import SpyTrainer, _always_stop, _context
 
 def test_resume_identity_is_independent_of_context_input_order(tmp_path: Path) -> None:
     contexts = _contexts(2)
-    source = tmp_path / "source.pt"
-    source.write_bytes(b"source")
     config = DAggerConfig(artifact_root=tmp_path)
+    source = config.bootstrap_path
+    _always_stop.freeze(source)
     first = run_dagger(
         train_contexts=contexts,
         dev_contexts=contexts,

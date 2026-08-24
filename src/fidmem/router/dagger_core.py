@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 
@@ -27,6 +29,7 @@ from fidmem.oracle.search import (
     observation_key,
 )
 from fidmem.router.dataset import (
+    FrozenComponentIdentity,
     RouterBatch,
     TestByteTokenizer,
     TextTokenizer,
@@ -57,13 +60,14 @@ class InvalidPolicyActionError(ValueError):
     """A policy returned an action outside the environment's legal tuple."""
 
 
-class CacheArtifactIdentity(BaseModel):
-    """Immutable content identity for one offline cache artifact."""
+class CacheContentIdentity(BaseModel):
+    """Internally derived immutable identity for actual cache contents."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: int = Field(default=1, ge=1, strict=True)
-    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    kind: str = Field(min_length=1)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def _canonical_json(value: object) -> str:
@@ -87,18 +91,18 @@ def evaluation_key(state: RouterState) -> str:
 class CachedAnswerEvaluator:
     """Read-only frozen evaluations with no Answerer/provider fallback."""
 
-    __slots__ = ("_evaluations", "_identity", "_sealed")
+    __slots__ = ("_evaluations", "_evaluator_identity", "_identity", "_sealed")
 
     def __init__(
         self,
         *,
-        identity: CacheArtifactIdentity,
+        evaluator_identity: FrozenComponentIdentity,
         evaluations: Mapping[str, AnswerEvaluation],
     ) -> None:
-        object.__setattr__(
-            self,
-            "_identity",
-            CacheArtifactIdentity.model_validate(identity.model_dump(mode="python")),
+        if not isinstance(evaluator_identity, FrozenComponentIdentity):
+            raise TypeError("evaluator_identity must be a FrozenComponentIdentity")
+        frozen_identity = FrozenComponentIdentity.model_validate(
+            evaluator_identity.model_dump(mode="python")
         )
         normalized: dict[str, AnswerEvaluation] = {}
         for key, evaluation in evaluations.items():
@@ -111,6 +115,20 @@ class CachedAnswerEvaluator:
             normalized[key] = AnswerEvaluation.model_validate(
                 evaluation.model_dump(mode="python")
             )
+        payload = {
+            "evaluator_identity": frozen_identity.model_dump(mode="json"),
+            "evaluations": tuple(
+                (key, normalized[key].model_dump(mode="json"))
+                for key in sorted(normalized)
+            ),
+        }
+        digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+        object.__setattr__(self, "_evaluator_identity", frozen_identity)
+        object.__setattr__(
+            self,
+            "_identity",
+            CacheContentIdentity(kind="answer-evaluations", content_sha256=digest),
+        )
         object.__setattr__(self, "_evaluations", MappingProxyType(normalized))
         object.__setattr__(self, "_sealed", True)
 
@@ -120,8 +138,15 @@ class CachedAnswerEvaluator:
         object.__setattr__(self, name, value)
 
     @property
-    def identity(self) -> CacheArtifactIdentity:
+    def identity(self) -> CacheContentIdentity:
         return self._identity
+
+    @property
+    def evaluator_identity(self) -> FrozenComponentIdentity:
+        return self._evaluator_identity
+
+    def canonical_items(self) -> tuple[tuple[str, AnswerEvaluation], ...]:
+        return tuple((key, self._evaluations[key]) for key in sorted(self._evaluations))
 
     def get(self, state: RouterState) -> AnswerEvaluation | None:
         return self._evaluations.get(evaluation_key(state))
@@ -131,21 +156,13 @@ class CachedAnswerEvaluator:
 
 
 class CachedUtilityGraph:
-    """Identity-bound observation and evaluation caches used by DAgger."""
+    """Content-addressed observation and evaluation caches used by DAgger."""
 
-    __slots__ = (
-        "_evaluator",
-        "_identity",
-        "_observation_identity",
-        "_observations",
-        "_sealed",
-    )
+    __slots__ = ("_evaluator", "_identity", "_observations", "_sealed")
 
     def __init__(
         self,
         *,
-        identity: CacheArtifactIdentity,
-        observation_identity: CacheArtifactIdentity,
         observations: CachedObservationGraph,
         evaluator: CachedAnswerEvaluator,
     ) -> None:
@@ -153,17 +170,16 @@ class CachedUtilityGraph:
             raise TypeError("observations must be a CachedObservationGraph")
         if not isinstance(evaluator, CachedAnswerEvaluator):
             raise TypeError("evaluator must be a CachedAnswerEvaluator")
+        payload = {
+            "observations_sha256": observations.content_sha256,
+            "evaluations_sha256": evaluator.identity.content_sha256,
+            "evaluator_identity": evaluator.evaluator_identity.model_dump(mode="json"),
+        }
+        digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
         object.__setattr__(
             self,
             "_identity",
-            CacheArtifactIdentity.model_validate(identity.model_dump(mode="python")),
-        )
-        object.__setattr__(
-            self,
-            "_observation_identity",
-            CacheArtifactIdentity.model_validate(
-                observation_identity.model_dump(mode="python")
-            ),
+            CacheContentIdentity(kind="utility-graph", content_sha256=digest),
         )
         object.__setattr__(self, "_observations", observations)
         object.__setattr__(self, "_evaluator", evaluator)
@@ -175,16 +191,26 @@ class CachedUtilityGraph:
         object.__setattr__(self, name, value)
 
     @property
-    def identity(self) -> CacheArtifactIdentity:
+    def identity(self) -> CacheContentIdentity:
         return self._identity
 
     @property
-    def observation_identity(self) -> CacheArtifactIdentity:
-        return self._observation_identity
+    def observation_identity(self) -> CacheContentIdentity:
+        return CacheContentIdentity(
+            kind="observations", content_sha256=self._observations.content_sha256
+        )
 
     @property
-    def evaluator_identity(self) -> CacheArtifactIdentity:
-        return self._evaluator.identity
+    def evaluator_identity(self) -> FrozenComponentIdentity:
+        return self._evaluator.evaluator_identity
+
+    @property
+    def observation_content_sha256(self) -> str:
+        return self._observations.content_sha256
+
+    @property
+    def evaluation_content_sha256(self) -> str:
+        return self._evaluator.identity.content_sha256
 
     def get(
         self, state: RouterState, action: ActionInstance
@@ -353,6 +379,84 @@ def encode_router_state(
     )
 
 
+class PolicyIdentity(BaseModel):
+    """Identity derived from an executable policy and its frozen checkpoint."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    implementation: str = Field(min_length=1)
+    behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _state_dict_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
+    hasher = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name]
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError("policy checkpoint model state must contain tensors")
+        value = tensor.detach().cpu().contiguous()
+        hasher.update(name.encode("utf-8"))
+        hasher.update(str(value.dtype).encode("ascii"))
+        hasher.update(_canonical_json(tuple(value.shape)).encode("ascii"))
+        hasher.update(value.view(torch.uint8).numpy().tobytes())
+    return hasher.hexdigest()
+
+
+def _checkpoint_sha256(path: str | os.PathLike[str]) -> str:
+    checkpoint = Path(path)
+    if not checkpoint.is_file() or checkpoint.is_symlink():
+        raise ValueError("policy checkpoint must be a regular file")
+    return hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+
+
+class FrozenActionPolicy:
+    """Deterministic content-attested policy used by offline workflow tests."""
+
+    def __init__(self, action_type: ActionType) -> None:
+        self.action_type = ActionType(action_type)
+
+    def __call__(
+        self, state: RouterState, legal_actions: tuple[ActionInstance, ...]
+    ) -> ActionInstance:
+        del state
+        for action in legal_actions:
+            if action.action_type is self.action_type:
+                return action
+        raise InvalidPolicyActionError("frozen action is not legal")
+
+    def freeze(self, path: str | os.PathLike[str]) -> PolicyIdentity:
+        checkpoint = Path(path)
+        payload = {
+            "schema_version": 1,
+            "policy_kind": "frozen-action",
+            "action_type": self.action_type.value,
+        }
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(_canonical_json(payload) + "\n", encoding="utf-8")
+        return self.identity_for_checkpoint(checkpoint)
+
+    def identity_for_checkpoint(self, path: str | os.PathLike[str]) -> PolicyIdentity:
+        checkpoint = Path(path)
+        try:
+            payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("frozen policy checkpoint is unreadable") from exc
+        expected = {
+            "schema_version": 1,
+            "policy_kind": "frozen-action",
+            "action_type": self.action_type.value,
+        }
+        if payload != expected:
+            raise ValueError("frozen policy checkpoint does not match behavior")
+        behavior = hashlib.sha256(_canonical_json(expected).encode("utf-8")).hexdigest()
+        return PolicyIdentity(
+            implementation="fidmem.router.FrozenActionPolicy/v1",
+            behavior_sha256=behavior,
+            checkpoint_sha256=_checkpoint_sha256(checkpoint),
+        )
+
+
 class BCPolicy:
     """Greedy Task 10 policy with exact tokenizer identity and device safety."""
 
@@ -386,6 +490,31 @@ class BCPolicy:
         self.max_item_tokens = max_item_tokens or model.config.max_item_tokens
         self.model.eval()
 
+    def identity_for_checkpoint(self, path: str | os.PathLike[str]) -> PolicyIdentity:
+        checkpoint = Path(path)
+        try:
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise ValueError("Task 10 policy checkpoint is unreadable") from exc
+        raw_model = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(raw_model, Mapping):
+            raise ValueError("Task 10 policy checkpoint lacks model state")
+        expected = _state_dict_sha256(raw_model)
+        current = _state_dict_sha256(self.model.state_dict())
+        if current != expected:
+            raise ValueError("BCPolicy model state does not match checkpoint")
+        encoder = hashlib.sha256(
+            _canonical_json(self.model.config.encoder.model_dump(mode="json")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        behavior = hashlib.sha256(f"{current}:{encoder}".encode("ascii")).hexdigest()
+        return PolicyIdentity(
+            implementation="fidmem.router.BCPolicy/v1",
+            behavior_sha256=behavior,
+            checkpoint_sha256=_checkpoint_sha256(checkpoint),
+        )
+
     def __call__(
         self, state: RouterState, legal_actions: tuple[ActionInstance, ...]
     ) -> ActionInstance:
@@ -410,6 +539,16 @@ class BCPolicy:
         if index < 0 or index >= len(legal_actions):
             raise InvalidPolicyActionError("model selected outside the legal mask")
         return legal_actions[index]
+
+
+def policy_identity(
+    policy: RouterPolicy, checkpoint: str | os.PathLike[str]
+) -> PolicyIdentity:
+    """Attest only built-in policies whose behavior can be recomputed."""
+
+    if type(policy) not in {BCPolicy, FrozenActionPolicy}:
+        raise TypeError("policy must expose an actual built-in content identity")
+    return policy.identity_for_checkpoint(checkpoint)  # type: ignore[union-attr]
 
 
 def _rollout(
@@ -578,17 +717,21 @@ def _acquired_observation_keys(
 def _state_key(
     state: RouterState,
     *,
-    question_id: str = "legacy",
-    replayed_transitions: Sequence[EnvironmentTransition] = (),
-    budget_bin_width: float = 1.0,
+    question_id: str,
+    initial_replay_transitions: Sequence[EnvironmentTransition],
+    replayed_transitions: Sequence[EnvironmentTransition],
+    budget_bin_width: float,
 ) -> str:
-    """Hash only actual replay acquisitions plus routing-relevant state."""
+    """Hash authoritative acquisitions plus only routing-relevant state."""
 
     if not question_id:
         raise ValueError("question_id must be non-empty")
+    acquired = _acquired_observation_keys(
+        tuple(initial_replay_transitions) + tuple(replayed_transitions)
+    )
     payload = {
         "question_id": question_id,
-        "acquired_observation_keys": _acquired_observation_keys(replayed_transitions),
+        "acquired_observation_keys": acquired,
         "budget_bin": budget_bin(state.remaining_budget, width=budget_bin_width),
         "cost_preference": state.cost_preference,
         "frontier": tuple(
@@ -599,17 +742,65 @@ def _state_key(
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+class DeviationAuthority(BaseModel):
+    """Exact Task 8/9/10 context lineage copied into each deviation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    context_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    video_group_id: str = Field(min_length=1)
+    observation_snapshot_id: str = Field(min_length=1)
+    base_dataset_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_record_id: str = Field(min_length=1)
+    dataset_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    group_assignment_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    longroute_example_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    normalization_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preference_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class Deviation(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     state_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     question_id: str = Field(min_length=1)
     state: RouterState
     action_instances: tuple[ActionInstance, ...] = Field(min_length=1)
+    action_signatures: tuple[str, ...] = Field(min_length=1)
     legal_action_mask: tuple[bool, ...] = Field(min_length=1)
     policy_action: ActionInstance
     oracle_action: ActionInstance
     acquired_observation_keys: tuple[str, ...]
+    authority: DeviationAuthority | None = None
+
+    def model_post_init(self, __context: object) -> None:
+        del __context
+        expected_state = hashlib.sha256(
+            _canonical_json(self.state.model_dump(mode="json")).encode("utf-8")
+        ).hexdigest()
+        if expected_state != self.state_sha256:
+            raise ValueError("deviation state canonical hash mismatch")
+        expected_signatures = tuple(
+            action_signature(item) for item in self.action_instances
+        )
+        if self.action_signatures != expected_signatures:
+            raise ValueError("deviation action signatures mismatch")
+        if len(self.legal_action_mask) != len(self.action_instances) or not any(
+            self.legal_action_mask
+        ):
+            raise ValueError("deviation legal mask is invalid")
+        legal = tuple(
+            action
+            for action, enabled in zip(
+                self.action_instances, self.legal_action_mask, strict=True
+            )
+            if enabled
+        )
+        if self.oracle_action not in legal:
+            raise ValueError("deviation Oracle action must be legal")
 
 
 def collect_deviations(
@@ -619,22 +810,29 @@ def collect_deviations(
     environment: MemoryEnvironment,
     utility_graph: CachedUtilityGraph,
     normalization: CostNormalization,
-    question_ids: Sequence[str] | None = None,
+    question_ids: Sequence[str],
+    initial_replay_transitions: Sequence[Sequence[EnvironmentTransition]],
+    authorities: Sequence[DeviationAuthority | None] | None = None,
     seen_keys: set[str] | None = None,
-    budget_bin_width: float = 1.0,
+    budget_bin_width: float,
     beam_size: int = _BEAM_SIZE,
     max_depth: int = _MAX_DEPTH,
 ) -> tuple[Deviation, ...]:
-    """Collect once-labelled departures and update the caller-owned seen set."""
+    """Collect departures, committing seen keys only after all labels validate."""
 
-    ids = tuple(
-        question_ids or (f"question-{index}" for index in range(len(train_states)))
-    )
-    if len(ids) != len(train_states):
-        raise ValueError("question_ids must match train_states")
-    seen = seen_keys if seen_keys is not None else set()
+    ids = tuple(question_ids)
+    initial_prefixes = tuple(tuple(item) for item in initial_replay_transitions)
+    if len(ids) != len(train_states) or len(initial_prefixes) != len(train_states):
+        raise ValueError("question ids and initial replay must match train states")
+    lineage = tuple(authorities or (None for _ in train_states))
+    if len(lineage) != len(train_states):
+        raise ValueError("deviation authorities must match train states")
+    original_seen = seen_keys if seen_keys is not None else set()
+    local_seen = set(original_seen)
     deviations: list[Deviation] = []
-    for question_id, initial in zip(ids, train_states, strict=True):
+    for question_id, initial, initial_prefix, authority in zip(
+        ids, train_states, initial_prefixes, lineage, strict=True
+    ):
         transitions = _rollout(
             initial,
             policy=policy,
@@ -648,13 +846,13 @@ def collect_deviations(
             key = _state_key(
                 state,
                 question_id=question_id,
+                initial_replay_transitions=initial_prefix,
                 replayed_transitions=prefix,
                 budget_bin_width=budget_bin_width,
             )
-            if key in seen:
+            if key in local_seen:
                 prefix.append(transition)
                 continue
-            seen.add(key)
             oracle_action = label_best_next_action(
                 state,
                 environment=environment,
@@ -665,19 +863,29 @@ def collect_deviations(
             )
             legal = environment.valid_actions(state)
             if transition.action != oracle_action:
-                deviations.append(
-                    Deviation(
-                        state_key=key,
-                        question_id=question_id,
-                        state=state,
-                        action_instances=legal,
-                        legal_action_mask=(True,) * len(legal),
-                        policy_action=transition.action,
-                        oracle_action=oracle_action,
-                        acquired_observation_keys=_acquired_observation_keys(prefix),
-                    )
+                state_sha = hashlib.sha256(
+                    _canonical_json(state.model_dump(mode="json")).encode("utf-8")
+                ).hexdigest()
+                deviation = Deviation(
+                    state_key=key,
+                    state_sha256=state_sha,
+                    question_id=question_id,
+                    state=state,
+                    action_instances=legal,
+                    action_signatures=tuple(action_signature(item) for item in legal),
+                    legal_action_mask=(True,) * len(legal),
+                    policy_action=transition.action,
+                    oracle_action=oracle_action,
+                    acquired_observation_keys=_acquired_observation_keys(
+                        initial_prefix + tuple(prefix)
+                    ),
+                    authority=authority,
                 )
+                deviations.append(deviation)
+            local_seen.add(key)
             prefix.append(transition)
+    if seen_keys is not None:
+        seen_keys.update(local_seen - original_seen)
     return tuple(deviations)
 
 
@@ -782,7 +990,8 @@ def run_dagger_round(
     environment: MemoryEnvironment,
     utility_graph: CachedUtilityGraph,
     normalization: CostNormalization,
-    question_ids: Sequence[str] | None = None,
+    question_ids: Sequence[str],
+    initial_replay_transitions: Sequence[Sequence[EnvironmentTransition]],
     seen_keys: set[str] | None = None,
     previous: DaggerRoundResult | None = None,
     budget_bin_width: float = 1.0,
@@ -801,6 +1010,7 @@ def run_dagger_round(
         utility_graph=utility_graph,
         normalization=normalization,
         question_ids=question_ids,
+        initial_replay_transitions=initial_replay_transitions,
         seen_keys=seen,
         budget_bin_width=budget_bin_width,
         beam_size=beam_size,
@@ -834,15 +1044,18 @@ def run_dagger_round(
 
 __all__ = [
     "BCPolicy",
-    "CacheArtifactIdentity",
+    "FrozenActionPolicy",
+    "CacheContentIdentity",
     "CachedAnswerEvaluator",
     "CachedUtilityGraph",
     "DaggerRoundResult",
     "Deviation",
+    "DeviationAuthority",
     "ForbiddenObservationGenerator",
     "InvalidPolicyActionError",
     "MissingCachedEvaluationError",
     "MissingCachedObservationError",
+    "PolicyIdentity",
     "_oracle_cost",
     "_rollout",
     "_should_continue",
@@ -852,5 +1065,6 @@ __all__ = [
     "encode_router_state",
     "evaluation_key",
     "label_best_next_action",
+    "policy_identity",
     "run_dagger_round",
 ]

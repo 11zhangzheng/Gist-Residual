@@ -59,6 +59,17 @@ class MemoryEnvironment:
         if len({e.event_id for e in records}) != len(records): raise ValueError("event ids must be unique")
         self._by_id = {e.event_id:e for e in records}; self._ids = tuple(e.event_id for e in records)
         self._executor = executor; self.costs = costs if isinstance(costs, ActionCostTable) else ActionCostTable.model_validate(costs or {})
+    @property
+    def canonical_events(self) -> tuple[EventRecord, ...]:
+        """Return the immutable canonical event table used by action semantics."""
+        return tuple(self._by_id[event_id] for event_id in self._ids)
+    @property
+    def executor(self) -> ActionExecutor:
+        """Expose the injected executor for identity attestation, never execution."""
+        return self._executor
+    @property
+    def action_semantics_version(self) -> str:
+        return "fidmem.memory-environment/v1"
     @staticmethod
     def _a(kind: ActionType, event: str|None=None, budget: str|None=None) -> ActionInstance: return ActionInstance(kind,event,budget)  # type: ignore[arg-type]
     @staticmethod

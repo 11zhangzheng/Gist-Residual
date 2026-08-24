@@ -18,7 +18,6 @@ from fidmem.oracle.search import (
 )
 from fidmem.router.dagger import (
     BCPolicy,
-    CacheArtifactIdentity,
     CachedAnswerEvaluator,
     CachedUtilityGraph,
     ForbiddenObservationGenerator,
@@ -30,7 +29,7 @@ from fidmem.router.dagger import (
     evaluation_key,
     label_best_next_action,
 )
-from fidmem.router.dataset import TestByteTokenizer
+from fidmem.router.dataset import FrozenComponentIdentity, TestByteTokenizer
 from fidmem.router.model import EncoderIdentity, MemoryRouter, RouterModelConfig
 from fidmem.types import (
     ActionInstance,
@@ -60,9 +59,12 @@ def _state(*, preference: float = 0.0, budget: float = 3.0) -> RouterState:
     )
 
 
-def _identity(label: str) -> CacheArtifactIdentity:
-    return CacheArtifactIdentity(
-        artifact_sha256=hashlib.sha256(label.encode("utf-8")).hexdigest()
+def _identity(label: str) -> FrozenComponentIdentity:
+    return FrozenComponentIdentity(
+        implementation="unit-cached-evaluator",
+        model_id=label,
+        revision="frozen-v1",
+        artifact_sha256=hashlib.sha256(label.encode("utf-8")).hexdigest(),
     )
 
 
@@ -133,12 +135,10 @@ def _cached_graph(
             answer="blue", answer_score=1.0, correct=True
         )
     evaluator = CachedAnswerEvaluator(
-        identity=_identity("answers"), evaluations=evaluations
+        evaluator_identity=_identity("answers"), evaluations=evaluations
     )
     return (
         CachedUtilityGraph(
-            identity=_identity("utility"),
-            observation_identity=_identity("observations"),
             observations=observations,
             evaluator=evaluator,
         ),

@@ -18,19 +18,19 @@ from fidmem.oracle.search import (
     observation_key,
 )
 from fidmem.router.dagger import (
-    CacheArtifactIdentity,
     CachedAnswerEvaluator,
     CachedUtilityGraph,
     DAggerConfig,
     DAggerQuestionContext,
     ForbiddenObservationGenerator,
+    FrozenActionPolicy,
     PolicyTrainingResult,
     Task10DaggerProvenance,
     evaluation_key,
     run_dagger,
     select_train_question_subset,
 )
-from fidmem.router.dataset import OracleBCDataset
+from fidmem.router.dataset import FrozenComponentIdentity, OracleBCDataset
 from fidmem.types import (
     ActionInstance,
     ActionType,
@@ -43,9 +43,12 @@ from fidmem.types import (
 from tests.router._fixtures import authoritative_record
 
 
-def _identity(label: str) -> CacheArtifactIdentity:
-    return CacheArtifactIdentity(
-        artifact_sha256=hashlib.sha256(label.encode("utf-8")).hexdigest()
+def _identity(label: str) -> FrozenComponentIdentity:
+    return FrozenComponentIdentity(
+        implementation="unit-cached-evaluator",
+        model_id=label,
+        revision="frozen-v1",
+        artifact_sha256=hashlib.sha256(label.encode("utf-8")).hexdigest(),
     )
 
 
@@ -110,13 +113,11 @@ def _snapshot(
     )
     searched = environment.replay(state, search, observation).next_state
     return CachedUtilityGraph(
-        identity=_identity(f"snapshot:{label}"),
-        observation_identity=_identity(f"observations:{label}"),
         observations=CachedObservationGraph(
             {observation_key(state, search): observation}
         ),
         evaluator=CachedAnswerEvaluator(
-            identity=_identity(f"evaluations:{label}"),
+            evaluator_identity=_identity(f"evaluations:{label}"),
             evaluations={
                 evaluation_key(state): AnswerEvaluation(
                     answer="red", answer_score=0.2, correct=False
@@ -164,12 +165,7 @@ def _contexts(count: int) -> tuple[DAggerQuestionContext, ...]:
     return tuple(contexts)
 
 
-def _always_stop(
-    state: RouterState, legal: tuple[ActionInstance, ...]
-) -> ActionInstance:
-    stop = _action(ActionType.STOP)
-    assert stop in legal
-    return stop
+_always_stop = FrozenActionPolicy(ActionType.STOP)
 
 
 class SpyTrainer:
@@ -177,6 +173,13 @@ class SpyTrainer:
         self.aggregate_sizes: list[int] = []
         self.new_sizes: list[int] = []
         self.load_calls = 0
+
+    def dataset_identity(
+        self, *, base_dataset: OracleBCDataset, deviations: tuple[object, ...]
+    ) -> str:
+        return hashlib.sha256(
+            f"{base_dataset.identity}:{len(deviations)}".encode()
+        ).hexdigest()
 
     def train(
         self,
@@ -191,17 +194,14 @@ class SpyTrainer:
         self.aggregate_sizes.append(len(deviations))
         self.new_sizes.append(len(new_deviations))
         output_checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        output_checkpoint.write_bytes(
-            f"round={round_number};source={source_policy_checkpoint.name}".encode()
-        )
-        digest = hashlib.sha256(output_checkpoint.read_bytes()).hexdigest()
+        identity = _always_stop.freeze(output_checkpoint)
         return PolicyTrainingResult(
             policy=_always_stop,
             checkpoint_path=output_checkpoint,
-            checkpoint_sha256=digest,
-            aggregated_dataset_identity=hashlib.sha256(
-                f"{base_dataset.identity}:{len(deviations)}".encode()
-            ).hexdigest(),
+            checkpoint_sha256=identity.checkpoint_sha256,
+            aggregated_dataset_identity=self.dataset_identity(
+                base_dataset=base_dataset, deviations=deviations
+            ),
         )
 
     def load_policy(
@@ -212,7 +212,7 @@ class SpyTrainer:
         deviations: tuple[object, ...],
     ):
         self.load_calls += 1
-        return _always_stop
+        return FrozenActionPolicy(ActionType.STOP)
 
 
 def test_fixed_question_subset_is_seeded_canonical_and_worker_independent() -> None:
@@ -246,10 +246,12 @@ def test_multiround_training_persists_seen_keys_manifests_and_resumes(
     tmp_path: Path,
 ) -> None:
     contexts = _contexts(1)
-    initial_checkpoint = tmp_path / "initial.pt"
-    initial_checkpoint.write_bytes(b"initial policy")
     config = DAggerConfig(
         artifact_root=tmp_path,
+        bootstrap_checkpoint=Path("bootstrap.pt"),
+        generations_dir=Path("generations"),
+        current_pointer=Path("current.json"),
+        min_rounds=2,
         max_rounds=3,
         beam_size=8,
         max_depth=5,
@@ -258,11 +260,9 @@ def test_multiround_training_persists_seen_keys_manifests_and_resumes(
         train_question_subset_fraction=1.0,
         train_question_subset_seed=37,
         budget_bin_width=1.0,
-        seen_keys_path=Path("seen.json"),
-        deviation_artifact_path=Path("deviations.json"),
-        manifest_dir=Path("manifests"),
-        checkpoint_dir=Path("checkpoints"),
     )
+    initial_checkpoint = config.bootstrap_path
+    _always_stop.freeze(initial_checkpoint)
     trainer = SpyTrainer()
 
     result = run_dagger(
@@ -279,9 +279,9 @@ def test_multiround_training_persists_seen_keys_manifests_and_resumes(
     assert len(result.manifests) == 2
     assert result.manifests[-1].status == "stopped"
     assert result.manifests[-1].stop_reason == "threshold_not_met"
-    assert (tmp_path / "seen.json").is_file()
-    assert len(tuple(tmp_path.glob("deviations-round-*.json"))) == 2
-    assert tuple((tmp_path / "manifests").glob("round-*.json"))
+    assert (tmp_path / "current.json").is_file()
+    assert len(tuple((tmp_path / "generations").glob("round-*"))) == 2
+    assert (tmp_path / "generations" / "round-0002" / "manifest.json").is_file()
 
     resumed_trainer = SpyTrainer()
     resumed = run_dagger(
@@ -295,15 +295,15 @@ def test_multiround_training_persists_seen_keys_manifests_and_resumes(
 
     assert resumed.resumed is True
     assert resumed_trainer.aggregate_sizes == []
-    assert resumed_trainer.load_calls == 0
+    assert resumed_trainer.load_calls == 3
     assert resumed.final_checkpoint == result.final_checkpoint
 
 
 def test_resume_rejects_changed_source_policy_identity(tmp_path: Path) -> None:
     contexts = _contexts(1)
-    source = tmp_path / "initial.pt"
-    source.write_bytes(b"initial policy")
     config = DAggerConfig(artifact_root=tmp_path)
+    source = config.bootstrap_path
+    _always_stop.freeze(source)
     run_dagger(
         train_contexts=contexts,
         dev_contexts=contexts,
@@ -314,7 +314,7 @@ def test_resume_rejects_changed_source_policy_identity(tmp_path: Path) -> None:
     )
     source.write_bytes(b"forged policy")
 
-    with pytest.raises(ValueError, match="run identity"):
+    with pytest.raises(ValueError, match="checkpoint|policy"):
         run_dagger(
             train_contexts=contexts,
             dev_contexts=contexts,

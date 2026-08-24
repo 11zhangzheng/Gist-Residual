@@ -9,7 +9,7 @@ from tests.router.test_dagger_workflow import _contexts
 def test_question_context_requires_forbidden_executor_in_real_environment() -> None:
     context = _contexts(1)[0]
     unsafe = MemoryEnvironment(
-        events=tuple(context.environment._by_id.values()),
+        events=context.environment.canonical_events,
         executor=lambda action, state: ActionObservation(),
         costs=context.environment.costs,
     )

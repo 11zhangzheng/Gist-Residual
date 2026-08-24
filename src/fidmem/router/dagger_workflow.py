@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import os
+import shutil
+from decimal import Decimal
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from fidmem.actions.environment import MemoryEnvironment
+from fidmem.actions.environment import EnvironmentTransition, MemoryEnvironment
 from fidmem.agent.runner import RouterPolicy
 from fidmem.oracle.labels import CostNormalization
 from fidmem.router.dataset import OracleBCDataset, OracleBCRecord
@@ -22,12 +24,13 @@ from fidmem.types import RouterState
 
 from .dagger_core import (
     CachedUtilityGraph,
-    DaggerRoundResult,
     Deviation,
+    DeviationAuthority,
     ForbiddenObservationGenerator,
+    PolicyIdentity,
     _evaluate_dev,
-    _should_continue,
     collect_deviations,
+    policy_identity,
 )
 
 
@@ -106,16 +109,14 @@ class Task10DaggerProvenance(BaseModel):
 
 
 class DAggerQuestionContext(BaseModel):
-    """Strict question, cache snapshot and Task 8/9/10 authority bundle."""
+    """Question authority reconstructed from cached replay and Task 8/9/10."""
 
-    model_config = ConfigDict(
-        frozen=True,
-        extra="forbid",
-        arbitrary_types_allowed=True,
-    )
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
     question_id: str = Field(min_length=1)
     video_group_id: str = Field(min_length=1)
+    initial_state: RouterState
+    initial_replay_transitions: tuple[EnvironmentTransition, ...] = ()
     state: RouterState
     environment: MemoryEnvironment
     dataset: OracleBCDataset
@@ -127,13 +128,27 @@ class DAggerQuestionContext(BaseModel):
 
     @model_validator(mode="after")
     def authority_matches_dataset(self) -> "DAggerQuestionContext":
-        if not isinstance(
-            getattr(self.environment, "_executor", None),
-            ForbiddenObservationGenerator,
-        ):
+        if type(self.environment.executor) is not ForbiddenObservationGenerator:
             raise ValueError(
-                "DAgger environment must inject ForbiddenObservationGenerator"
+                "DAgger environment must inject exact ForbiddenObservationGenerator"
             )
+        current = self.initial_state
+        for persisted in self.initial_replay_transitions:
+            if persisted.state != current:
+                raise ValueError("initial replay transition state chain mismatch")
+            cached = self.snapshot.get(current, persisted.action)
+            if cached is None or cached != persisted.observation:
+                raise ValueError("initial replay transition is absent from cache")
+            replayed = self.environment.replay(current, persisted.action, cached)
+            if replayed != persisted:
+                raise ValueError("initial replay transition is not authoritative")
+            current = replayed.next_state
+        if current != self.state:
+            raise ValueError("initial replay does not derive context state")
+        if tuple(self.state.action_history) != tuple(
+            transition.action for transition in self.initial_replay_transitions
+        ):
+            raise ValueError("context action history is not replay-derived")
         if self.dataset.identity != self.task10.dataset_identity:
             raise ValueError("Task 10 dataset identity does not match context dataset")
         if tuple(record.record_id for record in self.dataset.records) != (
@@ -181,11 +196,21 @@ class DAggerQuestionContext(BaseModel):
         dataset: OracleBCDataset,
         environment: MemoryEnvironment,
         snapshot: CachedUtilityGraph,
+        initial_state: RouterState | None = None,
+        initial_replay_transitions: Sequence[EnvironmentTransition] = (),
     ) -> "DAggerQuestionContext":
+        transitions = tuple(initial_replay_transitions)
+        root = record.state if initial_state is None else initial_state
+        if record.state.action_history and not transitions:
+            raise ValueError(
+                "pre-acquired Task 10 record requires authoritative initial replay"
+            )
         provenance = record.provenance
         return cls(
             question_id=record.question_id,
             video_group_id=record.video_id,
+            initial_state=root,
+            initial_replay_transitions=transitions,
             state=record.state,
             environment=environment,
             dataset=dataset,
@@ -210,24 +235,66 @@ class DAggerQuestionContext(BaseModel):
         )
 
     @property
+    def base_record(self) -> OracleBCRecord:
+        return next(
+            record
+            for record in self.dataset.records
+            if record.question_id == self.question_id
+            and record.video_id == self.video_group_id
+            and record.state == self.state
+            and record.observation_snapshot_id == self.observation_snapshot_id
+        )
+
+    @property
+    def environment_identity(self) -> str:
+        payload = {
+            "events": tuple(
+                event.model_dump(mode="json")
+                for event in self.environment.canonical_events
+            ),
+            "costs": self.environment.costs.model_dump(mode="json"),
+            "action_semantics_version": self.environment.action_semantics_version,
+            "executor_identity": (
+                "fidmem.router.dagger_core.ForbiddenObservationGenerator/v1"
+            ),
+        }
+        return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+
+    @property
     def identity(self) -> str:
         payload = {
             "question_id": self.question_id,
             "video_group_id": self.video_group_id,
+            "initial_state": self.initial_state.model_dump(mode="json"),
+            "initial_replay_transitions": tuple(
+                item.model_dump(mode="json") for item in self.initial_replay_transitions
+            ),
             "state": self.state.model_dump(mode="json"),
+            "environment_identity": self.environment_identity,
             "observation_snapshot_id": self.observation_snapshot_id,
             "snapshot_identity": self.snapshot.identity.model_dump(mode="json"),
-            "observation_identity": self.snapshot.observation_identity.model_dump(
-                mode="json"
-            ),
-            "evaluator_identity": self.snapshot.evaluator_identity.model_dump(
-                mode="json"
-            ),
             "task8": self.task8.model_dump(mode="json"),
             "task9": self.task9.model_dump(mode="json"),
             "task10": self.task10.model_dump(mode="json"),
         }
         return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+
+    @property
+    def deviation_authority(self) -> DeviationAuthority:
+        return DeviationAuthority(
+            context_identity=self.identity,
+            video_group_id=self.video_group_id,
+            observation_snapshot_id=self.observation_snapshot_id,
+            base_dataset_identity=self.dataset.identity,
+            base_record_id=self.base_record.record_id,
+            dataset_manifest_hash=self.task8.dataset_manifest_hash,
+            source_manifest_hash=self.task8.source_manifest_hash,
+            asset_sha256=self.task8.asset_sha256,
+            group_assignment_sha256=self.task8.group_assignment_sha256,
+            longroute_example_sha256=self.task8.longroute_example_sha256,
+            normalization_manifest_hash=self.task9.normalization_manifest_hash,
+            preference_set_hash=self.task9.preference_set_hash,
+        )
 
 
 def select_train_question_subset(
@@ -264,6 +331,10 @@ class DAggerConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     artifact_root: Path = Path("artifacts/dagger")
+    bootstrap_checkpoint: Path = Path("bootstrap.pt")
+    generations_dir: Path = Path("generations")
+    current_pointer: Path = Path("current.json")
+    min_rounds: int = Field(default=2, ge=2, le=3)
     max_rounds: int = Field(default=3, ge=2, le=3)
     beam_size: int = Field(default=8, ge=1)
     max_depth: int = Field(default=5, ge=1)
@@ -272,14 +343,12 @@ class DAggerConfig(BaseModel):
     train_question_subset_fraction: float = Field(default=1.0, gt=0, le=1)
     train_question_subset_seed: int = 2026
     budget_bin_width: float = Field(default=1.0, gt=0)
-    seen_keys_path: Path = Path("seen-keys.json")
-    deviation_artifact_path: Path = Path("deviations.json")
-    manifest_dir: Path = Path("manifests")
-    checkpoint_dir: Path = Path("checkpoints")
 
     def resolve_path(self, value: Path, *, directory: bool = False) -> Path:
         root = self.artifact_root.resolve()
-        target = value.resolve() if value.is_absolute() else (root / value).resolve()
+        if value.is_absolute() or ".." in value.parts:
+            raise ValueError("DAgger paths must be canonical relative paths")
+        target = (root / value).resolve()
         if not target.is_relative_to(root) or target == root:
             raise ValueError("DAgger artifact paths must stay under artifact_root")
         if directory and target.suffix:
@@ -288,11 +357,16 @@ class DAggerConfig(BaseModel):
 
     @model_validator(mode="after")
     def paths_are_contained(self) -> "DAggerConfig":
-        self.resolve_path(self.seen_keys_path)
-        self.resolve_path(self.deviation_artifact_path)
-        self.resolve_path(self.manifest_dir, directory=True)
-        self.resolve_path(self.checkpoint_dir, directory=True)
+        if self.min_rounds > self.max_rounds:
+            raise ValueError("min_rounds cannot exceed max_rounds")
+        self.resolve_path(self.bootstrap_checkpoint)
+        self.resolve_path(self.generations_dir, directory=True)
+        self.resolve_path(self.current_pointer)
         return self
+
+    @property
+    def bootstrap_path(self) -> Path:
+        return self.resolve_path(self.bootstrap_checkpoint)
 
 
 @dataclass(frozen=True)
@@ -304,7 +378,10 @@ class PolicyTrainingResult:
 
 
 class PolicyTrainer(Protocol):
-    """Injected trainer boundary; production adapter invokes Task 10 train_bc."""
+    def dataset_identity(
+        self, *, base_dataset: OracleBCDataset, deviations: tuple[Deviation, ...]
+    ) -> str:
+        ...
 
     def train(
         self,
@@ -334,17 +411,27 @@ class ArtifactReference(BaseModel):
     path: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+    @model_validator(mode="after")
+    def canonical_relative(self) -> "ArtifactReference":
+        candidate = Path(self.path)
+        if (
+            candidate.is_absolute()
+            or ".." in candidate.parts
+            or candidate.as_posix() != self.path
+            or len(candidate.parts) != 1
+        ):
+            raise ValueError("artifact reference must be one canonical relative path")
+        return self
+
 
 class RoundMetrics(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
-
     dev_utility: float
     cost_regret: float = Field(ge=0)
 
 
 class RoundThresholds(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
-
     utility_gain: float = Field(ge=0)
     regret_improvement_ratio: float = Field(ge=0)
 
@@ -352,25 +439,31 @@ class RoundThresholds(BaseModel):
 class DAggerRoundManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     round_number: int = Field(ge=1, le=3)
+    generation: str = Field(min_length=1)
+    manifest_path: Literal["manifest.json"] = "manifest.json"
     status: Literal["completed", "stopped"]
     stop_reason: Literal["continue", "threshold_not_met", "max_rounds"]
     source_policy: ArtifactReference
+    source_policy_identity: PolicyIdentity
     checkpoint: ArtifactReference
+    checkpoint_policy_identity: PolicyIdentity
+    seen_keys: ArtifactReference
+    dev_artifact: ArtifactReference
+    deviation_artifact: ArtifactReference
     base_dataset_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     aggregated_dataset_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     train_subset_question_ids: tuple[str, ...] = Field(min_length=1)
     train_subset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     context_identities: tuple[str, ...] = Field(min_length=1)
-    seen_keys_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     seen_key_count: int = Field(ge=0)
-    deviation_artifact: ArtifactReference
     deviation_count: int = Field(ge=0)
     new_deviation_count: int = Field(ge=0)
     thresholds: RoundThresholds
     metrics: RoundMetrics
+    budget_bin_width: float = Field(gt=0)
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -387,7 +480,6 @@ class DAggerRoundManifest(BaseModel):
 
 class DAggerRunResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-
     run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: Literal["stopped"]
     resumed: bool
@@ -397,9 +489,9 @@ class DAggerRunResult(BaseModel):
 
 class _SeenKeysArtifact(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    round_number: int = Field(ge=1)
     keys: tuple[str, ...]
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -411,26 +503,94 @@ class _SeenKeysArtifact(BaseModel):
             for key in self.keys
         ):
             raise ValueError("seen keys must be sorted unique SHA-256 values")
-        expected = _sha256_bytes(
-            _canonical_json(
-                self.model_dump(mode="json", exclude={"artifact_sha256"})
-            ).encode("utf-8")
-        )
-        if expected != self.artifact_sha256:
-            raise ValueError("seen key artifact self hash mismatch")
+        _validate_self_hash(self, "artifact_sha256", "seen key artifact")
         return self
 
 
-def _seen_artifact(run_identity: str, keys: set[str]) -> _SeenKeysArtifact:
-    base = {
-        "schema_version": 1,
-        "run_identity": run_identity,
-        "keys": tuple(sorted(keys)),
-    }
-    return _SeenKeysArtifact(
-        **base,
-        artifact_sha256=_sha256_bytes(_canonical_json(base).encode("utf-8")),
+class _DeviationArtifact(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    schema_version: Literal[2] = 2
+    run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    round_number: int = Field(ge=1)
+    deviations: tuple[Deviation, ...]
+    new_state_keys: tuple[str, ...]
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_contents(self) -> "_DeviationArtifact":
+        keys = tuple(item.state_key for item in self.deviations)
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("deviations must be canonical and unique")
+        if self.new_state_keys != tuple(sorted(set(self.new_state_keys))) or any(
+            key not in set(keys) for key in self.new_state_keys
+        ):
+            raise ValueError("new deviation keys are invalid")
+        _validate_self_hash(self, "artifact_sha256", "deviation artifact")
+        return self
+
+
+class _ContextMetric(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    context_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    utility: float
+    cost_regret: float = Field(ge=0)
+
+
+class _DevArtifact(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    schema_version: Literal[2] = 2
+    run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    round_number: int = Field(ge=1)
+    context_metrics: tuple[_ContextMetric, ...]
+    metrics: RoundMetrics
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_metrics(self) -> "_DevArtifact":
+        identities = tuple(item.context_identity for item in self.context_metrics)
+        if identities != tuple(sorted(set(identities))) or not identities:
+            raise ValueError("dev context metrics must be sorted unique")
+        expected = RoundMetrics(
+            dev_utility=math.fsum(item.utility for item in self.context_metrics)
+            / len(self.context_metrics),
+            cost_regret=math.fsum(item.cost_regret for item in self.context_metrics)
+            / len(self.context_metrics),
+        )
+        if self.metrics != expected:
+            raise ValueError("dev aggregate metrics mismatch")
+        _validate_self_hash(self, "artifact_sha256", "dev artifact")
+        return self
+
+
+class _CurrentPointer(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    schema_version: Literal[1] = 1
+    run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    round_number: int = Field(ge=1)
+    generation: str = Field(min_length=1)
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pointer_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_hash(self) -> "_CurrentPointer":
+        _validate_self_hash(self, "pointer_sha256", "current pointer")
+        return self
+
+
+def _validate_self_hash(model: BaseModel, field: str, label: str) -> None:
+    expected = _sha256_bytes(
+        _canonical_json(model.model_dump(mode="json", exclude={field})).encode("utf-8")
     )
+    if getattr(model, field) != expected:
+        raise ValueError(f"{label} self hash mismatch")
+
+
+def _sealed(model_type: type[BaseModel], **payload: object) -> BaseModel:
+    body = {"schema_version": 2, **payload}
+    provisional = model_type.model_construct(**body, artifact_sha256="0" * 64)
+    canonical = provisional.model_dump(mode="json", exclude={"artifact_sha256"})
+    digest = _sha256_bytes(_canonical_json(canonical).encode("utf-8"))
+    return model_type(**body, artifact_sha256=digest)
 
 
 def _write_model(path: Path, model: BaseModel) -> None:
@@ -440,62 +600,156 @@ def _write_model(path: Path, model: BaseModel) -> None:
     )
 
 
-def _deviation_path(config: DAggerConfig, round_number: int) -> Path:
-    base = config.resolve_path(config.deviation_artifact_path)
-    return base.with_name(f"{base.stem}-round-{round_number}{base.suffix}")
-
-
-def _manifest_path(config: DAggerConfig, round_number: int) -> Path:
-    return config.resolve_path(config.manifest_dir, directory=True) / (
-        f"round-{round_number}.json"
-    )
-
-
-def _checkpoint_path(config: DAggerConfig, round_number: int) -> Path:
-    return config.resolve_path(config.checkpoint_dir, directory=True) / (
-        f"policy-round-{round_number}.pt"
-    )
-
-
-def _write_deviations(path: Path, deviations: Sequence[Deviation]) -> str:
-    payload = {
-        "schema_version": 1,
-        "deviations": tuple(
-            deviation.model_dump(mode="json") for deviation in deviations
-        ),
-    }
-    encoded = (_canonical_json(payload) + "\n").encode("utf-8")
-    _atomic_write(path, encoded)
-    return _sha256_bytes(encoded)
-
-
-def _load_deviations(path: Path, expected_sha256: str) -> tuple[Deviation, ...]:
-    if not path.is_file() or path.is_symlink():
-        raise ValueError("deviation artifact is missing or not a regular file")
-    if _sha256_file(path) != expected_sha256:
-        raise ValueError("deviation artifact identity mismatch")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(payload, dict)
-        or set(payload)
-        != {
-            "schema_version",
-            "deviations",
-        }
-        or payload["schema_version"] != 1
-    ):
-        raise ValueError("deviation artifact schema is invalid")
-    return tuple(Deviation.model_validate(item) for item in payload["deviations"])
-
-
 def _build_manifest(**payload: object) -> DAggerRoundManifest:
     normalized = {
         key: value.model_dump(mode="json") if isinstance(value, BaseModel) else value
         for key, value in payload.items()
     }
-    base = {"schema_version": 1, **normalized}
-    digest = _sha256_bytes(_canonical_json(base).encode("utf-8"))
-    return DAggerRoundManifest(**base, manifest_sha256=digest)
+    body = {"schema_version": 2, **normalized}
+    digest = _sha256_bytes(_canonical_json(body).encode("utf-8"))
+    return DAggerRoundManifest(**body, manifest_sha256=digest)
+
+
+def _generation_name(round_number: int) -> str:
+    return f"round-{round_number:04d}"
+
+
+def _generation_relative(config: DAggerConfig, round_number: int) -> str:
+    return (config.generations_dir / _generation_name(round_number)).as_posix()
+
+
+class DaggerRoundStore:
+    """Same-root transactional store with current pointer published last."""
+
+    def __init__(self, config: DAggerConfig) -> None:
+        self.config = config
+        self.root = config.artifact_root.resolve()
+        self.generations = config.resolve_path(config.generations_dir, directory=True)
+        self.current = config.resolve_path(config.current_pointer)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.generations.mkdir(parents=True, exist_ok=True)
+
+    def _round_path(self, round_number: int) -> Path:
+        return self.generations / _generation_name(round_number)
+
+    def _staging_path(self, round_number: int) -> Path:
+        return self.generations / f".{_generation_name(round_number)}.staging"
+
+    def recover(self) -> None:
+        current_round = 0
+        if self.current.exists():
+            current_round = self.load_pointer().round_number
+        for candidate in self.generations.iterdir():
+            if candidate.name.startswith(".round-") and candidate.name.endswith(
+                ".staging"
+            ):
+                self._remove(candidate)
+        for round_number in range(current_round + 1, self.config.max_rounds + 1):
+            orphan = self._round_path(round_number)
+            if orphan.exists():
+                self._remove(orphan)
+
+    def _remove(self, candidate: Path) -> None:
+        resolved_parent = candidate.parent.resolve()
+        if resolved_parent != self.generations or not (
+            candidate.name.startswith(".round-") or candidate.name.startswith("round-")
+        ):
+            raise ValueError("refusing to remove an unsafe DAgger generation")
+        if candidate.is_symlink():
+            candidate.unlink()
+        elif candidate.is_dir():
+            shutil.rmtree(candidate)
+        elif candidate.exists():
+            candidate.unlink()
+
+    def begin(self, round_number: int) -> Path:
+        staging = self._staging_path(round_number)
+        final = self._round_path(round_number)
+        if final.exists():
+            raise ValueError("immutable DAgger generation already exists")
+        if staging.exists():
+            self._remove(staging)
+        staging.mkdir()
+        return staging
+
+    def rollback(self, staging: Path) -> None:
+        if staging.exists():
+            self._remove(staging)
+
+    def commit(self, staging: Path, manifest: DAggerRoundManifest) -> Path:
+        final = self._round_path(manifest.round_number)
+        _write_model(staging / "manifest.json", manifest)
+        for child in staging.iterdir():
+            if child.is_symlink() or not child.is_file():
+                raise ValueError("generation contains an unsafe artifact")
+            with child.open("rb+") as handle:
+                os.fsync(handle.fileno())
+        _fsync_directory(staging)
+        os.replace(staging, final)
+        _fsync_directory(self.generations)
+        published = False
+        try:
+            pointer_body = {
+                "schema_version": 1,
+                "run_identity": manifest.run_identity,
+                "round_number": manifest.round_number,
+                "generation": manifest.generation,
+                "manifest_sha256": manifest.manifest_sha256,
+            }
+            pointer = _CurrentPointer(
+                **pointer_body,
+                pointer_sha256=_sha256_bytes(
+                    _canonical_json(pointer_body).encode("utf-8")
+                ),
+            )
+            _write_model(self.current, pointer)
+            _fsync_directory(self.root)
+            published = True
+            return final
+        finally:
+            if not published and final.exists():
+                self._remove(final)
+
+    def load_pointer(self) -> _CurrentPointer:
+        if not self.current.is_file() or self.current.is_symlink():
+            raise ValueError("current pointer is missing or unsafe")
+        pointer = _CurrentPointer.model_validate_json(
+            self.current.read_text(encoding="utf-8")
+        )
+        expected = _generation_relative(self.config, pointer.round_number)
+        if pointer.generation != expected:
+            raise ValueError("current pointer target is invalid")
+        return pointer
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "nt":
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _artifact_path(
+    generation: Path, reference: ArtifactReference, expected_name: str
+) -> Path:
+    if reference.path != expected_name or generation.is_symlink():
+        raise ValueError("generation artifact path is not canonical")
+    target = generation / reference.path
+    if (
+        not target.is_file()
+        or target.is_symlink()
+        or not target.resolve().is_relative_to(generation.resolve())
+    ):
+        raise ValueError("generation artifact is missing or unsafe")
+    if _sha256_file(target) != reference.sha256:
+        raise ValueError("generation artifact identity mismatch")
+    return target
+
+
+def _artifact_reference(path: Path) -> ArtifactReference:
+    return ArtifactReference(path=path.name, sha256=_sha256_file(path))
 
 
 def _run_identity(
@@ -503,56 +757,15 @@ def _run_identity(
     contexts: Sequence[DAggerQuestionContext],
     dev_contexts: Sequence[DAggerQuestionContext],
     config: DAggerConfig,
-    source_policy_sha256: str,
+    source_policy_identity: PolicyIdentity,
 ) -> str:
     payload = {
         "train_contexts": tuple(sorted(item.identity for item in contexts)),
         "dev_contexts": tuple(sorted(item.identity for item in dev_contexts)),
         "config": config.model_dump(mode="json"),
-        "source_policy_sha256": source_policy_sha256,
+        "source_policy_identity": source_policy_identity.model_dump(mode="json"),
     }
     return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
-
-
-def _load_existing_manifests(
-    config: DAggerConfig,
-    *,
-    run_identity: str,
-    base_dataset_identity: str,
-    subset_ids: tuple[str, ...],
-    context_ids: tuple[str, ...],
-) -> tuple[DAggerRoundManifest, ...]:
-    manifests: list[DAggerRoundManifest] = []
-    for round_number in range(1, config.max_rounds + 1):
-        path = _manifest_path(config, round_number)
-        if not path.exists():
-            break
-        manifest = DAggerRoundManifest.model_validate_json(
-            path.read_text(encoding="utf-8")
-        )
-        if manifest.round_number != round_number:
-            raise ValueError("round manifest sequence is invalid")
-        if manifest.run_identity != run_identity:
-            raise ValueError("round manifest run identity mismatch")
-        if manifest.base_dataset_identity != base_dataset_identity:
-            raise ValueError("round manifest dataset identity mismatch")
-        if manifest.train_subset_question_ids != subset_ids:
-            raise ValueError("round manifest train subset identity mismatch")
-        if manifest.context_identities != context_ids:
-            raise ValueError("round manifest context identity mismatch")
-        checkpoint = Path(manifest.checkpoint.path)
-        deviations = Path(manifest.deviation_artifact.path)
-        if (
-            not checkpoint.is_file()
-            or checkpoint.is_symlink()
-            or _sha256_file(checkpoint) != manifest.checkpoint.sha256
-        ):
-            raise ValueError("round checkpoint identity mismatch")
-        _load_deviations(deviations, manifest.deviation_artifact.sha256)
-        if manifests and manifest.source_policy != manifests[-1].checkpoint:
-            raise ValueError("round source policy chain is invalid")
-        manifests.append(manifest)
-    return tuple(manifests)
 
 
 def _average_dev_metrics(
@@ -560,10 +773,9 @@ def _average_dev_metrics(
     *,
     policy: RouterPolicy,
     config: DAggerConfig,
-) -> tuple[float, float]:
-    utilities: list[float] = []
-    regrets: list[float] = []
-    for context in contexts:
+) -> tuple[RoundMetrics, tuple[_ContextMetric, ...]]:
+    entries: list[_ContextMetric] = []
+    for context in sorted(contexts, key=lambda item: item.identity):
         utility, regret = _evaluate_dev(
             (context.state,),
             policy=policy,
@@ -573,9 +785,160 @@ def _average_dev_metrics(
             beam_size=config.beam_size,
             max_depth=config.max_depth,
         )
-        utilities.append(utility)
-        regrets.append(regret)
-    return sum(utilities) / len(utilities), sum(regrets) / len(regrets)
+        entries.append(
+            _ContextMetric(
+                context_identity=context.identity,
+                utility=utility,
+                cost_regret=regret,
+            )
+        )
+    metrics = RoundMetrics(
+        dev_utility=math.fsum(item.utility for item in entries) / len(entries),
+        cost_regret=math.fsum(item.cost_regret for item in entries) / len(entries),
+    )
+    return metrics, tuple(entries)
+
+
+def _stop_decision(
+    round_number: int,
+    metrics: RoundMetrics,
+    previous: RoundMetrics | None,
+    config: DAggerConfig,
+) -> tuple[
+    Literal["completed", "stopped"],
+    Literal["continue", "threshold_not_met", "max_rounds"],
+]:
+    if round_number >= config.max_rounds:
+        return "stopped", "max_rounds"
+    if round_number < config.min_rounds:
+        return "completed", "continue"
+    if previous is None:
+        raise ValueError("round stop decision requires prior metrics")
+    utility_gain = Decimal(str(metrics.dev_utility)) - Decimal(
+        str(previous.dev_utility)
+    )
+    regret_improvement = Decimal(str(previous.cost_regret)) - Decimal(
+        str(metrics.cost_regret)
+    )
+    regret_threshold = Decimal(str(config.regret_improvement_ratio)) * Decimal(
+        str(previous.cost_regret)
+    )
+    continues = utility_gain >= Decimal(str(config.utility_gain_threshold)) or (
+        previous.cost_regret > 0 and regret_improvement >= regret_threshold
+    )
+    return (
+        ("completed", "continue")
+        if continues
+        else (
+            "stopped",
+            "threshold_not_met",
+        )
+    )
+
+
+def _load_generation(
+    *,
+    store: DaggerRoundStore,
+    round_number: int,
+    run_identity: str,
+    dataset: OracleBCDataset,
+    trainer: PolicyTrainer,
+    subset_ids: tuple[str, ...],
+    subset_hash: str,
+    context_ids: tuple[str, ...],
+    dev_context_ids: tuple[str, ...],
+    source_identity: PolicyIdentity,
+    previous_metrics: RoundMetrics | None,
+) -> tuple[DAggerRoundManifest, tuple[Deviation, ...], set[str], RouterPolicy]:
+    generation = store._round_path(round_number)
+    if not generation.is_dir() or generation.is_symlink():
+        raise ValueError("committed generation is missing or unsafe")
+    manifest_path = generation / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("round manifest is missing or unsafe")
+    manifest = DAggerRoundManifest.model_validate_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    expected_generation = _generation_relative(store.config, round_number)
+    if (
+        manifest.round_number != round_number
+        or manifest.generation != expected_generation
+        or manifest.run_identity != run_identity
+        or manifest.base_dataset_identity != dataset.identity
+        or manifest.train_subset_question_ids != subset_ids
+        or manifest.train_subset_sha256 != subset_hash
+        or manifest.context_identities != context_ids
+        or manifest.source_policy_identity != source_identity
+        or manifest.budget_bin_width != store.config.budget_bin_width
+    ):
+        raise ValueError("round manifest derived identity mismatch")
+    expected_thresholds = RoundThresholds(
+        utility_gain=store.config.utility_gain_threshold,
+        regret_improvement_ratio=store.config.regret_improvement_ratio,
+    )
+    if manifest.thresholds != expected_thresholds:
+        raise ValueError("round manifest threshold mismatch")
+    _artifact_path(generation, manifest.source_policy, "source.pt")
+    if manifest.source_policy.sha256 != (
+        manifest.source_policy_identity.checkpoint_sha256
+    ):
+        raise ValueError("source policy content identity mismatch")
+    seen_path = _artifact_path(generation, manifest.seen_keys, "seen.json")
+    seen = _SeenKeysArtifact.model_validate_json(seen_path.read_text(encoding="utf-8"))
+    if (
+        seen.run_identity != run_identity
+        or seen.round_number != round_number
+        or len(seen.keys) != manifest.seen_key_count
+    ):
+        raise ValueError("seen key artifact derived fields mismatch")
+    deviation_path = _artifact_path(
+        generation, manifest.deviation_artifact, "deviations.json"
+    )
+    deviations_artifact = _DeviationArtifact.model_validate_json(
+        deviation_path.read_text(encoding="utf-8")
+    )
+    deviations = deviations_artifact.deviations
+    if (
+        deviations_artifact.run_identity != run_identity
+        or deviations_artifact.round_number != round_number
+        or len(deviations) != manifest.deviation_count
+        or len(deviations_artifact.new_state_keys) != manifest.new_deviation_count
+    ):
+        raise ValueError("deviation artifact derived fields mismatch")
+    if any(item.state_key not in set(seen.keys) for item in deviations):
+        raise ValueError("deviation keys are absent from seen artifact")
+    dev_path = _artifact_path(generation, manifest.dev_artifact, "dev.json")
+    dev = _DevArtifact.model_validate_json(dev_path.read_text(encoding="utf-8"))
+    if (
+        dev.run_identity != run_identity
+        or dev.round_number != round_number
+        or dev.metrics != manifest.metrics
+        or tuple(item.context_identity for item in dev.context_metrics)
+        != dev_context_ids
+    ):
+        raise ValueError("dev artifact derived fields mismatch")
+    status, reason = _stop_decision(
+        round_number, manifest.metrics, previous_metrics, store.config
+    )
+    if manifest.status != status or manifest.stop_reason != reason:
+        raise ValueError("round manifest stop decision mismatch")
+    aggregate_identity = trainer.dataset_identity(
+        base_dataset=dataset, deviations=deviations
+    )
+    if aggregate_identity != manifest.aggregated_dataset_identity:
+        raise ValueError("aggregated dataset identity mismatch")
+    checkpoint = _artifact_path(generation, manifest.checkpoint, "checkpoint.pt")
+    if (
+        manifest.checkpoint.sha256
+        != manifest.checkpoint_policy_identity.checkpoint_sha256
+    ):
+        raise ValueError("checkpoint policy content identity mismatch")
+    policy = trainer.load_policy(
+        checkpoint=checkpoint, base_dataset=dataset, deviations=deviations
+    )
+    if policy_identity(policy, checkpoint) != manifest.checkpoint_policy_identity:
+        raise ValueError("loaded policy identity mismatch")
+    return manifest, deviations, set(seen.keys), policy
 
 
 def run_dagger(
@@ -583,12 +946,10 @@ def run_dagger(
     train_contexts: Sequence[DAggerQuestionContext],
     dev_contexts: Sequence[DAggerQuestionContext],
     initial_policy: RouterPolicy,
-    source_policy_checkpoint: Path,
     trainer: PolicyTrainer,
     config: DAggerConfig,
+    source_policy_checkpoint: Path | None = None,
 ) -> DAggerRunResult:
-    """Run or resume an identity-checked DAgger correction workflow."""
-
     train = tuple(train_contexts)
     dev = tuple(dev_contexts)
     if not train or not dev:
@@ -599,10 +960,20 @@ def run_dagger(
     normalizations = {item.task9.normalization_manifest_hash for item in (*train, *dev)}
     if len(normalizations) != 1:
         raise ValueError("DAgger contexts must share one Task 9 normalization")
-    source = source_policy_checkpoint.resolve()
-    if not source.is_file() or source.is_symlink():
-        raise ValueError("source policy checkpoint must be a regular file")
-    source_hash = _sha256_file(source)
+    bootstrap = config.bootstrap_path
+    if (
+        source_policy_checkpoint is not None
+        and source_policy_checkpoint.resolve() != bootstrap
+    ):
+        raise ValueError("source policy must equal configured bootstrap checkpoint")
+    bootstrap_identity = policy_identity(initial_policy, bootstrap)
+    validated_bootstrap = trainer.load_policy(
+        checkpoint=bootstrap,
+        base_dataset=dataset,
+        deviations=(),
+    )
+    if policy_identity(validated_bootstrap, bootstrap) != bootstrap_identity:
+        raise ValueError("initial policy does not match validated bootstrap checkpoint")
     selected = select_train_question_subset(
         train,
         fraction=config.train_question_subset_fraction,
@@ -611,71 +982,65 @@ def run_dagger(
     subset_ids = tuple(item.question_id for item in selected)
     subset_hash = _sha256_bytes(_canonical_json(subset_ids).encode("utf-8"))
     context_ids = tuple(item.identity for item in selected)
+    dev_context_ids = tuple(sorted(item.identity for item in dev))
     run_identity = _run_identity(
         contexts=selected,
         dev_contexts=dev,
         config=config,
-        source_policy_sha256=source_hash,
+        source_policy_identity=bootstrap_identity,
     )
-    existing = _load_existing_manifests(
-        config,
-        run_identity=run_identity,
-        base_dataset_identity=dataset.identity,
-        subset_ids=subset_ids,
-        context_ids=context_ids,
-    )
-    seen_path = config.resolve_path(config.seen_keys_path)
+    store = DaggerRoundStore(config)
+    store.recover()
+    manifests: list[DAggerRoundManifest] = []
     deviations: tuple[Deviation, ...] = ()
     seen: set[str] = set()
-    policy = initial_policy
-    current_source = source
-    current_source_hash = source_hash
-    previous: DaggerRoundResult | None = None
-    resumed = bool(existing)
-    if existing:
-        last = existing[-1]
-        deviations = _load_deviations(
-            Path(last.deviation_artifact.path), last.deviation_artifact.sha256
-        )
-        if not seen_path.is_file() or seen_path.is_symlink():
-            raise ValueError("seen key artifact is missing on resume")
-        seen_artifact = _SeenKeysArtifact.model_validate_json(
-            seen_path.read_text(encoding="utf-8")
-        )
+    policy = validated_bootstrap
+    current_checkpoint = bootstrap
+    current_identity = bootstrap_identity
+    previous_metrics: RoundMetrics | None = None
+    resumed = False
+    if store.current.exists():
+        pointer = store.load_pointer()
+        if pointer.run_identity != run_identity:
+            raise ValueError("current pointer run identity mismatch")
+        expected_identity = bootstrap_identity
+        for round_number in range(1, pointer.round_number + 1):
+            manifest, deviations, seen, policy = _load_generation(
+                store=store,
+                round_number=round_number,
+                run_identity=run_identity,
+                dataset=dataset,
+                trainer=trainer,
+                subset_ids=subset_ids,
+                subset_hash=subset_hash,
+                context_ids=context_ids,
+                dev_context_ids=dev_context_ids,
+                source_identity=expected_identity,
+                previous_metrics=previous_metrics,
+            )
+            manifests.append(manifest)
+            expected_identity = manifest.checkpoint_policy_identity
+            previous_metrics = manifest.metrics
+        last = manifests[-1]
         if (
-            seen_artifact.run_identity != run_identity
-            or seen_artifact.artifact_sha256 != last.seen_keys_sha256
-            or len(seen_artifact.keys) != last.seen_key_count
+            pointer.generation != last.generation
+            or pointer.manifest_sha256 != last.manifest_sha256
         ):
-            raise ValueError("seen key artifact identity mismatch")
-        seen = set(seen_artifact.keys)
-        previous = DaggerRoundResult(
-            round_number=last.round_number,
-            deviations=(),
-            dev_utility=last.metrics.dev_utility,
-            cost_regret=last.metrics.cost_regret,
-            should_continue=last.status == "completed",
-            seen_keys=seen_artifact.keys,
-        )
-        current_source = Path(last.checkpoint.path)
-        current_source_hash = last.checkpoint.sha256
+            raise ValueError("current pointer does not match its round manifest")
+        current_checkpoint = store._round_path(last.round_number) / "checkpoint.pt"
+        current_identity = last.checkpoint_policy_identity
+        resumed = True
         if last.status == "stopped":
             return DAggerRunResult(
                 run_identity=run_identity,
                 status="stopped",
                 resumed=True,
-                final_checkpoint=current_source,
-                manifests=existing,
+                final_checkpoint=current_checkpoint,
+                manifests=tuple(manifests),
             )
-        policy = trainer.load_policy(
-            checkpoint=current_source,
-            base_dataset=dataset,
-            deviations=deviations,
-        )
-
-    manifests = list(existing)
-    start_round = len(existing) + 1
+    start_round = len(manifests) + 1
     for round_number in range(start_round, config.max_rounds + 1):
+        round_seen = set(seen)
         new: list[Deviation] = []
         for context in selected:
             new.extend(
@@ -686,7 +1051,9 @@ def run_dagger(
                     utility_graph=context.snapshot,
                     normalization=context.task9.normalization,
                     question_ids=(context.question_id,),
-                    seen_keys=seen,
+                    initial_replay_transitions=(context.initial_replay_transitions,),
+                    authorities=(context.deviation_authority,),
+                    seen_keys=round_seen,
                     budget_bin_width=config.budget_bin_width,
                     beam_size=config.beam_size,
                     max_depth=config.max_depth,
@@ -695,101 +1062,108 @@ def run_dagger(
         by_key = {item.state_key: item for item in deviations}
         for item in new:
             by_key.setdefault(item.state_key, item)
-        deviations = tuple(by_key[key] for key in sorted(by_key))
-        seen_artifact = _seen_artifact(run_identity, seen)
-        _write_model(seen_path, seen_artifact)
-
-        output_checkpoint = _checkpoint_path(config, round_number)
-        trained = trainer.train(
-            round_number=round_number,
-            base_dataset=dataset,
-            deviations=deviations,
-            new_deviations=tuple(new),
-            source_policy_checkpoint=current_source,
-            output_checkpoint=output_checkpoint,
-        )
-        actual_checkpoint = trained.checkpoint_path.resolve()
-        if actual_checkpoint != output_checkpoint.resolve():
-            raise ValueError("trainer returned an unexpected checkpoint path")
-        if (
-            not actual_checkpoint.is_file()
-            or actual_checkpoint.is_symlink()
-            or _sha256_file(actual_checkpoint) != trained.checkpoint_sha256
-        ):
-            raise ValueError("trainer checkpoint identity mismatch")
-        dev_utility, cost_regret = _average_dev_metrics(
-            dev, policy=trained.policy, config=config
-        )
-        should_continue = _should_continue(
-            round_number,
-            dev_utility,
-            cost_regret,
-            previous,
-            utility_gain_threshold=config.utility_gain_threshold,
-            regret_improvement_ratio=config.regret_improvement_ratio,
-        )
-        if round_number >= config.max_rounds:
-            should_continue = False
-            stop_reason: Literal[
-                "continue", "threshold_not_met", "max_rounds"
-            ] = "max_rounds"
-        elif not should_continue:
-            stop_reason = "threshold_not_met"
-        else:
-            stop_reason = "continue"
-        status: Literal["completed", "stopped"] = (
-            "completed" if should_continue else "stopped"
-        )
-        deviation_path = _deviation_path(config, round_number)
-        deviation_sha = _write_deviations(deviation_path, deviations)
-        manifest = _build_manifest(
-            run_identity=run_identity,
-            round_number=round_number,
-            status=status,
-            stop_reason=stop_reason,
-            source_policy=ArtifactReference(
-                path=str(current_source), sha256=current_source_hash
-            ),
-            checkpoint=ArtifactReference(
-                path=str(actual_checkpoint), sha256=trained.checkpoint_sha256
-            ),
-            base_dataset_identity=dataset.identity,
-            aggregated_dataset_identity=trained.aggregated_dataset_identity,
-            train_subset_question_ids=subset_ids,
-            train_subset_sha256=subset_hash,
-            context_identities=context_ids,
-            seen_keys_sha256=seen_artifact.artifact_sha256,
-            seen_key_count=len(seen),
-            deviation_artifact=ArtifactReference(
-                path=str(deviation_path), sha256=deviation_sha
-            ),
-            deviation_count=len(deviations),
-            new_deviation_count=len(new),
-            thresholds=RoundThresholds(
-                utility_gain=config.utility_gain_threshold,
-                regret_improvement_ratio=config.regret_improvement_ratio,
-            ),
-            metrics=RoundMetrics(dev_utility=dev_utility, cost_regret=cost_regret),
-        )
-        _write_model(_manifest_path(config, round_number), manifest)
+        round_deviations = tuple(by_key[key] for key in sorted(by_key))
+        staging = store.begin(round_number)
+        try:
+            shutil.copyfile(current_checkpoint, staging / "source.pt")
+            source_ref = _artifact_reference(staging / "source.pt")
+            if source_ref.sha256 != current_identity.checkpoint_sha256:
+                raise ValueError("source policy checkpoint identity mismatch")
+            output_checkpoint = staging / "checkpoint.pt"
+            trained = trainer.train(
+                round_number=round_number,
+                base_dataset=dataset,
+                deviations=round_deviations,
+                new_deviations=tuple(new),
+                source_policy_checkpoint=staging / "source.pt",
+                output_checkpoint=output_checkpoint,
+            )
+            if trained.checkpoint_path.resolve() != output_checkpoint.resolve():
+                raise ValueError("trainer returned an unexpected checkpoint path")
+            checkpoint_ref = _artifact_reference(output_checkpoint)
+            if checkpoint_ref.sha256 != trained.checkpoint_sha256:
+                raise ValueError("trainer checkpoint identity mismatch")
+            trained_identity = policy_identity(trained.policy, output_checkpoint)
+            aggregate_identity = trainer.dataset_identity(
+                base_dataset=dataset, deviations=round_deviations
+            )
+            if aggregate_identity != trained.aggregated_dataset_identity:
+                raise ValueError("trainer aggregated dataset identity mismatch")
+            metrics, entries = _average_dev_metrics(
+                dev, policy=trained.policy, config=config
+            )
+            status, stop_reason = _stop_decision(
+                round_number, metrics, previous_metrics, config
+            )
+            seen_artifact = _sealed(
+                _SeenKeysArtifact,
+                run_identity=run_identity,
+                round_number=round_number,
+                keys=tuple(sorted(round_seen)),
+            )
+            _write_model(staging / "seen.json", seen_artifact)
+            deviation_artifact = _sealed(
+                _DeviationArtifact,
+                run_identity=run_identity,
+                round_number=round_number,
+                deviations=round_deviations,
+                new_state_keys=tuple(sorted(item.state_key for item in new)),
+            )
+            _write_model(staging / "deviations.json", deviation_artifact)
+            dev_artifact = _sealed(
+                _DevArtifact,
+                run_identity=run_identity,
+                round_number=round_number,
+                context_metrics=entries,
+                metrics=metrics,
+            )
+            _write_model(staging / "dev.json", dev_artifact)
+            manifest = _build_manifest(
+                run_identity=run_identity,
+                round_number=round_number,
+                generation=_generation_relative(config, round_number),
+                manifest_path="manifest.json",
+                status=status,
+                stop_reason=stop_reason,
+                source_policy=source_ref,
+                source_policy_identity=current_identity,
+                checkpoint=checkpoint_ref,
+                checkpoint_policy_identity=trained_identity,
+                seen_keys=_artifact_reference(staging / "seen.json"),
+                dev_artifact=_artifact_reference(staging / "dev.json"),
+                deviation_artifact=_artifact_reference(staging / "deviations.json"),
+                base_dataset_identity=dataset.identity,
+                aggregated_dataset_identity=aggregate_identity,
+                train_subset_question_ids=subset_ids,
+                train_subset_sha256=subset_hash,
+                context_identities=context_ids,
+                seen_key_count=len(round_seen),
+                deviation_count=len(round_deviations),
+                new_deviation_count=len(new),
+                thresholds=RoundThresholds(
+                    utility_gain=config.utility_gain_threshold,
+                    regret_improvement_ratio=config.regret_improvement_ratio,
+                ),
+                metrics=metrics,
+                budget_bin_width=config.budget_bin_width,
+            )
+            final = store.commit(staging, manifest)
+        except Exception:
+            store.rollback(staging)
+            raise
         manifests.append(manifest)
-        previous = DaggerRoundResult(
-            round_number=round_number,
-            deviations=(),
-            dev_utility=dev_utility,
-            cost_regret=cost_regret,
-            should_continue=should_continue,
-            seen_keys=tuple(sorted(seen)),
-        )
+        deviations = round_deviations
+        seen = round_seen
         policy = trained.policy
-        current_source = actual_checkpoint
-        current_source_hash = trained.checkpoint_sha256
-        if not should_continue:
+        current_checkpoint = final / "checkpoint.pt"
+        current_identity = trained_identity
+        previous_metrics = metrics
+        if status == "stopped":
             return DAggerRunResult(
                 run_identity=run_identity,
                 status="stopped",
                 resumed=resumed,
-                final_checkpoint=current_source,
+                final_checkpoint=current_checkpoint,
                 manifests=tuple(manifests),
             )
     raise RuntimeError("DAgger round loop ended without a stop decision")
@@ -801,6 +1175,7 @@ __all__ = [
     "DAggerQuestionContext",
     "DAggerRoundManifest",
     "DAggerRunResult",
+    "DaggerRoundStore",
     "PolicyTrainer",
     "PolicyTrainingResult",
     "Task10DaggerProvenance",

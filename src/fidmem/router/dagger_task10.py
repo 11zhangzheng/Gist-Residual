@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from fidmem.agent.runner import RouterPolicy
 
 from .dagger_core import BCPolicy, Deviation
+from fidmem.oracle.search import action_signature
 from .dagger_workflow import DAggerConfig, PolicyTrainingResult
 from .dataset import (
     HFTokenizerAdapter,
@@ -34,8 +35,20 @@ from .train_bc import (
 )
 
 ModelFactory = Callable[[], MemoryRouter | tuple[MemoryRouter, TextTokenizer]]
-RecordMaterializer = Callable[[Deviation], OracleBCRecord]
+RecordMaterializer = Callable[[Deviation], "MaterializedDeviationRecord"]
 TrainFunction = Callable[..., TrainResult]
+
+
+class MaterializedDeviationRecord(BaseModel):
+    """Task 10 row plus Task 11 cross-check fields; no label can be swapped."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    deviation_state_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    deviation_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acquired_observation_keys: tuple[str, ...]
+    action_signatures: tuple[str, ...] = Field(min_length=1)
+    record: OracleBCRecord
 
 
 class DAggerFileConfig(BaseModel):
@@ -69,6 +82,15 @@ def load_dagger_file(
     model_config = RouterModelConfig.model_validate(model_raw)
     if file_config.training.device not in {"cpu", "cuda"}:
         raise ValueError("Task 10 training device is invalid")
+    training_root = file_config.training.artifact_root.resolve()
+    dagger_root = file_config.dagger.artifact_root.resolve()
+    if training_root != dagger_root:
+        raise ValueError("Task 10 and DAgger artifact roots must match")
+    if (
+        file_config.training.validated_checkpoint_path()
+        != file_config.dagger.bootstrap_path
+    ):
+        raise ValueError("training checkpoint_path must be the DAgger bootstrap")
     return model_config, file_config
 
 
@@ -106,6 +128,62 @@ class Task10PolicyTrainer:
         self._record_materializer = record_materializer
         self._train_function = train_function
 
+    def _materialized_record(
+        self, deviation: Deviation, base_dataset: OracleBCDataset
+    ) -> OracleBCRecord:
+        materialized = self._record_materializer(deviation)
+        if not isinstance(materialized, MaterializedDeviationRecord):
+            raise TypeError(
+                "record materializer must return MaterializedDeviationRecord"
+            )
+        if deviation.authority is None:
+            raise ValueError("Task 10 materialization requires deviation authority")
+        authority = deviation.authority
+        if (
+            authority.base_dataset_identity != base_dataset.identity
+            or authority.base_record_id
+            not in {record.record_id for record in base_dataset.records}
+        ):
+            raise ValueError("deviation authority does not match base dataset")
+        record = materialized.record
+        if (
+            materialized.deviation_state_key != deviation.state_key
+            or materialized.deviation_state_sha256 != deviation.state_sha256
+            or materialized.acquired_observation_keys
+            != deviation.acquired_observation_keys
+            or materialized.action_signatures != deviation.action_signatures
+            or tuple(action_signature(item) for item in record.action_instances)
+            != deviation.action_signatures
+            or record.question_id != deviation.question_id
+            or record.video_id != authority.video_group_id
+            or record.observation_snapshot_id != authority.observation_snapshot_id
+            or record.state != deviation.state
+            or record.legal_action_mask != deviation.legal_action_mask
+            or record.action_instances != deviation.action_instances
+        ):
+            raise ValueError(
+                "materialized record does not match deviation state/context"
+            )
+        if (
+            record.action_instances[record.target_action_index]
+            != deviation.oracle_action
+        ):
+            raise ValueError("materialized target action is not the Oracle action")
+        provenance = record.provenance
+        expected = {
+            "dataset_manifest_hash": authority.dataset_manifest_hash,
+            "source_manifest_hash": authority.source_manifest_hash,
+            "asset_sha256": authority.asset_sha256,
+            "group_assignment_sha256": authority.group_assignment_sha256,
+            "longroute_example_sha256": authority.longroute_example_sha256,
+            "normalization_manifest_hash": authority.normalization_manifest_hash,
+            "preference_set_hash": authority.preference_set_hash,
+        }
+        actual = {name: getattr(provenance, name) for name in expected}
+        if actual != expected:
+            raise ValueError("materialized record provenance does not match deviation")
+        return record
+
     def _aggregate(
         self,
         base_dataset: OracleBCDataset,
@@ -114,9 +192,15 @@ class Task10PolicyTrainer:
         if not all(isinstance(deviation, Deviation) for deviation in deviations):
             raise TypeError("Task 10 adapter requires validated DAgger deviations")
         records = tuple(base_dataset.records) + tuple(
-            self._record_materializer(deviation) for deviation in deviations
+            self._materialized_record(deviation, base_dataset)
+            for deviation in deviations
         )
         return OracleBCDataset(records)
+
+    def dataset_identity(
+        self, *, base_dataset: OracleBCDataset, deviations: tuple[Deviation, ...]
+    ) -> str:
+        return self._aggregate(base_dataset, deviations).identity
 
     def _round_config(self, output_checkpoint: Path) -> TrainConfig:
         return TrainConfig.model_validate(
@@ -240,6 +324,7 @@ def build_task10_policy_trainer(
 
 __all__ = [
     "DAggerFileConfig",
+    "MaterializedDeviationRecord",
     "Task10PolicyTrainer",
     "build_task10_policy_trainer",
     "load_dagger_file",

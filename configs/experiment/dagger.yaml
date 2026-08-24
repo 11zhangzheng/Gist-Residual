@@ -1,0 +1,31 @@
+model_config_path: ../model/router.yaml
+model_overrides:
+  encoder:
+    kind: test
+    model_id: offline-smoke-encoder-v1
+    revision: offline-test-v1
+    tokenizer:
+      implementation: fidmem.byte-utf8.v1
+      model_id: offline-smoke-encoder-v1
+      revision: offline-byte-v1
+      vocab_sha256: 7ed9e54a2ee1ad3205a78fd13daa9ceb7cf8e37c69b83f103f46ccf41303c25a
+      artifact_sha256: 1e4d5d30c9ca55cfb556febaca1a7b0c46005f4cbeab797b5727d97864fc4444
+    trust_remote_code: false
+  encoder_output_dim: 48
+  hidden_dim: 64
+  action_type_embedding_dim: 16
+  fidelity_embedding_dim: 8
+  max_question_tokens: 128
+  max_item_tokens: 96
+  production: false
+  enforce_parameter_range: false
+dagger:
+  max_rounds: 2
+  beam_size: 8
+  max_depth: 5
+  utility_gain_threshold: 0.005
+  regret_improvement_ratio: 0.02
+  device: cpu
+  train_question_subset_fraction: 1.0
+  normalization_path: artifacts/oracle-cost-normalization.json
+  seen_keys_path: artifacts/dagger-seen-keys.json

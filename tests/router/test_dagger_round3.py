@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 import fidmem.router.dagger_workflow as workflow
-from fidmem.router.dagger import DAggerConfig, run_dagger
+from fidmem.router.dagger import DAggerConfig, IndeterminateCommitOutcome, run_dagger
 
 from tests.router.test_dagger_round2_workflow import _run
 from tests.router.test_dagger_workflow import SpyTrainer, _always_stop, _contexts
@@ -31,7 +31,7 @@ def _rewrite_sealed(path: Path, payload: dict[str, object], hash_field: str) -> 
     path.write_bytes(_canonical_bytes(body) + b"\n")
 
 
-def test_failure_before_current_replace_rolls_back_generation(
+def test_failure_before_current_replace_preserves_retryable_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = DAggerConfig(artifact_root=tmp_path)
@@ -62,8 +62,66 @@ def test_failure_before_current_replace_rolls_back_generation(
     pointer = json.loads((tmp_path / "current.json").read_text(encoding="utf-8"))
     assert pointer["round_number"] == 1
     assert (tmp_path / "generations" / "round-0001").is_dir()
-    assert not (tmp_path / "generations" / "round-0002").exists()
+    assert (tmp_path / "generations" / "round-0002").is_dir()
     assert not tuple((tmp_path / "generations").glob("*.staging"))
+
+    monkeypatch.setattr(workflow.os, "replace", real_replace)
+    retried_trainer = SpyTrainer()
+    retried = _run(tmp_path, retried_trainer)
+    assert retried.resumed is True
+    assert retried.manifests[-1].round_number == 2
+    assert retried_trainer.aggregate_sizes == []
+
+
+def test_replace_then_raise_with_transient_pointer_read_is_indeterminate_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_replace = os.replace
+    real_load_pointer = workflow.DaggerRoundStore.load_pointer
+    replace_raised = False
+    pointer_read_failed = False
+
+    def replace_then_raise_once(source: str | Path, target: str | Path) -> None:
+        nonlocal replace_raised
+        real_replace(source, target)
+        if (
+            Path(target).resolve() == (tmp_path / "current.json").resolve()
+            and not replace_raised
+        ):
+            replace_raised = True
+            raise OSError("injected after current replace")
+
+    def fail_first_pointer_read(store: workflow.DaggerRoundStore):
+        nonlocal pointer_read_failed
+        if replace_raised and not pointer_read_failed:
+            pointer_read_failed = True
+            raise OSError("injected transient pointer read failure")
+        return real_load_pointer(store)
+
+    monkeypatch.setattr(workflow.os, "replace", replace_then_raise_once)
+    monkeypatch.setattr(
+        workflow.DaggerRoundStore, "load_pointer", fail_first_pointer_read
+    )
+    trainer = SpyTrainer()
+
+    with pytest.raises(IndeterminateCommitOutcome, match="indeterminate") as caught:
+        _run(tmp_path, trainer)
+
+    assert type(caught.value).__name__ == "IndeterminateCommitOutcome"
+    assert trainer.aggregate_sizes == [1]
+    pointer = json.loads((tmp_path / "current.json").read_text(encoding="utf-8"))
+    generation = tmp_path / pointer["generation"]
+    assert pointer["round_number"] == 1
+    assert generation.is_dir()
+    assert (generation / "manifest.json").is_file()
+
+    monkeypatch.setattr(workflow.os, "replace", real_replace)
+    monkeypatch.setattr(workflow.DaggerRoundStore, "load_pointer", real_load_pointer)
+    resumed_trainer = SpyTrainer()
+    resumed = _run(tmp_path, resumed_trainer)
+    assert resumed.resumed is True
+    assert resumed.manifests[-1].round_number == 2
+    assert resumed_trainer.aggregate_sizes == [1]
 
 
 def test_failure_after_current_replace_is_committed_with_durability_warning(
@@ -178,6 +236,8 @@ def test_resume_rejects_missing_predecessor_generation(tmp_path: Path) -> None:
         ("generations/bootstrap.pt", "generations", "current.json"),
         ("bootstrap.pt", "generations", "generations/current.json"),
         ("current.json", "generations", "current.json"),
+        ("key", "generations", "key/current.json"),
+        ("key/bootstrap.pt", "generations", "key"),
     ),
 )
 def test_config_rejects_critical_path_overlap(

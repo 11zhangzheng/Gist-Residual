@@ -406,9 +406,9 @@ class DAggerConfig(BaseModel):
         for key_file in (bootstrap, current):
             if key_file.exists() and not key_file.is_file():
                 raise ValueError("DAgger key artifact paths must be files")
-        if bootstrap == current:
+        if _paths_overlap(bootstrap, current):
             raise ValueError(
-                "bootstrap checkpoint and current pointer must be distinct"
+                "bootstrap checkpoint and current pointer must not overlap"
             )
         if _paths_overlap(generations, bootstrap) or _paths_overlap(
             generations, current
@@ -708,6 +708,10 @@ class GenerationCommitOutcome:
     durability_warning: str | None = None
 
 
+class IndeterminateCommitOutcome(RuntimeError):
+    """Pointer replacement was attempted but its outcome cannot be confirmed."""
+
+
 class CommittedGenerationVerificationError(RuntimeError):
     """The pointer crossed the commit boundary but verification failed."""
 
@@ -730,18 +734,13 @@ class DaggerRoundStore:
         return self.generations / f".{_generation_name(round_number)}.staging"
 
     def recover(self) -> None:
-        current_round = 0
         if self.current.exists():
-            current_round = self.load_pointer().round_number
+            self.load_pointer()
         for candidate in self.generations.iterdir():
             if candidate.name.startswith(".round-") and candidate.name.endswith(
                 ".staging"
             ):
                 self._remove(candidate)
-        for round_number in range(current_round + 1, self.config.max_rounds + 1):
-            orphan = self._round_path(round_number)
-            if orphan.exists():
-                self._remove(orphan)
 
     def _remove(self, candidate: Path) -> None:
         resolved_parent = candidate.parent.resolve()
@@ -783,11 +782,16 @@ class DaggerRoundStore:
             pointer_sha256=_sha256_bytes(_canonical_json(pointer_body).encode("utf-8")),
         )
 
-    def _pointer_matches(self, expected: _CurrentPointer) -> bool:
+    def _pointer_state(
+        self, expected: _CurrentPointer
+    ) -> Literal["matches", "different", "unknown"]:
         try:
-            return self.load_pointer() == expected
-        except (OSError, ValueError):
-            return False
+            current = self.load_pointer()
+        except OSError:
+            return "unknown"
+        except ValueError:
+            return "different"
+        return "matches" if current == expected else "different"
 
     def _verify_committed_generation(
         self,
@@ -795,7 +799,10 @@ class DaggerRoundStore:
         manifest: DAggerRoundManifest,
         pointer: _CurrentPointer,
     ) -> None:
-        if not self._pointer_matches(pointer):
+        pointer_state = self._pointer_state(pointer)
+        if pointer_state == "unknown":
+            raise OSError("current pointer could not be read for verification")
+        if pointer_state != "matches":
             raise ValueError("current pointer does not identify committed generation")
         manifest_path = final / "manifest.json"
         if not manifest_path.is_file() or manifest_path.is_symlink():
@@ -824,6 +831,10 @@ class DaggerRoundStore:
     ) -> GenerationCommitOutcome:
         try:
             self._verify_committed_generation(final, manifest, pointer)
+        except OSError as verification_error:
+            raise IndeterminateCommitOutcome(
+                "pointer replacement outcome is indeterminate; generation was preserved"
+            ) from verification_error
         except Exception as verification_error:
             raise CommittedGenerationVerificationError(
                 "current pointer was replaced, but committed generation verification failed"
@@ -837,24 +848,14 @@ class DaggerRoundStore:
             ),
         )
 
-    def commit(
-        self, staging: Path, manifest: DAggerRoundManifest
+    def _publish_pointer(
+        self,
+        *,
+        final: Path,
+        manifest: DAggerRoundManifest,
+        cleanup_if_unattempted: bool,
     ) -> GenerationCommitOutcome:
-        final = self._round_path(manifest.round_number)
-        _write_model(staging / "manifest.json", manifest)
-        for child in staging.iterdir():
-            if child.is_symlink() or not child.is_file():
-                raise ValueError("generation contains an unsafe artifact")
-            with child.open("rb+") as handle:
-                os.fsync(handle.fileno())
-        _fsync_directory(staging)
-        try:
-            os.replace(staging, final)
-        except Exception:
-            if final.exists() and not staging.exists():
-                self._remove(final)
-            raise
-        committed = False
+        replace_attempted = False
         pointer_temporary: Path | None = None
         try:
             _fsync_directory(self.generations)
@@ -874,18 +875,23 @@ class DaggerRoundStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
+                replace_attempted = True
                 os.replace(pointer_temporary, self.current)
             except Exception as error:
-                if self._pointer_matches(pointer):
-                    committed = True
+                pointer_state = self._pointer_state(pointer)
+                if pointer_state == "matches":
                     return self._warning_outcome(
                         final=final,
                         manifest=manifest,
                         pointer=pointer,
                         error=error,
                     )
+                if pointer_state == "unknown":
+                    raise IndeterminateCommitOutcome(
+                        "pointer replacement outcome is indeterminate; "
+                        "generation was preserved"
+                    ) from error
                 raise
-            committed = True
             try:
                 _fsync_directory(self.root)
             except Exception as error:
@@ -899,8 +905,43 @@ class DaggerRoundStore:
         finally:
             if pointer_temporary is not None:
                 pointer_temporary.unlink(missing_ok=True)
-            if not committed and final.exists():
+            if cleanup_if_unattempted and not replace_attempted and final.exists():
                 self._remove(final)
+
+    def publish_existing(
+        self, manifest: DAggerRoundManifest
+    ) -> GenerationCommitOutcome:
+        final = self._round_path(manifest.round_number)
+        if not final.is_dir() or final.is_symlink():
+            raise ValueError("retryable DAgger generation is missing or unsafe")
+        return self._publish_pointer(
+            final=final,
+            manifest=manifest,
+            cleanup_if_unattempted=False,
+        )
+
+    def commit(
+        self, staging: Path, manifest: DAggerRoundManifest
+    ) -> GenerationCommitOutcome:
+        final = self._round_path(manifest.round_number)
+        _write_model(staging / "manifest.json", manifest)
+        for child in staging.iterdir():
+            if child.is_symlink() or not child.is_file():
+                raise ValueError("generation contains an unsafe artifact")
+            with child.open("rb+") as handle:
+                os.fsync(handle.fileno())
+        _fsync_directory(staging)
+        try:
+            os.replace(staging, final)
+        except Exception:
+            if final.exists() and not staging.exists():
+                self._remove(final)
+            raise
+        return self._publish_pointer(
+            final=final,
+            manifest=manifest,
+            cleanup_if_unattempted=True,
+        )
 
     def load_pointer(self) -> _CurrentPointer:
         if not self.current.is_file() or self.current.is_symlink():
@@ -1255,6 +1296,49 @@ def run_dagger(
             )
     start_round = len(manifests) + 1
     for round_number in range(start_round, config.max_rounds + 1):
+        final = store._round_path(round_number)
+        if final.exists():
+            (
+                manifest,
+                round_deviations,
+                round_seen,
+                recovered_policy,
+            ) = _load_generation(
+                store=store,
+                round_number=round_number,
+                run_identity=run_identity,
+                dataset=dataset,
+                trainer=trainer,
+                subset_ids=subset_ids,
+                subset_hash=subset_hash,
+                context_ids=context_ids,
+                dev_context_ids=dev_context_ids,
+                source_identity=current_identity,
+                previous_metrics=previous_metrics,
+                previous_manifest=manifests[-1] if manifests else None,
+                previous_deviation_keys={item.state_key for item in deviations},
+            )
+            outcome = store.publish_existing(manifest)
+            if outcome.durability_warning is not None:
+                durability_warnings.append(outcome.durability_warning)
+            manifests.append(manifest)
+            deviations = round_deviations
+            seen = round_seen
+            policy = recovered_policy
+            current_checkpoint = outcome.generation / "checkpoint.pt"
+            current_identity = manifest.checkpoint_policy_identity
+            previous_metrics = manifest.metrics
+            resumed = True
+            if manifest.status == "stopped":
+                return DAggerRunResult(
+                    run_identity=run_identity,
+                    status="stopped",
+                    resumed=True,
+                    final_checkpoint=current_checkpoint,
+                    manifests=tuple(manifests),
+                    durability_warnings=tuple(durability_warnings),
+                )
+            continue
         round_seen = set(seen)
         new: list[Deviation] = []
         for context in selected:
@@ -1401,6 +1485,7 @@ __all__ = [
     "DAggerRoundManifest",
     "DAggerRunResult",
     "DaggerRoundStore",
+    "IndeterminateCommitOutcome",
     "PolicyTrainer",
     "PolicyTrainingResult",
     "Task10DaggerProvenance",

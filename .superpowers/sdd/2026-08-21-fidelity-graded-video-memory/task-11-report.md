@@ -1,6 +1,6 @@
 # Task 11 implementation report
 
-Status: ROUND3_DONE
+Status: ROUND4_DONE
 
 ## Scope and design
 
@@ -215,17 +215,19 @@ Status: ROUND3_DONE
 
 ### Scope and design changes
 
-- `current.json` replacement is now the sole irreversible commit point. Any
-  generation-directory flush, pointer preparation, or replace failure before
-  that point removes the new final generation and leaves the verified prior
-  pointer/generation unchanged. Immediately after replacement, `committed` is
-  true; no later cleanup can remove the published generation.
-- A post-replace exception (including root-directory fsync failure or a replace
-  wrapper that raises after completing the syscall) rereads and validates the
-  current pointer, manifest, and every referenced generation artifact. It
-  returns `GenerationCommitOutcome(durable=False)` and exposes the explicit
-  message through `DAggerRunResult.durability_warnings`. It does not claim
-  durability, delete the generation, or make retry/resume fail.
+- `current.json` replacement is the atomic publication operation, but the
+  wrapper return is not a sole observable commit point. Generation-directory
+  flush and pointer preparation failures may clean the new final generation
+  only while pointer replacement has not been invoked. Immediately before
+  invocation, `replace_attempted` becomes true; every later path preserves the
+  generation because publication may already have occurred.
+- A post-replace exception that can be confirmed by rereading and validating
+  the current pointer, manifest, and every referenced artifact returns
+  `GenerationCommitOutcome(durable=False)` and exposes a warning through
+  `DAggerRunResult.durability_warnings`. If pointer reread is unavailable, the
+  outcome is explicitly indeterminate rather than false. Neither case deletes
+  the generation or claims durability; root-directory synchronization is still
+  required for a durability guarantee.
 - Round manifests use schema 3 and bind
   `previous_generation_id/previous_generation_manifest_sha256`. Resume walks
   from round 1, verifies that exact chain, validates that predecessor deviation
@@ -276,3 +278,72 @@ fsync failure, followed by safe retry.
   pre-existing files (`dataset.py`, `test_review_round3.py`) and they were not
   modified.
 - `git diff --check` -> exit 0, no output.
+
+## Round 4: indeterminate pointer publication and key-path separation
+
+Status: ROUND4_DONE
+
+### Scope and design changes
+
+- Pointer publication now records `replace_attempted=True` immediately before
+  invoking `os.replace`. Once invocation has been attempted, every exception
+  path retains the immutable generation; only failures that are known to occur
+  before entering the pointer replace may clean a newly finalized generation.
+- A replace wrapper that raises after the syscall and an unavailable pointer
+  reread now produce the explicit `IndeterminateCommitOutcome`. This outcome
+  neither claims publication nor durability, and it never removes the
+  generation. A confirmed matching pointer still returns
+  `GenerationCommitOutcome(durable=False)` when root durability confirmation
+  fails.
+- Recovery removes incomplete staging directories but preserves finalized
+  generations. If `current.json` already identifies the retained generation,
+  normal resume validates it. If the pointer is still old or absent, the exact
+  next orphan is fully revalidated through the manifest predecessor chain,
+  every artifact hash, dataset/policy identity, derived counts, thresholds, and
+  stop decision before the pointer is retried. A matching orphan is reused
+  without `PolicyTrainer.train`; any mismatch fails closed.
+- `bootstrap_checkpoint` and `current_pointer` now use the same resolved
+  bidirectional `_paths_overlap` check. Nonexistent ancestor/descendant pairs
+  such as `key` and `key/current.json`, the reverse direction, and resolved
+  symlink aliases are rejected.
+
+### RED / GREEN ledger
+
+Initial Round 4 RED:
+
+`D:\Anaconda\python.exe -m pytest tests/router/test_dagger_round3.py -q`
+
+Result: `4 failed, 14 passed, 1 skipped in 5.23s`. The failures proved that a
+replace-after-syscall exception plus a transient first pointer read deleted the
+published generation, a replace-before-syscall wrapper failure deleted instead
+of preserving a retryable orphan, and both bootstrap/current ancestor
+directions were accepted.
+
+Final Round 4 focused file:
+
+`D:\Anaconda\python.exe -m pytest tests/router/test_dagger_round3.py -q`
+
+Result: `18 passed, 1 skipped in 7.18s`. The matched-orphan retry asserts that
+round 2 is republished with no training calls; the indeterminate-outcome retry
+asserts that `current.json` never dangles and the next run resumes round 1
+before completing round 2.
+
+### Final Round 4 verification
+
+- Every Task 11 DAgger file: `50 passed, 1 skipped in 8.15s`.
+- Full Router suite: `104 passed, 1 skipped in 72.69s`.
+- Full default environment, no OMP/MKL workaround:
+  `356 passed, 2 skipped in 75.41s` (under the 180-second bound).
+- `D:\Anaconda\python.exe -m compileall -q src tests` -> exit 0.
+- Scoped Ruff check -> exit 0; scoped format check ->
+  `3 files already formatted`.
+- `git diff --check` -> exit 0, no output.
+
+### Residual limits
+
+- After a pointer replace attempt, process-local observation cannot always
+  distinguish committed from uncommitted state. `IndeterminateCommitOutcome`
+  is therefore intentional; durability is not guaranteed until directory
+  synchronization completes, and retry performs authoritative disk validation.
+- The real symlink probe remains skipped on this Windows host when unprivileged
+  directory symlink creation is unavailable.

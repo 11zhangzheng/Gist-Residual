@@ -23,8 +23,9 @@ def _state_sha256(state:RouterState)->str:
     payload=json.dumps(state.model_dump(mode="json"),ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 class AgentRunner:
-    def __init__(self,environment:MemoryEnvironment,policy:RouterPolicy,answerer:FrozenAnswerer,*,run_store:RunStore|None=None,artifact_dir:Path|str|None=None,worker_id:str="agent-runner")->None:
-        self.environment=environment;self.policy=policy;self.answerer=answerer;self.run_store=run_store;self.artifact_dir=Path(artifact_dir) if artifact_dir is not None else None;self.worker_id=worker_id
+    def __init__(self,environment:MemoryEnvironment,policy:RouterPolicy,answerer:FrozenAnswerer,*,run_store:RunStore|None=None,artifact_dir:Path|str|None=None,worker_id:str="agent-runner",max_transitions:int=5)->None:
+        if not isinstance(max_transitions,int) or isinstance(max_transitions,bool) or max_transitions<2: raise ValueError("max_transitions must be an integer of at least two")
+        self.environment=environment;self.policy=policy;self.answerer=answerer;self.run_store=run_store;self.artifact_dir=Path(artifact_dir) if artifact_dir is not None else None;self.worker_id=worker_id;self.max_transitions=max_transitions
         if run_store is not None and self.artifact_dir is None: raise ValueError("artifact_dir is required with RunStore")
     @staticmethod
     def _key(step:int)->str:return f"transition-{step:03d}"
@@ -44,7 +45,7 @@ class AgentRunner:
     def _restore(self,initial:RouterState,run:str)->tuple[list[EnvironmentTransition],RouterState]:
         if self.run_store is None:return [],initial
         state=initial;out=[]
-        for step in range(5):
+        for step in range(self.max_transitions):
             item=self.run_store.item(run,self._key(step))
             if item is None or item.status!="complete":break
             tr=self._load_transition(item.output_uri)
@@ -76,16 +77,16 @@ class AgentRunner:
         except BaseException as error:self._fail(run,key,error);raise
         return RunResult(transitions=tuple(trs),answer=answer,final_state=state,forced_stop=forced)
     def run(self,initial_state:RouterState,*,run_id:str)->RunResult:
-        trs,state=self._restore(initial_state,run_id);forced=bool(len(trs)==5 and trs[-1].terminal)
+        trs,state=self._restore(initial_state,run_id);forced=bool(len(trs)==self.max_transitions and trs[-1].terminal)
         if trs and trs[-1].terminal:return self._answer(state,trs,run_id,forced)
-        for step in range(len(trs),5):
+        for step in range(len(trs),self.max_transitions):
             legal=self.environment.valid_actions(state)
             if not legal:raise RuntimeError("non-terminal state has no legal action")
             key=self._key(step);self._claim(run_id,key)
             try:
-                if step==4:
+                if step==self.max_transitions-1:
                     selected=ActionInstance(ActionType.STOP,None,None)
-                    if selected not in legal:raise RuntimeError("fifth transition requires STOP")
+                    if selected not in legal:raise RuntimeError("final transition requires STOP")
                     forced=True
                 else:
                     selected=self.policy(state,legal)

@@ -25,9 +25,14 @@ ERROR_PRIORITY = (
 
 
 class ErrorSignals(BaseModel):
-    """Signals produced by benchmark/oracle audits, never caller labels."""
+    """Signals derived from a validated trajectory and frozen Oracle authority."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        revalidate_instances="always",
+    )
 
     gist_top_k_contains_answer: bool
     oracle_evidence_sufficient: bool = False
@@ -42,14 +47,17 @@ class ErrorSignals(BaseModel):
             self.answerer_correct_with_oracle_evidence is not None
             and not self.oracle_evidence_sufficient
         ):
-            raise ValueError(
-                "Answerer correctness requires Oracle-sufficient evidence"
-            )
+            raise ValueError("Answerer correctness requires Oracle-sufficient evidence")
         return self
 
 
 class ErrorClassification(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        revalidate_instances="always",
+    )
 
     primary: ErrorCause | None
     secondary: tuple[ErrorCause, ...]
@@ -74,18 +82,22 @@ def _active_causes(signals: ErrorSignals) -> tuple[ErrorCause, ...]:
 
 
 def classify_error(
-    signals: ErrorSignals, *, invalid: bool = False
+    signals: ErrorSignals,
+    *,
+    invalid: bool = False,
+    correct: bool = False,
 ) -> ErrorClassification:
-    """Choose the first active cause in the frozen priority order.
+    """Classify only valid incorrect outcomes; retain efficiency flags on correct."""
 
-    Invalid samples are reported separately because their outcome is not an
-    ordinary controller/answering error. Secondary flags retain every active
-    auditable cause for trajectory analysis.
-    """
-
+    validated = ErrorSignals.model_validate(signals.model_dump(mode="python"))
     if invalid:
         return ErrorClassification(primary=None, secondary=())
-    active = _active_causes(signals)
+    active = _active_causes(validated)
+    if correct:
+        secondary = (
+            (ErrorCause.OVER_RETRIEVAL,) if ErrorCause.OVER_RETRIEVAL in active else ()
+        )
+        return ErrorClassification(primary=None, secondary=secondary)
     return ErrorClassification(
         primary=next((cause for cause in ERROR_PRIORITY if cause in active), None),
         secondary=tuple(cause for cause in ERROR_PRIORITY if cause in active),

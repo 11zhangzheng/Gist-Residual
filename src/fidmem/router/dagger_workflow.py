@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from fidmem.actions.environment import EnvironmentTransition, MemoryEnvironment
 from fidmem.agent.runner import RouterPolicy
@@ -327,6 +327,18 @@ def select_train_question_subset(
     return ordered[:count]
 
 
+def _path_has_symlink_component(path: Path) -> bool:
+    absolute = path.absolute()
+    candidates = (absolute, *absolute.parents)
+    return any(candidate.is_symlink() for candidate in candidates)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return (
+        first == second or first.is_relative_to(second) or second.is_relative_to(first)
+    )
+
+
 class DAggerConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
@@ -344,6 +356,21 @@ class DAggerConfig(BaseModel):
     train_question_subset_seed: int = 2026
     budget_bin_width: float = Field(default=1.0, gt=0)
 
+    @field_validator(
+        "artifact_root",
+        "bootstrap_checkpoint",
+        "generations_dir",
+        "current_pointer",
+        mode="before",
+    )
+    @classmethod
+    def paths_have_strict_types(cls, value: object) -> object:
+        if not isinstance(value, (str, Path)) or (
+            isinstance(value, str) and not value.strip()
+        ):
+            raise ValueError("DAgger paths must be non-empty strings or Path values")
+        return value
+
     def resolve_path(self, value: Path, *, directory: bool = False) -> Path:
         root = self.artifact_root.resolve()
         if value.is_absolute() or ".." in value.parts:
@@ -359,9 +386,34 @@ class DAggerConfig(BaseModel):
     def paths_are_contained(self) -> "DAggerConfig":
         if self.min_rounds > self.max_rounds:
             raise ValueError("min_rounds cannot exceed max_rounds")
-        self.resolve_path(self.bootstrap_checkpoint)
-        self.resolve_path(self.generations_dir, directory=True)
-        self.resolve_path(self.current_pointer)
+        unresolved_root = self.artifact_root.absolute()
+        if _path_has_symlink_component(unresolved_root):
+            raise ValueError("artifact_root must not use a symlink alias")
+        if unresolved_root.exists() and not unresolved_root.is_dir():
+            raise ValueError("artifact_root must be a directory")
+        bootstrap = self.resolve_path(self.bootstrap_checkpoint)
+        generations = self.resolve_path(self.generations_dir, directory=True)
+        current = self.resolve_path(self.current_pointer)
+        for unresolved in (
+            unresolved_root / self.bootstrap_checkpoint,
+            unresolved_root / self.generations_dir,
+            unresolved_root / self.current_pointer,
+        ):
+            if _path_has_symlink_component(unresolved):
+                raise ValueError("DAgger artifact paths must not use symlink aliases")
+        if generations.exists() and not generations.is_dir():
+            raise ValueError("generations_dir must be a directory")
+        for key_file in (bootstrap, current):
+            if key_file.exists() and not key_file.is_file():
+                raise ValueError("DAgger key artifact paths must be files")
+        if bootstrap == current:
+            raise ValueError(
+                "bootstrap checkpoint and current pointer must be distinct"
+            )
+        if _paths_overlap(generations, bootstrap) or _paths_overlap(
+            generations, current
+        ):
+            raise ValueError("generations_dir must not overlap key artifact paths")
         return self
 
     @property
@@ -439,10 +491,12 @@ class RoundThresholds(BaseModel):
 class DAggerRoundManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     run_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     round_number: int = Field(ge=1, le=3)
     generation: str = Field(min_length=1)
+    previous_generation_id: str | None
+    previous_generation_manifest_sha256: str | None
     manifest_path: Literal["manifest.json"] = "manifest.json"
     status: Literal["completed", "stopped"]
     stop_reason: Literal["continue", "threshold_not_met", "max_rounds"]
@@ -468,6 +522,33 @@ class DAggerRoundManifest(BaseModel):
 
     @model_validator(mode="after")
     def self_hash_matches(self) -> "DAggerRoundManifest":
+        if self.round_number == 1:
+            if (
+                self.previous_generation_id is not None
+                or self.previous_generation_manifest_sha256 is not None
+            ):
+                raise ValueError("round one must not claim a previous generation")
+        elif (
+            self.previous_generation_id is None
+            or self.previous_generation_manifest_sha256 is None
+        ):
+            raise ValueError("later rounds must bind a previous generation")
+        if self.previous_generation_id is not None:
+            previous = Path(self.previous_generation_id)
+            if (
+                previous.is_absolute()
+                or ".." in previous.parts
+                or previous.as_posix() != self.previous_generation_id
+            ):
+                raise ValueError("previous generation identity is not canonical")
+        if self.previous_generation_manifest_sha256 is not None and (
+            len(self.previous_generation_manifest_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.previous_generation_manifest_sha256
+            )
+        ):
+            raise ValueError("previous generation manifest identity is invalid")
         expected = _sha256_bytes(
             _canonical_json(
                 self.model_dump(mode="json", exclude={"manifest_sha256"})
@@ -485,6 +566,7 @@ class DAggerRunResult(BaseModel):
     resumed: bool
     final_checkpoint: Path
     manifests: tuple[DAggerRoundManifest, ...] = Field(min_length=1)
+    durability_warnings: tuple[str, ...] = ()
 
 
 class _SeenKeysArtifact(BaseModel):
@@ -605,7 +687,7 @@ def _build_manifest(**payload: object) -> DAggerRoundManifest:
         key: value.model_dump(mode="json") if isinstance(value, BaseModel) else value
         for key, value in payload.items()
     }
-    body = {"schema_version": 2, **normalized}
+    body = {"schema_version": 3, **normalized}
     digest = _sha256_bytes(_canonical_json(body).encode("utf-8"))
     return DAggerRoundManifest(**body, manifest_sha256=digest)
 
@@ -616,6 +698,18 @@ def _generation_name(round_number: int) -> str:
 
 def _generation_relative(config: DAggerConfig, round_number: int) -> str:
     return (config.generations_dir / _generation_name(round_number)).as_posix()
+
+
+@dataclass(frozen=True)
+class GenerationCommitOutcome:
+    generation: Path
+    committed: Literal[True] = True
+    durable: bool = True
+    durability_warning: str | None = None
+
+
+class CommittedGenerationVerificationError(RuntimeError):
+    """The pointer crossed the commit boundary but verification failed."""
 
 
 class DaggerRoundStore:
@@ -676,7 +770,76 @@ class DaggerRoundStore:
         if staging.exists():
             self._remove(staging)
 
-    def commit(self, staging: Path, manifest: DAggerRoundManifest) -> Path:
+    def _pointer_for(self, manifest: DAggerRoundManifest) -> _CurrentPointer:
+        pointer_body = {
+            "schema_version": 1,
+            "run_identity": manifest.run_identity,
+            "round_number": manifest.round_number,
+            "generation": manifest.generation,
+            "manifest_sha256": manifest.manifest_sha256,
+        }
+        return _CurrentPointer(
+            **pointer_body,
+            pointer_sha256=_sha256_bytes(_canonical_json(pointer_body).encode("utf-8")),
+        )
+
+    def _pointer_matches(self, expected: _CurrentPointer) -> bool:
+        try:
+            return self.load_pointer() == expected
+        except (OSError, ValueError):
+            return False
+
+    def _verify_committed_generation(
+        self,
+        final: Path,
+        manifest: DAggerRoundManifest,
+        pointer: _CurrentPointer,
+    ) -> None:
+        if not self._pointer_matches(pointer):
+            raise ValueError("current pointer does not identify committed generation")
+        manifest_path = final / "manifest.json"
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise ValueError("committed manifest is missing or unsafe")
+        loaded = DAggerRoundManifest.model_validate_json(
+            manifest_path.read_text(encoding="utf-8")
+        )
+        if loaded != manifest:
+            raise ValueError("committed manifest does not match publication")
+        for reference, name in (
+            (manifest.source_policy, "source.pt"),
+            (manifest.checkpoint, "checkpoint.pt"),
+            (manifest.seen_keys, "seen.json"),
+            (manifest.dev_artifact, "dev.json"),
+            (manifest.deviation_artifact, "deviations.json"),
+        ):
+            _artifact_path(final, reference, name)
+
+    def _warning_outcome(
+        self,
+        *,
+        final: Path,
+        manifest: DAggerRoundManifest,
+        pointer: _CurrentPointer,
+        error: BaseException,
+    ) -> GenerationCommitOutcome:
+        try:
+            self._verify_committed_generation(final, manifest, pointer)
+        except Exception as verification_error:
+            raise CommittedGenerationVerificationError(
+                "current pointer was replaced, but committed generation verification failed"
+            ) from verification_error
+        return GenerationCommitOutcome(
+            generation=final,
+            durable=False,
+            durability_warning=(
+                f"round {manifest.round_number} committed but root durability "
+                f"confirmation failed: {error}"
+            ),
+        )
+
+    def commit(
+        self, staging: Path, manifest: DAggerRoundManifest
+    ) -> GenerationCommitOutcome:
         final = self._round_path(manifest.round_number)
         _write_model(staging / "manifest.json", manifest)
         for child in staging.iterdir():
@@ -685,29 +848,58 @@ class DaggerRoundStore:
             with child.open("rb+") as handle:
                 os.fsync(handle.fileno())
         _fsync_directory(staging)
-        os.replace(staging, final)
-        _fsync_directory(self.generations)
-        published = False
         try:
-            pointer_body = {
-                "schema_version": 1,
-                "run_identity": manifest.run_identity,
-                "round_number": manifest.round_number,
-                "generation": manifest.generation,
-                "manifest_sha256": manifest.manifest_sha256,
-            }
-            pointer = _CurrentPointer(
-                **pointer_body,
-                pointer_sha256=_sha256_bytes(
-                    _canonical_json(pointer_body).encode("utf-8")
-                ),
+            os.replace(staging, final)
+        except Exception:
+            if final.exists() and not staging.exists():
+                self._remove(final)
+            raise
+        committed = False
+        pointer_temporary: Path | None = None
+        try:
+            _fsync_directory(self.generations)
+            pointer = self._pointer_for(manifest)
+            if self.current.is_symlink():
+                raise ValueError("refusing to replace a current pointer symlink")
+            handle = tempfile.NamedTemporaryFile(
+                dir=self.root, prefix=f".{self.current.name}.", delete=False
             )
-            _write_model(self.current, pointer)
-            _fsync_directory(self.root)
-            published = True
-            return final
+            pointer_temporary = Path(handle.name)
+            with handle:
+                handle.write(
+                    (_canonical_json(pointer.model_dump(mode="json")) + "\n").encode(
+                        "utf-8"
+                    )
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.replace(pointer_temporary, self.current)
+            except Exception as error:
+                if self._pointer_matches(pointer):
+                    committed = True
+                    return self._warning_outcome(
+                        final=final,
+                        manifest=manifest,
+                        pointer=pointer,
+                        error=error,
+                    )
+                raise
+            committed = True
+            try:
+                _fsync_directory(self.root)
+            except Exception as error:
+                return self._warning_outcome(
+                    final=final,
+                    manifest=manifest,
+                    pointer=pointer,
+                    error=error,
+                )
+            return GenerationCommitOutcome(generation=final)
         finally:
-            if not published and final.exists():
+            if pointer_temporary is not None:
+                pointer_temporary.unlink(missing_ok=True)
+            if not committed and final.exists():
                 self._remove(final)
 
     def load_pointer(self) -> _CurrentPointer:
@@ -849,6 +1041,8 @@ def _load_generation(
     dev_context_ids: tuple[str, ...],
     source_identity: PolicyIdentity,
     previous_metrics: RoundMetrics | None,
+    previous_manifest: DAggerRoundManifest | None,
+    previous_deviation_keys: set[str],
 ) -> tuple[DAggerRoundManifest, tuple[Deviation, ...], set[str], RouterPolicy]:
     generation = store._round_path(round_number)
     if not generation.is_dir() or generation.is_symlink():
@@ -860,6 +1054,17 @@ def _load_generation(
         manifest_path.read_text(encoding="utf-8")
     )
     expected_generation = _generation_relative(store.config, round_number)
+    expected_previous_id = (
+        None if previous_manifest is None else previous_manifest.generation
+    )
+    expected_previous_hash = (
+        None if previous_manifest is None else previous_manifest.manifest_sha256
+    )
+    if (
+        manifest.previous_generation_id != expected_previous_id
+        or manifest.previous_generation_manifest_sha256 != expected_previous_hash
+    ):
+        raise ValueError("round manifest predecessor chain mismatch")
     if (
         manifest.round_number != round_number
         or manifest.generation != expected_generation
@@ -905,6 +1110,12 @@ def _load_generation(
         or len(deviations_artifact.new_state_keys) != manifest.new_deviation_count
     ):
         raise ValueError("deviation artifact derived fields mismatch")
+    current_deviation_keys = {item.state_key for item in deviations}
+    if not previous_deviation_keys.issubset(current_deviation_keys):
+        raise ValueError("deviation chain removed a predecessor deviation")
+    expected_new_keys = tuple(sorted(current_deviation_keys - previous_deviation_keys))
+    if deviations_artifact.new_state_keys != expected_new_keys:
+        raise ValueError("new deviation keys must equal the predecessor set difference")
     if any(item.state_key not in set(seen.keys) for item in deviations):
         raise ValueError("deviation keys are absent from seen artifact")
     dev_path = _artifact_path(generation, manifest.dev_artifact, "dev.json")
@@ -992,6 +1203,7 @@ def run_dagger(
     store = DaggerRoundStore(config)
     store.recover()
     manifests: list[DAggerRoundManifest] = []
+    durability_warnings: list[str] = []
     deviations: tuple[Deviation, ...] = ()
     seen: set[str] = set()
     policy = validated_bootstrap
@@ -1017,6 +1229,8 @@ def run_dagger(
                 dev_context_ids=dev_context_ids,
                 source_identity=expected_identity,
                 previous_metrics=previous_metrics,
+                previous_manifest=manifests[-1] if manifests else None,
+                previous_deviation_keys={item.state_key for item in deviations},
             )
             manifests.append(manifest)
             expected_identity = manifest.checkpoint_policy_identity
@@ -1037,6 +1251,7 @@ def run_dagger(
                 resumed=True,
                 final_checkpoint=current_checkpoint,
                 manifests=tuple(manifests),
+                durability_warnings=tuple(durability_warnings),
             )
     start_round = len(manifests) + 1
     for round_number in range(start_round, config.max_rounds + 1):
@@ -1122,6 +1337,12 @@ def run_dagger(
                 run_identity=run_identity,
                 round_number=round_number,
                 generation=_generation_relative(config, round_number),
+                previous_generation_id=(
+                    manifests[-1].generation if manifests else None
+                ),
+                previous_generation_manifest_sha256=(
+                    manifests[-1].manifest_sha256 if manifests else None
+                ),
                 manifest_path="manifest.json",
                 status=status,
                 stop_reason=stop_reason,
@@ -1147,10 +1368,13 @@ def run_dagger(
                 metrics=metrics,
                 budget_bin_width=config.budget_bin_width,
             )
-            final = store.commit(staging, manifest)
+            outcome = store.commit(staging, manifest)
         except Exception:
             store.rollback(staging)
             raise
+        final = outcome.generation
+        if outcome.durability_warning is not None:
+            durability_warnings.append(outcome.durability_warning)
         manifests.append(manifest)
         deviations = round_deviations
         seen = round_seen
@@ -1165,6 +1389,7 @@ def run_dagger(
                 resumed=resumed,
                 final_checkpoint=current_checkpoint,
                 manifests=tuple(manifests),
+                durability_warnings=tuple(durability_warnings),
             )
     raise RuntimeError("DAgger round loop ended without a stop decision")
 

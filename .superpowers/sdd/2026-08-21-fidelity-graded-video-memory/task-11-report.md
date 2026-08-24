@@ -1,6 +1,6 @@
 # Task 11 implementation report
 
-Status: ROUND2_DONE
+Status: ROUND3_DONE
 
 ## Scope and design
 
@@ -121,8 +121,10 @@ Status: ROUND2_DONE
   `.round-N.staging` receives source policy, seen keys, checkpoint, dev metrics,
   deviations, and manifest; every file and the staging directory are flushed;
   the directory is renamed to immutable `round-N`; and `current.json` is the
-  final atomic write. Failed training or publication removes staging/orphan
-  output without changing the prior current pointer.
+  final atomic write. Round 2 correctly removed staging/final output for
+  failures before that pointer replacement, but it did not distinguish a
+  failure after the pointer had already been replaced. The exact irreversible
+  boundary and post-commit warning outcome are corrected in Round 3 below.
 - Cache identity is recomputed from actual sorted observation keys plus
   canonical observations and actual sorted state evaluations plus the frozen
   evaluator identity. Task 9 gained only the read-only
@@ -206,3 +208,71 @@ No Task 10 implementation file was changed. Task 9 changed only by adding the
 two read-only cache attestation accessors above. `MemoryEnvironment` gained
 read-only canonical event, executor, and action-semantics identity accessors;
 action legality, costs, replay, and execution semantics are unchanged.
+
+## Round 3: sealed commit boundary and predecessor chain
+
+Status: ROUND3_DONE
+
+### Scope and design changes
+
+- `current.json` replacement is now the sole irreversible commit point. Any
+  generation-directory flush, pointer preparation, or replace failure before
+  that point removes the new final generation and leaves the verified prior
+  pointer/generation unchanged. Immediately after replacement, `committed` is
+  true; no later cleanup can remove the published generation.
+- A post-replace exception (including root-directory fsync failure or a replace
+  wrapper that raises after completing the syscall) rereads and validates the
+  current pointer, manifest, and every referenced generation artifact. It
+  returns `GenerationCommitOutcome(durable=False)` and exposes the explicit
+  message through `DAggerRunResult.durability_warnings`. It does not claim
+  durability, delete the generation, or make retry/resume fail.
+- Round manifests use schema 3 and bind
+  `previous_generation_id/previous_generation_manifest_sha256`. Resume walks
+  from round 1, verifies that exact chain, validates that predecessor deviation
+  keys remain present, and requires
+  `new_state_keys == current_state_keys - previous_state_keys`. Thus an old
+  deviation cannot be relabeled as new even after deviation, manifest, and
+  pointer hashes are all recomputed; a missing predecessor also fails closed.
+- `DAggerConfig` validates critical paths as strict non-empty `str`/`Path`
+  values before coercion. It rejects file-shaped roots/directories, bootstrap
+  and current equality, either key file overlapping `generations_dir` in any
+  ancestor direction, and symlink aliases both at the root and inside the
+  resolved artifact tree. Removed legacy seen/dev fields remain rejected by
+  `extra="forbid"`.
+
+### RED / GREEN ledger
+
+Initial Round 3 RED:
+
+`D:\Anaconda\python.exe -m pytest tests/router/test_dagger_round3.py -q`
+
+Result: `7 failed, 1 passed, 1 skipped in 4.07s`. The passing characterization
+proved pre-replace cleanup already existed for an empty store. Failures proved
+that post-replace fsync still raised and deleted the generation, manifests had
+no predecessor binding, a resealed old deviation could masquerade as new, and
+critical path overlaps/file roots were accepted. The skip is the real symlink
+probe on this Windows host, where unprivileged directory symlink creation is
+unavailable; it runs on hosts that permit symlinks.
+
+Final Round 3 focused file:
+
+`D:\Anaconda\python.exe -m pytest tests/router/test_dagger_round3.py -q`
+
+Result: `15 passed, 1 skipped in 4.92s`. The pre-replace probe now fails the
+round-2 pointer replacement and confirms round 1 remains current; the two
+post-replace probes cover both a completed replace that then raises and a root
+fsync failure, followed by safe retry.
+
+### Final Round 3 verification
+
+- Every Task 11 DAgger file: `47 passed, 1 skipped in 7.61s`.
+- Full Router suite: `101 passed, 1 skipped in 19.31s`.
+- Full default environment, no OMP/MKL workaround:
+  `353 passed, 2 skipped in 61.54s` (under the 180-second bound).
+- Commit-boundary plus resealed-tamper smoke: `2 passed in 3.64s`.
+- `D:\Anaconda\python.exe -m compileall -q src tests` -> exit 0.
+- Exact Round 3 Ruff check -> exit 0; exact format check ->
+  `2 files already formatted`. A broader format check reports two unrelated
+  pre-existing files (`dataset.py`, `test_review_round3.py`) and they were not
+  modified.
+- `git diff --check` -> exit 0, no output.

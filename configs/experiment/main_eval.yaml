@@ -1,0 +1,54 @@
+# Main fair-evaluation matrix. Hash placeholders must be replaced by sealed
+# artifacts before a formal run; the runner rejects mismatches.
+policies:
+  uniform: {family: fixed}
+  gist_only: {family: fixed}
+  gist_residual: {family: fixed}
+  gist_visual: {family: fixed}
+  full_residual: {family: fixed}
+  rule: {family: adaptive}
+  prompt_vlm: {family: adaptive}
+  text_adaptive: {family: adaptive}
+  question_only: {family: learned}
+  bc: {family: learned}
+  bc_dagger: {family: learned}
+
+budget_sweep:
+  total_cost: [8.0, 16.0, 32.0, 64.0]
+  max_visual_frames: [32, 64, 128, 256]
+  max_evidence_tokens: [512, 1024, 2048, 4096]
+
+seeds: [2026, 2027, 2028]
+cost_preferences: [0.0, 0.25, 0.5, 0.75, 1.0]
+
+shared_identities:
+  answerer_template_sha256: ${oc.env:FIDMEM_ANSWERER_TEMPLATE_SHA256,REPLACE_WITH_64_HEX}
+  answerer_config_sha256: ${oc.env:FIDMEM_ANSWERER_CONFIG_SHA256,REPLACE_WITH_64_HEX}
+  cache_graph_sha256: ${oc.env:FIDMEM_CACHE_GRAPH_SHA256,REPLACE_WITH_64_HEX}
+  cost_table_sha256: ${oc.env:FIDMEM_COST_TABLE_SHA256,REPLACE_WITH_64_HEX}
+  environment_sha256: ${oc.env:FIDMEM_ENVIRONMENT_SHA256,REPLACE_WITH_64_HEX}
+  benchmark_manifest_sha256: ${oc.env:FIDMEM_BENCHMARK_MANIFEST_SHA256,REPLACE_WITH_64_HEX}
+  leakage_audit_sha256: ${oc.env:FIDMEM_LEAKAGE_AUDIT_SHA256,REPLACE_WITH_64_HEX}
+
+hardware:
+  training: A800
+  evaluation: V100
+  a800_gpu_hour_cap: 800
+  v100_gpu_hour_cap: 200
+
+reporting:
+  preserve_per_seed_raw: true
+  fabricate_confidence_intervals: false
+  primary_metrics: [mc_accuracy, pareto_frontier, cost_at_accuracy, fixed_budget_accuracy]
+  secondary_metrics:
+    - gpu_seconds
+    - wall_seconds
+    - input_frames
+    - visual_tokens
+    - text_tokens
+    - peak_memory_bytes
+    - oracle_utility_regret
+    - premature_stop_rate
+    - unnecessary_expansion_rate
+    - top_k_recall
+    - action_distribution

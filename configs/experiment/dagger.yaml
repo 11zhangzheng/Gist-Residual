@@ -19,13 +19,40 @@ model_overrides:
   max_item_tokens: 96
   production: false
   enforce_parameter_range: false
+training:
+  seed: 13
+  max_steps: 20
+  batch_size: 32
+  learning_rate: 0.003
+  weight_decay: 0.0
+  scheduler_gamma: 1.0
+  artifact_root: artifacts/dagger
+  checkpoint_path: bootstrap.pt
+  checkpoint_every: 20
+  device: cpu
+  split_seed: 2026
+  train_fraction: 1.0
+  dev_fraction: 0.0
+  loss_profile:
+    name: main-v1
+    version: 1
+    weights:
+      action: 1.0
+      sufficiency: 0.3
+      cost_to_go: 0.1
+    reason: pre-registered Task 10 objective
+    frozen: true
 dagger:
-  max_rounds: 2
+  artifact_root: artifacts/dagger
+  max_rounds: 3
   beam_size: 8
   max_depth: 5
   utility_gain_threshold: 0.005
   regret_improvement_ratio: 0.02
-  device: cpu
   train_question_subset_fraction: 1.0
-  normalization_path: artifacts/oracle-cost-normalization.json
-  seen_keys_path: artifacts/dagger-seen-keys.json
+  train_question_subset_seed: 2026
+  budget_bin_width: 1.0
+  seen_keys_path: seen-keys.json
+  deviation_artifact_path: deviations.json
+  manifest_dir: manifests
+  checkpoint_dir: checkpoints

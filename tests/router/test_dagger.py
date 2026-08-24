@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import hashlib
 
 from fidmem.actions.environment import (
     ActionCostTable,
@@ -16,11 +16,14 @@ from fidmem.oracle.search import (
 )
 from fidmem.router.dagger import (
     BCPolicy,
+    CacheArtifactIdentity,
+    CachedAnswerEvaluator,
+    CachedUtilityGraph,
     DaggerRoundResult,
     ForbiddenObservationGenerator,
     _should_continue,
     collect_deviations,
-    label_best_next_action,
+    evaluation_key,
     run_dagger_round,
 )
 from fidmem.router.model import EncoderIdentity, MemoryRouter, RouterModelConfig
@@ -33,13 +36,11 @@ from fidmem.types import (
     RouterState,
 )
 
-_NORMALIZATION = CostNormalization(constant=10, sample_count=100, source_split="train")
+_NORMALIZATION = CostNormalization(constant=10, sample_count=1, source_split="train")
 
 
-def _action(
-    kind: ActionType, event_id: str | None = None, budget: str | None = None
-) -> ActionInstance:
-    return ActionInstance(kind, event_id, budget)  # type: ignore[arg-type]
+def _action(kind: ActionType) -> ActionInstance:
+    return ActionInstance(kind, None, None)
 
 
 def _state() -> RouterState:
@@ -48,7 +49,7 @@ def _state() -> RouterState:
         options=("blue", "red"),
         evidence=(),
         action_history=(),
-        remaining_budget=20,
+        remaining_budget=3,
         candidate_event_ids=(),
         candidate_fidelity_levels={},
         context_frontiers={},
@@ -56,51 +57,44 @@ def _state() -> RouterState:
     )
 
 
-def _environment(executor_calls: list[ActionInstance]) -> MemoryEnvironment:
-    def forbidden_executor(
-        action: ActionInstance, state: RouterState
-    ) -> ActionObservation:
-        executor_calls.append(action)
-        raise AssertionError("DAgger must not execute providers")
-
-    event = EventRecord(
-        video_id="v",
-        event_id="e1",
-        start_sec=0,
-        end_sec=2,
-        gist_text="a bottle",
-        visual_embedding=(1.0,),
-        text_embedding=(1.0,),
-        raw_video_uri="v.mp4",
-        memory_version="v1",
+def _identity(label: str) -> CacheArtifactIdentity:
+    return CacheArtifactIdentity(
+        artifact_sha256=hashlib.sha256(label.encode()).hexdigest()
     )
+
+
+def _environment() -> MemoryEnvironment:
     return MemoryEnvironment(
-        events=(event,),
-        executor=forbidden_executor,
-        costs=ActionCostTable(
-            search_gist=1,
-            residual=2,
-            context=1,
-            visual_low=5,
-            visual_high=8,
-            visual_low_question=0,
-            visual_high_question=0,
+        events=(
+            EventRecord(
+                video_id="v",
+                event_id="e1",
+                start_sec=0,
+                end_sec=2,
+                gist_text="bottle",
+                visual_embedding=(1.0,),
+                text_embedding=(1.0,),
+                raw_video_uri="v.mp4",
+                memory_version="v1",
+            ),
         ),
+        executor=ForbiddenObservationGenerator(),
+        costs=ActionCostTable(search_gist=3),
     )
 
 
-def _toy_graph(
+def _utility_graph(
     environment: MemoryEnvironment, initial: RouterState
-) -> CachedObservationGraph:
+) -> CachedUtilityGraph:
     search = _action(ActionType.SEARCH_GIST)
-    search_observation = ActionObservation(
+    observation = ActionObservation(
         action_type=ActionType.SEARCH_GIST,
         candidate_event_ids=("e1",),
         evidence=(
             EvidenceItem(
                 event_id="e1",
                 fidelity_level=FidelityLevel.GIST,
-                content="bottle",
+                content="blue",
                 score=1,
             ),
         ),
@@ -110,78 +104,33 @@ def _toy_graph(
             ),
         ),
     )
-    searched = environment.replay(initial, search, search_observation).next_state
-    residual = _action(ActionType.EXPAND_RESIDUAL, "e1")
-    residual_observation = ActionObservation(
-        action_type=ActionType.EXPAND_RESIDUAL,
-        target_event_id="e1",
-        evidence=(
-            EvidenceItem(
-                event_id="e1",
-                fidelity_level=FidelityLevel.RESIDUAL,
-                content="blue",
-                score=1,
-            ),
+    searched = environment.replay(initial, search, observation).next_state
+    return CachedUtilityGraph(
+        identity=_identity("utility"),
+        observation_identity=_identity("observations"),
+        observations=CachedObservationGraph(
+            {observation_key(initial, search): observation}
         ),
-        operation_metadata=(
-            OperationMetadata(scope="residual", cache_status="miss", amortizable=True),
-        ),
-    )
-    visual = _action(ActionType.VERIFY_VISUAL, "e1", "low")
-    visual_observation = ActionObservation(
-        action_type=ActionType.VERIFY_VISUAL,
-        target_event_id="e1",
-        evidence=(
-            EvidenceItem(
-                event_id="e1",
-                fidelity_level=FidelityLevel.VISUAL,
-                content="blue",
-                score=1,
-                attachments=("frame.jpg",),
-            ),
-        ),
-        operation_metadata=(
-            OperationMetadata(
-                scope="event_observation",
-                cache_status="miss",
-                amortizable=True,
-                input_frames=12,
-            ),
-            OperationMetadata(
-                scope="question_verification", cache_status="miss", amortizable=False
-            ),
+        evaluator=CachedAnswerEvaluator(
+            identity=_identity("evaluations"),
+            evaluations={
+                evaluation_key(initial): AnswerEvaluation(
+                    answer="red", answer_score=0.2, correct=False
+                ),
+                evaluation_key(searched): AnswerEvaluation(
+                    answer="blue", answer_score=1.0, correct=True
+                ),
+            },
         ),
     )
-    return CachedObservationGraph(
-        {
-            observation_key(initial, search): search_observation,
-            observation_key(searched, residual): residual_observation,
-            observation_key(searched, visual): visual_observation,
-        }
-    )
 
 
-def _evaluate(state: RouterState) -> AnswerEvaluation:
-    correct = any(
-        item.content == "blue" and item.fidelity_level is not FidelityLevel.GIST
-        for item in state.evidence
-    )
-    return AnswerEvaluation(
-        answer="blue" if correct else "red",
-        answer_score=1.0 if correct else 0.2,
-        correct=correct,
-    )
-
-
-def _always_stop() -> Callable[[RouterState, tuple[ActionInstance, ...]], ActionInstance]:
-    def policy(
-        state: RouterState, legal_actions: tuple[ActionInstance, ...]
-    ) -> ActionInstance:
-        stop = _action(ActionType.STOP)
-        assert stop in legal_actions
-        return stop
-
-    return policy
+def _always_stop(
+    state: RouterState, legal: tuple[ActionInstance, ...]
+) -> ActionInstance:
+    stop = _action(ActionType.STOP)
+    assert stop in legal
+    return stop
 
 
 def _tiny_model() -> MemoryRouter:
@@ -199,72 +148,34 @@ def _tiny_model() -> MemoryRouter:
     )
 
 
-def test_label_best_next_action_selects_cheapest_correct_step_without_provider_io() -> (
-    None
-):
-    calls: list[ActionInstance] = []
-    environment = _environment(calls)
+def test_seen_keys_persist_across_collection_calls() -> None:
+    environment = _environment()
     initial = _state()
-    graph = _toy_graph(environment, initial)
+    graph = _utility_graph(environment, initial)
+    seen: set[str] = set()
 
-    best = label_best_next_action(
-        initial,
-        environment=environment,
-        graph=graph,
-        evaluator=_evaluate,
-        normalization=_NORMALIZATION,
-    )
-
-    assert best == _action(ActionType.SEARCH_GIST)
-    assert calls == []
-
-
-def test_collect_deviations_flags_policy_departure_without_provider_io() -> None:
-    calls: list[ActionInstance] = []
-    environment = _environment(calls)
-    initial = _state()
-    graph = _toy_graph(environment, initial)
-
-    deviations = collect_deviations(
+    first = collect_deviations(
         (initial,),
-        policy=_always_stop(),
+        policy=_always_stop,
         environment=environment,
-        graph=graph,
-        evaluator=_evaluate,
+        utility_graph=graph,
         normalization=_NORMALIZATION,
+        question_ids=("q",),
+        seen_keys=seen,
+    )
+    second = collect_deviations(
+        (initial,),
+        policy=_always_stop,
+        environment=environment,
+        utility_graph=graph,
+        normalization=_NORMALIZATION,
+        question_ids=("q",),
+        seen_keys=seen,
     )
 
-    assert len(deviations) == 1
-    assert deviations[0].policy_action == _action(ActionType.STOP)
-    assert deviations[0].oracle_action == _action(ActionType.SEARCH_GIST)
-    assert calls == []
-
-
-def test_collect_deviations_deduplicates_identical_states() -> None:
-    calls: list[ActionInstance] = []
-    environment = _environment(calls)
-    initial = _state()
-    graph = _toy_graph(environment, initial)
-
-    deviations = collect_deviations(
-        (initial, initial),
-        policy=_always_stop(),
-        environment=environment,
-        graph=graph,
-        evaluator=_evaluate,
-        normalization=_NORMALIZATION,
-    )
-
-    assert len(deviations) == 1
-
-
-def test_forbidden_observation_generator_fails_closed() -> None:
-    forbidden = ForbiddenObservationGenerator()
-    try:
-        forbidden(_action(ActionType.SEARCH_GIST), _state())
-    except AssertionError:
-        return
-    raise AssertionError("ForbiddenObservationGenerator did not raise")
+    assert len(first) == 1
+    assert second == ()
+    assert seen == {first[0].state_key}
 
 
 def test_round_two_stops_without_utility_or_regret_improvement() -> None:
@@ -276,47 +187,38 @@ def test_round_two_stops_without_utility_or_regret_improvement() -> None:
         should_continue=True,
     )
 
-    # utility gain 0.002 < 0.005 and regret improvement 0.005 < 2% * 0.3
     assert _should_continue(2, 0.502, 0.295, previous) is False
-    # enough utility gain
     assert _should_continue(2, 0.510, 0.295, previous) is True
-    # enough relative regret improvement
     assert _should_continue(2, 0.502, 0.290, previous) is True
-    # round one always continues; round three never continues
     assert _should_continue(1, 0.5, 0.3, None) is True
     assert _should_continue(3, 0.6, 0.1, previous) is False
 
 
-def test_run_dagger_round_round_one_always_continues() -> None:
-    calls: list[ActionInstance] = []
-    environment = _environment(calls)
+def test_run_dagger_round_round_one_labels_and_continues() -> None:
+    environment = _environment()
     initial = _state()
-    graph = _toy_graph(environment, initial)
+    graph = _utility_graph(environment, initial)
 
     result = run_dagger_round(
         round_number=1,
         train_states=(initial,),
         dev_states=(initial,),
-        policy=_always_stop(),
+        policy=_always_stop,
         environment=environment,
-        graph=graph,
-        evaluator=_evaluate,
+        utility_graph=graph,
         normalization=_NORMALIZATION,
+        question_ids=("q",),
     )
 
-    assert result.round_number == 1
     assert len(result.deviations) == 1
+    assert result.deviations[0].oracle_action == _action(ActionType.SEARCH_GIST)
     assert result.should_continue is True
-    assert calls == []
 
 
-def test_bc_policy_returns_a_legal_action() -> None:
-    calls: list[ActionInstance] = []
-    environment = _environment(calls)
+def test_bc_policy_returns_only_a_legal_action() -> None:
+    environment = _environment()
     initial = _state()
     policy = BCPolicy(_tiny_model())
 
     legal = environment.valid_actions(initial)
-    selected = policy(initial, legal)
-
-    assert selected in legal
+    assert policy(initial, legal) in legal

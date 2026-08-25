@@ -458,6 +458,7 @@ class BenchmarkQuestionRef(BaseModel):
     question_id: str = Field(min_length=1)
     video_group_id: str = Field(min_length=1)
     record_sha256: str = Field(pattern=_SHA256_PATTERN)
+    gold_answer_sha256: str = Field(pattern=_SHA256_PATTERN)
 
 
 class BenchmarkManifest(BaseModel):
@@ -533,6 +534,7 @@ class BenchmarkManifest(BaseModel):
             BenchmarkQuestionRef(
                 question_id=question.question_id,
                 video_group_id=question.video_group_id,
+                gold_answer_sha256=_sha256(question.gold_answer),
                 record_sha256=question.record_sha256,
             )
             for question in values
@@ -871,7 +873,7 @@ class RunManifest(BaseModel):
             benchmark.split,
         )
         benchmark_records = {
-            (item.question_id, item.video_group_id): item.record_sha256
+            (item.question_id, item.video_group_id): item
             for item in benchmark.questions
         }
         for item in values:
@@ -890,10 +892,9 @@ class RunManifest(BaseModel):
             if actual_identity != expected_identity:
                 raise ValueError("raw result identity differs from run identity")
             key = (item.question_id, item.video_group_id)
-            if benchmark_records.get(key) != item.record_sha256:
-                raise ValueError(
-                    "raw result differs from benchmark question provenance"
-                )
+            authority = benchmark_records.get(key)
+            if authority is None or authority.record_sha256 != item.record_sha256:
+                raise ValueError("raw result differs from benchmark question provenance")
         validated_benchmark = BenchmarkManifest.model_validate_json(
             benchmark.model_dump_json()
         )
@@ -940,8 +941,15 @@ class EvaluationRun(BaseModel):
         keys = tuple((item.question_id, item.video_group_id) for item in records)
         if keys != manifest.question_keys:
             raise ValueError("raw result order/keys do not match run manifest")
+        benchmark_records = {
+            (item.question_id, item.video_group_id): item
+            for item in manifest.benchmark.questions
+        }
+        for record in records:
+            authority = benchmark_records[(record.question_id, record.video_group_id)]
+            if _sha256(record.gold_answer) != authority.gold_answer_sha256:
+                raise ValueError("raw result differs from benchmark question authority")
         return self
-
     @property
     def summary(self) -> RunSummary:
         from .metrics import summarize_results

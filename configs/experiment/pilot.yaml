@@ -1,0 +1,20 @@
+retrieval:
+  top_k: 5
+oracle:
+  max_depth: 5
+  beam_size: 8
+visual:
+  low_frames: 12
+  high_frames: 32
+budget:
+  a800_gpu_hours: 800
+  v100_gpu_hours: 200
+
+pilot:
+  name: tiny-smoke
+  max_questions: 4
+  max_observations: 16
+  estimated_a800_gpu_hours: 0.032
+  estimated_v100_gpu_hours: 0.008
+  answerer: deterministic-smoke-v1
+  router: cpu-smoke-v1

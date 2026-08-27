@@ -1,0 +1,13 @@
+# TEMPLATE / NOT PRODUCTION. This file never selects or executes a model.
+schema_version: 1
+evidence_class: production
+production_authority: null
+run_id: R002-production-canary
+selection:
+  min_questions: 10
+  max_questions: 20
+  seed: null
+  selection_manifest: null
+input_jsonl: null
+artifact_root: artifacts
+resume: true

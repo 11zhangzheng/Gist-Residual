@@ -1,0 +1,13 @@
+# TEMPLATE / NOT PRODUCTION.
+# Replace every null only with independently verified immutable identities.
+# This draft is deliberately invalid and must fail authority-validate/seal.
+schema_version: 1
+lifecycle: draft
+production_ready: false
+repository: null
+dataset: null
+models: null
+prompts: null
+observation_configurations: null
+runtime: null
+cost: null

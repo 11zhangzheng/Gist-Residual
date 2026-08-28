@@ -37,21 +37,26 @@ def test_download_check_never_invokes_downloader(monkeypatch, tmp_path: Path) ->
         invoked = True
         raise AssertionError("download must not be called by --check")
 
-    with pytest.raises(
-        ValueError, match="is unresolved|lacks a resolved remote file manifest"
-    ):
-        operate(
-            "download",
-            stack_path=ROOT / "configs/experiment_stacks/gist_residual_v1.yaml",
-            lock_path=ROOT
-            / "configs/experiment_stacks/gist_residual_v1.assets.lock.json",
-            asset_kind="models",
-            check=True,
-            dry_run=False,
-            resume=False,
-            verify_only=False,
-            downloader=forbidden_downloader,
-        )
+    result = operate(
+        "download",
+        stack_path=ROOT / "configs/experiment_stacks/gist_residual_v1.yaml",
+        lock_path=ROOT
+        / "configs/experiment_stacks/gist_residual_v1.assets.lock.json",
+        asset_kind="models",
+        check=True,
+        dry_run=False,
+        resume=False,
+        verify_only=False,
+        downloader=forbidden_downloader,
+    )
+
+    assert result["status"] == "CHECK_PASSED"
+    assert result["assets"] == [
+        {"asset_id": "bge_m3", "download_invoked": False},
+        {"asset_id": "qwen3_8b", "download_invoked": False},
+        {"asset_id": "qwen3_vl_8b_instruct", "download_invoked": False},
+        {"asset_id": "siglip2_so400m_patch14_384", "download_invoked": False},
+    ]
     assert invoked is False
 
 

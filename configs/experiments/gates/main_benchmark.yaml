@@ -1,0 +1,3 @@
+minimum_qualifying_benchmarks: 2
+equal_accuracy_cost_reduction_fraction: 0.40
+equal_cost_accuracy_points: 2.0

@@ -1,0 +1,54 @@
+schema_version: 1
+stack_id: gist-residual-v1
+status: CANDIDATE_ASSETS_UNVERIFIED
+backend: HuggingFace Transformers
+dtype: bfloat16
+physical_assets:
+  longtvqa_metadata:
+    repo_id: longvideoagent/LongTVQA
+    repo_type: dataset
+    immutable_revision: 6831b8467c69b08055dc5b055d3133a8db1177b4
+    backend: huggingface_hub
+    dtype: null
+  bge_m3:
+    repo_id: BAAI/bge-m3
+    repo_type: model
+    immutable_revision: 5617a9f61b028005a4858fdac845db406aefb181
+    backend: HuggingFace Transformers
+    dtype: bfloat16
+  siglip2_so400m_patch14_384:
+    repo_id: google/siglip2-so400m-patch14-384
+    repo_type: model
+    immutable_revision: e8e487298228002f3d8a82e0cd5c8ea9c567f57f
+    backend: HuggingFace Transformers
+    dtype: bfloat16
+  qwen3_vl_8b_instruct:
+    repo_id: Qwen/Qwen3-VL-8B-Instruct
+    repo_type: model
+    immutable_revision: null
+    backend: HuggingFace Transformers
+    dtype: bfloat16
+  qwen3_8b:
+    repo_id: Qwen/Qwen3-8B
+    repo_type: model
+    immutable_revision: b968826d9c46dd6066d109eabc6255188de91218
+    backend: HuggingFace Transformers
+    dtype: bfloat16
+logical_roles:
+  source_dataset: longtvqa_metadata
+  gist_text_encoder: bge_m3
+  gist_visual_encoder: siglip2_so400m_patch14_384
+  embedding_model: bge_m3
+  residual_model: qwen3_vl_8b_instruct
+  visual_model: qwen3_vl_8b_instruct
+  answerer: qwen3_8b
+target_benchmarks:
+  video_mme_v2:
+    repo_id: Video-MME-v2
+    status: DEFERRED
+  lvbench:
+    repo_id: LVBench
+    status: DEFERRED
+  longvideobench:
+    repo_id: LongVideoBench
+    status: DEFERRED

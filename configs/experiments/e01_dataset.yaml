@@ -1,0 +1,27 @@
+extends: base.yaml
+experiment_id: E01
+production_authority: null
+required_fields: [source.git_commit, inputs.stack_config, inputs.asset_lock, inputs.dataset_root, inputs.official_metadata]
+required_environment:
+  - FIDMEM_INFERENCE_BACKEND
+  - FIDMEM_GIT_COMMIT
+  - FIDMEM_DATA_ROOT
+  - FIDMEM_MODEL_ROOT
+  - FIDMEM_CACHE_ROOT
+  - FIDMEM_ARTIFACT_ROOT
+  - FIDMEM_LONGTVQA_VIDEO_ROOT
+  - FIDMEM_LONGTVQA_HUMAN_AUDIT_RESULT
+required_paths:
+  - configs/experiment_stacks/gist_residual_v1.yaml
+  - configs/experiment_stacks/gist_residual_v1.assets.lock.json
+  - configs/experiment_stacks/longtvqa_split_policy.yaml
+inputs:
+  stack_config: configs/experiment_stacks/gist_residual_v1.yaml
+  asset_lock: configs/experiment_stacks/gist_residual_v1.assets.lock.json
+  dataset_root: env:FIDMEM_DATA_ROOT
+  official_metadata: asset-lock:longtvqa_metadata
+execution:
+  command: [python, -m, fidmem.assets.setup, e01]
+  may_generate_observations: false
+outputs:
+  required: [results/dataset_manifest.json, results/video_manifest.json, results/question_manifest.json, results/source_gate.json]

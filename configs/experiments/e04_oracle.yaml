@@ -1,0 +1,20 @@
+extends: base.yaml
+experiment_id: E04
+required_fields: [production_authority, source.git_commit, inputs.observation_graph]
+inputs:
+  dataset_split: authority:oracle
+  observation_graph: RESEARCH_OWNER_DECISION_REQUIRED
+oracle:
+  question_count: 100
+  beam_size: 8
+  max_depth: 5
+  exhaustive_subset_size: 20
+  cost_preferences: [0.0, 0.1, 0.3, 1.0]
+thresholds:
+  minimum_oracle_headroom: RESEARCH_OWNER_DECISION_REQUIRED
+  maximum_missing_observation_rate: RESEARCH_OWNER_DECISION_REQUIRED
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_ORACLE_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/oracle.json, results/beam_audit.json, results/trajectories.jsonl]

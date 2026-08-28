@@ -7,6 +7,12 @@ import pytest
 from fidmem.actions.environment import ActionObservation, OperationMetadata
 from fidmem.costs.tracker import CostRecord
 from fidmem.production.canary import validate_production_run
+from fidmem.production.authority import canonical_json, canonical_sha256
+from fidmem.production.manifests import (
+    QuestionManifest,
+    SelectionManifest,
+    VideoManifest,
+)
 from fidmem.experiments.observation_import import (
     ObservationImportRecord,
     _cache_manifest,
@@ -125,3 +131,45 @@ def test_validation_fails_closed_when_cache_envelope_is_missing(tmp_path) -> Non
 
     with pytest.raises(ValueError, match="Authority-bound cache envelope is missing"):
         validate_production_run(destination, authority_path=authority_path)
+
+
+def test_e03_selection_manifest_must_contain_ten_to_twenty_questions(tmp_path) -> None:
+    authority_path, authority = _sealed_authority(tmp_path)
+    source = tmp_path / "provider.jsonl"
+    destination = tmp_path / "run"
+    _write_jsonl(source, [_production_payload(authority)])
+    import_production_observations(
+        source,
+        destination,
+        authority_path=authority_path,
+        resume=False,
+        run_id="R002-canary",
+    )
+    questions = QuestionManifest.model_validate_json(
+        (tmp_path / authority.dataset.question_manifest_path).read_text(
+            encoding="utf-8"
+        )
+    )
+    videos = VideoManifest.model_validate_json(
+        (tmp_path / authority.dataset.video_manifest_path).read_text(encoding="utf-8")
+    )
+    payload = {
+        "schema_version": 1,
+        "group": "canary",
+        "seed": "engineering-fixture",
+        "source_video_manifest_sha256": videos.manifest_sha256,
+        "source_question_manifest_sha256": questions.manifest_sha256,
+        "question_ids": ("q1",),
+        "video_ids": ("v1",),
+    }
+    selection = SelectionManifest(**payload, selection_sha256=canonical_sha256(payload))
+    selection_path = tmp_path / "canary-selection.json"
+    selection_path.write_text(
+        canonical_json(selection.model_dump(mode="json")), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="10-20 questions"):
+        validate_production_run(
+            destination,
+            authority_path=authority_path,
+            selection_manifest_path=selection_path,
+        )

@@ -1,0 +1,13 @@
+extends: base.yaml
+experiment_id: E07
+required_fields: [production_authority, source.git_commit, inputs.gist_index, thresholds.minimum_top_k_recall]
+inputs:
+  gist_index: RESEARCH_OWNER_DECISION_REQUIRED
+retrieval: {top_k: 5}
+thresholds:
+  minimum_top_k_recall: RESEARCH_OWNER_DECISION_REQUIRED
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_GIST_RECALL_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/gist_recall.json, results/retrieval.jsonl]

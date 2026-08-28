@@ -1,0 +1,26 @@
+schema_version: 1
+families:
+  canary:
+    required: [experiment_id, run_id, authority_sha256, metrics, provenance]
+    metrics: [total_questions, total_videos, total_events, atomic_observation_count, gist_count, residual_count, visual_count, cache_hits, cache_misses, schema_error_rate, missing_observation_count, duplicate_count, collision_count, raw_cost, aggregate_cost, gpu_seconds, wall_seconds, frames, visual_tokens, text_tokens, peak_memory_bytes]
+  oracle:
+    required: [experiment_id, run_id, authority_sha256, metrics, trajectories]
+    metrics: [best_fixed_policy_accuracy, oracle_accuracy, oracle_headroom, fidelity_stop_distribution, raw_cost, normalized_cost, trajectory_cost, fidelity_cost_separation]
+  stability:
+    required: [experiment_id, run_id, authority_sha256, metrics, raw_answers]
+    metrics: [state_count, repeats, answer_flip_rate, label_flip_rate]
+  audit:
+    required: [experiment_id, run_id, authority_sha256, metrics, findings]
+    metrics: [confirmed_leakage, video_overlap_count, audited_count]
+  training:
+    required: [experiment_id, run_id, authority_sha256, metrics, checkpoints]
+    metrics: [seed, action_loss, sufficiency_loss, cost_to_go_loss, dev_utility]
+  evaluation:
+    required: [experiment_id, run_id, authority_sha256, rows, provenance]
+    row_fields: [dataset, split, policy, seed, cost_preference, accuracy, total_cost, gpu_seconds, wall_seconds, frames, visual_tokens, text_tokens, peak_memory_bytes]
+  efficiency:
+    required: [experiment_id, run_id, authority_sha256, amortization, pareto, failure_taxonomy]
+    amortization_fields: [dataset, policy, question_count, accuracy, total_cost, marginal_cost, cache_hits, cache_misses]
+  generalization:
+    required: [experiment_id, run_id, authority_sha256, rows, provenance]
+    row_fields: [source_domain, target_domain, model_identity, policy, seed, accuracy, total_cost]

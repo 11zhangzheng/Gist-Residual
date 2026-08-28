@@ -1,0 +1,11 @@
+extends: base.yaml
+experiment_id: E11
+required_fields: [production_authority, source.git_commit, inputs.observation_graph, inputs.checkpoint_manifest]
+inputs:
+  observation_graph: RESEARCH_OWNER_DECISION_REQUIRED
+  checkpoint_manifest: RESEARCH_OWNER_DECISION_REQUIRED
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_BC_EVALUATION_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/bc_predictions.jsonl, results/bc_evaluation.json]

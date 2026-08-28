@@ -1,0 +1,12 @@
+schema_version: 1
+split_policy_id: RESEARCH_OWNER_DECISION_REQUIRED
+status: RESEARCH_OWNER_DECISION_REQUIRED
+split_unit: video_id
+video_groups: {}
+selections:
+  canary:
+    count: RESEARCH_OWNER_DECISION_REQUIRED_10_TO_20
+    seed: RESEARCH_OWNER_DECISION_REQUIRED
+  oracle:
+    count: 100
+    seed: RESEARCH_OWNER_DECISION_REQUIRED

@@ -1,0 +1,11 @@
+extends: base.yaml
+experiment_id: E16
+required_fields: [production_authority, source.git_commit, inputs.transfer_protocol, inputs.main_checkpoint]
+inputs:
+  transfer_protocol: RESEARCH_OWNER_DECISION_REQUIRED
+  main_checkpoint: RESEARCH_OWNER_DECISION_REQUIRED
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_CROSS_DATASET_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/cross_dataset_predictions.jsonl, results/cross_dataset_summary.json]

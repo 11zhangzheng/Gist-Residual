@@ -1,0 +1,29 @@
+extends: base.yaml
+experiment_id: E03
+production_authority: env:FIDMEM_PRODUCTION_AUTHORITY
+required_fields: [production_authority, source.git_commit, inputs.selection_manifest, inputs.provider_request_manifest, inputs.provider_backend_factory]
+required_environment:
+  - FIDMEM_INFERENCE_BACKEND
+  - FIDMEM_GIT_COMMIT
+  - FIDMEM_PRODUCTION_AUTHORITY
+  - FIDMEM_CANARY_SELECTION_MANIFEST
+  - FIDMEM_PROVIDER_REQUEST_MANIFEST
+  - FIDMEM_PROVIDER_BACKEND_FACTORY
+required_paths:
+  - configs/experiment_stacks/gist_residual_v1.yaml
+  - configs/experiment_stacks/gist_residual_v1.assets.lock.json
+inputs:
+  stack_id: gist-residual-v1
+  stack_config: configs/experiment_stacks/gist_residual_v1.yaml
+  asset_lock: configs/experiment_stacks/gist_residual_v1.assets.lock.json
+  dataset_split: authority:canary
+  selection_manifest: env:FIDMEM_CANARY_SELECTION_MANIFEST
+  provider_request_manifest: env:FIDMEM_PROVIDER_REQUEST_MANIFEST
+  provider_backend_factory: env:FIDMEM_PROVIDER_BACKEND_FACTORY
+  question_count_min: 10
+  question_count_max: 20
+execution:
+  command: [python, -m, fidmem.providers.stack_v1_cli, run]
+  may_generate_observations: true
+outputs:
+  required: [provider/provider.jsonl, results/CURRENT.json, results/canary_validation.json]

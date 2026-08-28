@@ -14,12 +14,14 @@ from fidmem.production.authority import (
 )
 from fidmem.production.generation import GenerationStore
 from fidmem.experiments.observation_import import (
+    _authority_manifests,
     _manifest_pairs,
     _parse_existing,
     _validate_commit,
     _validate_record_against_authority,
     _validate_production_cache,
 )
+from fidmem.production.manifests import SelectionManifest
 from fidmem.types import ActionType
 
 
@@ -41,7 +43,10 @@ def _cache_isolation_valid(cache_manifest: dict[str, Any]) -> bool:
 
 
 def validate_production_run(
-    output_dir: str | Path, *, authority_path: str | Path
+    output_dir: str | Path,
+    *,
+    authority_path: str | Path,
+    selection_manifest_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Recompute Canary integrity metrics without executing models or providers."""
 
@@ -115,6 +120,40 @@ def validate_production_run(
         if record.action.event_id is not None
     }
     expected_questions = {question_id for question_id, _ in valid_pairs}
+    selection_sha256 = None
+    if selection_manifest_path is not None:
+        selection = SelectionManifest.model_validate_json(
+            Path(selection_manifest_path).read_text(encoding="utf-8")
+        )
+        questions, videos = _authority_manifests(authority_source, authority)
+        if selection.group != "canary":
+            raise ValueError("E03 selection manifest must bind the canary group")
+        selected_question_ids = set(selection.question_ids)
+        if len(selected_question_ids) != len(selection.question_ids):
+            raise ValueError("E03 selection manifest contains duplicate questions")
+        if len(set(selection.video_ids)) != len(selection.video_ids):
+            raise ValueError("E03 selection manifest contains duplicate videos")
+        if not 10 <= len(selected_question_ids) <= 20:
+            raise ValueError("E03 selection manifest must contain 10-20 questions")
+        if (
+            selection.source_question_manifest_sha256 != questions.manifest_sha256
+            or selection.source_video_manifest_sha256 != videos.manifest_sha256
+        ):
+            raise ValueError("Canary selection source manifests differ from Authority")
+        selected_pairs = {
+            (record.question_id, record.video_id)
+            for record in questions.records
+            if record.question_id in selected_question_ids
+        }
+        if {item[0] for item in selected_pairs} != selected_question_ids:
+            raise ValueError("Canary selection references an unknown question")
+        if {item[1] for item in selected_pairs} != set(selection.video_ids):
+            raise ValueError("Canary selection video identities differ from questions")
+        if not selected_pairs.issubset(valid_pairs):
+            raise ValueError("Canary selection is outside the Authority manifests")
+        expected_questions = selected_question_ids
+        selection_sha256 = selection.selection_sha256
+    unexpected_questions = question_ids - expected_questions
     action_counts = {
         "gist": sum(
             record.action.action_type is ActionType.SEARCH_GIST for record in records
@@ -142,7 +181,9 @@ def validate_production_run(
         "schema_version": 1,
         "evidence_class": "production",
         "authority_sha256": authority.authority_sha256,
+        "selection_sha256": selection_sha256,
         "production_provenance_valid": provenance_valid,
+        "production_namespace_isolated": True,
         "total_questions": len(question_ids),
         "total_videos": len(video_ids),
         "total_events": len(event_ids),
@@ -155,6 +196,7 @@ def validate_production_run(
         "schema_error_count": 0,
         "schema_error_rate": 0.0,
         "missing_observation_count": len(expected_questions - question_ids),
+        "unexpected_observation_question_count": len(unexpected_questions),
         "duplicate_collision_count": 0,
         "raw_cost_record_count": len(costs),
         "cost_reconciliation_passed": cost_reconciled,

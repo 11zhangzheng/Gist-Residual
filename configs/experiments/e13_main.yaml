@@ -1,0 +1,19 @@
+extends: base.yaml
+experiment_id: E13
+required_fields: [production_authority, source.git_commit, inputs.observation_graph, inputs.policy_manifest]
+inputs:
+  observation_graph: RESEARCH_OWNER_DECISION_REQUIRED
+  policy_manifest: RESEARCH_OWNER_DECISION_REQUIRED
+benchmarks: [video_mme_long, lvbench, longvideobench]
+policies: [uniform_frames, gist_only, gist_residual, gist_visual, full_residual, rule, prompt_vlm, text_adaptive, question_only, bc]
+seeds: [2026, 2027, 2028]
+cost_preferences: [0.0, 0.1, 0.3, 1.0]
+claim_gate:
+  minimum_qualifying_benchmarks: 2
+  equal_accuracy_cost_reduction_fraction: 0.40
+  equal_cost_accuracy_points: 2.0
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_MAIN_BENCHMARK_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/predictions.jsonl, results/cost.csv, results/main_summary.json]

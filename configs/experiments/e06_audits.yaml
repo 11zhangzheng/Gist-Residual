@@ -1,0 +1,15 @@
+extends: base.yaml
+experiment_id: E06
+resources: {min_free_disk_gb: 5, min_free_vram_mb: 0}
+required_fields: [production_authority, source.git_commit, inputs.manifest_root]
+inputs:
+  manifest_root: RESEARCH_OWNER_DECISION_REQUIRED
+audit:
+  split_source_of_truth: video_manifest
+  confirmed_leakage_required: 0
+  longroute_manual_audit_size: 100
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_LEAKAGE_LABEL_AUDIT_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/leakage.json, results/label_audit.json]

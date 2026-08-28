@@ -542,9 +542,9 @@ def _validate_record_against_authority(
         raise ValueError("production observation is missing from frozen manifests")
 
 
-def _manifest_pairs(
+def _authority_manifests(
     authority_path: Path, authority: SealedProductionAuthority
-) -> set[tuple[str, str]]:
+) -> tuple[QuestionManifest, VideoManifest]:
     authority_parent = authority_path.resolve().parent
     relative_inputs = {
         authority.dataset.split_policy_path: authority.dataset.split_policy_sha256,
@@ -574,6 +574,13 @@ def _manifest_pairs(
     videos = VideoManifest.model_validate_json(
         (root / authority.dataset.video_manifest_path).read_text(encoding="utf-8")
     )
+    return questions, videos
+
+
+def _manifest_pairs(
+    authority_path: Path, authority: SealedProductionAuthority
+) -> set[tuple[str, str]]:
+    questions, videos = _authority_manifests(authority_path, authority)
     allowed_videos = {record.video_id for record in videos.records}
     return {
         (record.question_id, record.video_id)

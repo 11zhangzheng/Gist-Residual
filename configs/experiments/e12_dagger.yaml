@@ -1,0 +1,16 @@
+extends: base.yaml
+experiment_id: E12
+required_fields: [production_authority, source.git_commit, inputs.observation_cache, inputs.bc_checkpoints]
+inputs:
+  observation_cache: RESEARCH_OWNER_DECISION_REQUIRED
+  bc_checkpoints: RESEARCH_OWNER_DECISION_REQUIRED
+dagger:
+  minimum_rounds: 2
+  maximum_rounds: 3
+  utility_gain_threshold: 0.005
+  regret_improvement_ratio: 0.02
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_DAGGER_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/dagger_summary.json, results/checkpoint_manifest.json]

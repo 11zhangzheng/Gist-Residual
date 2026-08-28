@@ -1,0 +1,23 @@
+schema_version: 1
+protocol_version: fidelity-memory-paper-v1
+experiment_id: RESEARCH_OWNER_DECISION_REQUIRED
+production_authority: RESEARCH_OWNER_DECISION_REQUIRED
+source:
+  require_clean: true
+  git_commit: env:FIDMEM_GIT_COMMIT
+resources:
+  min_free_disk_gb: 20
+  min_free_vram_mb: 1
+required_environment:
+  - FIDMEM_INFERENCE_BACKEND
+  - FIDMEM_GIT_COMMIT
+required_fields:
+  - production_authority
+  - source.git_commit
+required_paths: []
+inputs: {}
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_EXECUTOR]
+  may_generate_observations: false
+outputs:
+  required: [results/result.json]

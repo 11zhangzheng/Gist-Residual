@@ -1,0 +1,49 @@
+schema_version: 1
+stack_id: gist-residual-v1
+observation_configurations:
+  segmentation:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    source: current design and implementation
+    reason: No single production segmentation policy/version is frozen.
+    version: null
+    content: null
+  frame_sampling:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    source: configs/model/gist.yaml; configs/model/residual.yaml; configs/model/visual.yaml
+    reason: Per-role counts exist, but a complete production sampling policy is not frozen.
+    version: null
+    content: null
+  retrieval:
+    status: FROZEN
+    source: configs/base.yaml; configs/model/gist.yaml
+    version: retrieval-v1
+    content:
+      top_k: 5
+      text_weight: 0.6
+      visual_weight: 0.4
+  observation_budget:
+    status: FROZEN
+    source: configs/base.yaml; configs/model/visual.yaml
+    version: observation-budget-v1
+    content:
+      visual_low_frames: 12
+      visual_high_frames: 32
+model_runtime_settings:
+  gist_text_encoder:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    reason: Tokenization, pooling, normalization, batching, and precision settings are not fully frozen.
+  gist_visual_encoder:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    reason: Processor revision, resize/crop, pooling, batching, and precision settings are not fully frozen.
+  residual_model:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    reason: Generation decoding parameters are not fully frozen.
+  visual_model:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    reason: Generation decoding parameters are not fully frozen.
+  answerer:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    reason: Temperature is zero, but full decoding and seed policy are not frozen.
+  embedding_model:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    reason: Tokenization, pooling, normalization, batching, and precision settings are not fully frozen.

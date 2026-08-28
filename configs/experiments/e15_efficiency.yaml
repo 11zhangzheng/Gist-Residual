@@ -1,0 +1,14 @@
+extends: base.yaml
+experiment_id: E15
+resources: {min_free_disk_gb: 5, min_free_vram_mb: 0}
+required_environment: []
+required_fields: [production_authority, source.git_commit, inputs.main_run_root]
+inputs:
+  main_run_root: RESEARCH_OWNER_DECISION_REQUIRED
+amortization_questions: [1, 2, 4, 8, 16]
+failure_taxonomy: [retrieval_error, premature_stop, insufficient_fidelity, over_retrieval, answerer_error]
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_EFFICIENCY_ANALYSIS_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/efficiency.json, results/cache_savings.csv, results/pareto.json]

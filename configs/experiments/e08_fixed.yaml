@@ -1,0 +1,11 @@
+extends: base.yaml
+experiment_id: E08
+required_fields: [production_authority, source.git_commit, inputs.observation_graph]
+inputs:
+  observation_graph: RESEARCH_OWNER_DECISION_REQUIRED
+policies: [uniform_frames, gist_only, gist_residual, gist_visual, full_residual]
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_FIXED_BASELINE_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/fixed_predictions.jsonl, results/fixed_summary.json]

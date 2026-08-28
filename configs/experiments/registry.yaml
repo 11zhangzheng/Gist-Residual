@@ -1,0 +1,348 @@
+schema_version: 1
+protocol_version: fidelity-memory-paper-v1
+gates:
+  environment_ready: {producer: E00}
+  dataset_frozen: {producer: E01}
+  authority_sealed: {producer: E02}
+  production_canary: {producer: E03}
+  oracle_viability: {producer: E04}
+  beam_reliability: {producer: E04}
+  answerer_stability: {producer: E05}
+  zero_leakage: {producer: E06}
+  label_audit: {producer: E06}
+  gist_recall: {producer: E07}
+  fixed_baselines: {producer: E08}
+  baseline_ready: {producer: E09}
+  bc_router: {producer: E10}
+  bc_evaluation: {producer: E11}
+  dagger: {producer: E12}
+  main_benchmark: {producer: E13}
+  ablations_complete: {producer: E14}
+  efficiency_complete: {producer: E15}
+  cross_dataset: {producer: E16}
+  generalization_complete: {producer: E17}
+experiments:
+  - id: E00
+    purpose: Record environment, Git/source, backend, disk, and visible GPU identities.
+    evidence_class: engineering
+    dependencies: []
+    required_gates: []
+    produces_gates: [environment_ready]
+    dataset_split: none
+    model_roles: []
+    gpu_required: false
+    resource_class: cpu_metadata_only
+    config_path: configs/experiments/e00_environment.yaml
+    script_path: scripts/experiments/00_environment.sh
+    expected_inputs: [repository]
+    expected_outputs: [results/environment.json]
+    metrics: [environment_valid, source_identity_recorded]
+    paper_role: reproducibility appendix
+    phase: setup
+    resumable: false
+  - id: E01
+    purpose: Prepare immutable video/question manifests and video-disjoint experiment groups.
+    evidence_class: engineering
+    dependencies: [E00]
+    required_gates: [environment_ready]
+    produces_gates: [dataset_frozen]
+    dataset_split: authority-defined development/canary/oracle/holdout, video-disjoint
+    model_roles: []
+    gpu_required: false
+    resource_class: cpu_io_unknown_until_dataset_freeze
+    config_path: configs/experiments/e01_dataset.yaml
+    script_path: scripts/experiments/01_dataset.sh
+    expected_inputs: [dataset files, official metadata]
+    expected_outputs: [dataset_manifest.json, video_manifest.json, question_manifest.json]
+    metrics: [manifest coverage, video overlap count, SHA-256 validity]
+    paper_role: data protocol
+    phase: setup
+    resumable: true
+  - id: E02
+    purpose: Validate and seal Production Authority on the target GPU host.
+    evidence_class: engineering
+    dependencies: [E01]
+    required_gates: [environment_ready, dataset_frozen]
+    produces_gates: [authority_sealed]
+    dataset_split: inherited from VideoManifest
+    model_roles: [gist_text, gist_visual, residual, visual, answerer, embedding]
+    gpu_required: true
+    resource_class: metadata_only_target_gpu
+    config_path: configs/experiments/e02_authority.yaml
+    script_path: scripts/experiments/02_authority.sh
+    expected_inputs: [authority draft, manifests, local checkpoints or immutable provider evidence]
+    expected_outputs: [PRODUCTION_AUTHORITY.json]
+    metrics: [authority validation issues, runtime identity consistency]
+    paper_role: production provenance
+    phase: setup
+    resumable: false
+  - id: E03
+    purpose: Run the 10-20 question Production Canary and validate the true observation chain.
+    evidence_class: production
+    dependencies: [E02]
+    required_gates: [authority_sealed]
+    produces_gates: [production_canary]
+    dataset_split: authority canary, 10-20 real questions
+    model_roles: [gist_text, gist_visual, residual, visual, answerer, embedding]
+    gpu_required: true
+    resource_class: unknown_until_measured_canary
+    config_path: configs/experiments/e03_canary.yaml
+    script_path: scripts/experiments/03_canary.sh
+    expected_inputs: [sealed Authority, canary selection, real videos]
+    expected_outputs: [raw observations, CostRecords, canary validation report]
+    metrics: [observation counts, measured cost, resume, cache isolation, provenance]
+    paper_role: execution gate only; not a paper result
+    phase: observations
+    resumable: true
+  - id: E04
+    purpose: Run the 100-question Oracle pilot and Beam8 versus exhaustive/UCS audit.
+    evidence_class: production
+    dependencies: [E03]
+    required_gates: [production_canary]
+    produces_gates: [oracle_viability, beam_reliability]
+    dataset_split: authority oracle pilot, 100 questions; exhaustive subset 20
+    model_roles: [frozen answerer]
+    gpu_required: true
+    resource_class: projected_from_canary
+    config_path: configs/experiments/e04_oracle.yaml
+    script_path: scripts/experiments/04_oracle.sh
+    expected_inputs: [frozen observation graph, gold labels on explicit Oracle path]
+    expected_outputs: [Oracle trajectories, viability report, Beam audit]
+    metrics: [fixed accuracy, Oracle accuracy/headroom, trajectory cost, stop distribution, Beam hit/gap]
+    paper_role: Oracle headroom and M0 viability
+    phase: oracle
+    resumable: true
+  - id: E05
+    purpose: Measure frozen Answerer stability on 100 states with three repeats.
+    evidence_class: production
+    dependencies: [E03]
+    required_gates: [production_canary]
+    produces_gates: [answerer_stability]
+    dataset_split: authority oracle development states only
+    model_roles: [frozen answerer]
+    gpu_required: true
+    resource_class: projected_from_canary
+    config_path: configs/experiments/e05_stability.yaml
+    script_path: scripts/experiments/05_stability.sh
+    expected_inputs: [100 frozen states, frozen answerer]
+    expected_outputs: [300 raw answers, stability report]
+    metrics: [answer flip rate, label flip rate]
+    paper_role: Oracle label reliability
+    phase: observations
+    resumable: true
+  - id: E06
+    purpose: Audit video-level train/dev/eval leakage and LongRoute labels.
+    evidence_class: production
+    dependencies: [E03]
+    required_gates: [production_canary]
+    produces_gates: [zero_leakage, label_audit]
+    dataset_split: all Authority groups, read-only labels on audit path
+    model_roles: [embedding model for duplicate audit]
+    gpu_required: false
+    resource_class: cpu_or_light_embedding
+    config_path: configs/experiments/e06_audits.yaml
+    script_path: scripts/experiments/06_audits.sh
+    expected_inputs: [all manifests, LongRoute provenance]
+    expected_outputs: [leakage report, label audit report]
+    metrics: [confirmed leakage, overlaps, audited labels]
+    paper_role: leakage and label-integrity gate
+    phase: audit
+    resumable: true
+  - id: E07
+    purpose: Establish Gist top-5 evidence recall before Router training.
+    evidence_class: production
+    dependencies: [E04, E05, E06]
+    required_gates: [oracle_viability, beam_reliability, answerer_stability, zero_leakage, label_audit]
+    produces_gates: [gist_recall]
+    dataset_split: frozen development only
+    model_roles: [gist_text, gist_visual, embedding]
+    gpu_required: true
+    resource_class: projected_from_canary
+    config_path: configs/experiments/e07_gist_recall.yaml
+    script_path: scripts/experiments/07_gist_recall.sh
+    expected_inputs: [frozen Gist index, evidence annotations]
+    expected_outputs: [per-question retrieval JSONL, recall summary]
+    metrics: [top-5 evidence recall, recall by question type]
+    paper_role: retrieval diagnostic and M1 gate
+    phase: evaluation
+    resumable: true
+  - id: E08
+    purpose: Evaluate fixed uniform/Gist/Residual/Visual/full-Residual strategies.
+    evidence_class: production
+    dependencies: [E07]
+    required_gates: [gist_recall]
+    produces_gates: [fixed_baselines]
+    dataset_split: frozen development only
+    model_roles: [frozen answerer]
+    gpu_required: true
+    resource_class: projected_from_canary
+    config_path: configs/experiments/e08_fixed.yaml
+    script_path: scripts/experiments/08_fixed.sh
+    expected_inputs: [frozen observations, fixed policy definitions]
+    expected_outputs: [per-policy raw predictions and costs]
+    metrics: [accuracy, total cost, frames, tokens, latency]
+    paper_role: fixed baselines
+    phase: evaluation
+    resumable: true
+  - id: E09
+    purpose: Evaluate Rule, Prompt/VLM, and Text-Adaptive controllers with shared observations.
+    evidence_class: production
+    dependencies: [E08]
+    required_gates: [gist_recall, fixed_baselines]
+    produces_gates: [baseline_ready]
+    dataset_split: frozen development only
+    model_roles: [frozen answerer, frozen controller VLM where applicable]
+    gpu_required: true
+    resource_class: projected_from_canary
+    config_path: configs/experiments/e09_adaptive.yaml
+    script_path: scripts/experiments/09_adaptive.sh
+    expected_inputs: [frozen observations, fixed baseline outputs]
+    expected_outputs: [adaptive baseline predictions, identity audit]
+    metrics: [accuracy-cost, action distribution, shared identity]
+    paper_role: controller isolation baselines
+    phase: evaluation
+    resumable: true
+  - id: E10
+    purpose: Train the three-seed cost-conditioned BC Router from frozen Oracle artifacts.
+    evidence_class: production
+    dependencies: [E09]
+    required_gates: [oracle_viability, answerer_stability, zero_leakage, label_audit, gist_recall, baseline_ready]
+    produces_gates: [bc_router]
+    dataset_split: LongRoute-Train plus isolated development only
+    model_roles: [router]
+    gpu_required: true
+    resource_class: projected_from_oracle
+    config_path: configs/experiments/e10_bc.yaml
+    script_path: scripts/experiments/10_bc.sh
+    expected_inputs: [frozen observation graph, Oracle trajectories]
+    expected_outputs: [three checkpoints, training histories]
+    metrics: [action loss, sufficiency loss, cost-to-go loss, dev utility]
+    paper_role: learned Router training
+    phase: router_training
+    resumable: true
+  - id: E11
+    purpose: Evaluate BC Router against Rule and fixed baselines on frozen development.
+    evidence_class: production
+    dependencies: [E10]
+    required_gates: [bc_router]
+    produces_gates: [bc_evaluation]
+    dataset_split: frozen development only
+    model_roles: [router, frozen answerer]
+    gpu_required: true
+    resource_class: projected_from_oracle
+    config_path: configs/experiments/e11_bc_eval.yaml
+    script_path: scripts/experiments/11_bc_eval.sh
+    expected_inputs: [BC checkpoints, frozen observations]
+    expected_outputs: [per-seed BC evaluation]
+    metrics: [accuracy-cost, Oracle regret, premature stop]
+    paper_role: M2 BC gate
+    phase: evaluation
+    resumable: true
+  - id: E12
+    purpose: Optionally run two DAgger correction rounds and conditional third round.
+    evidence_class: production
+    dependencies: [E11]
+    required_gates: [bc_evaluation]
+    produces_gates: [dagger]
+    dataset_split: Router training/development only
+    model_roles: [router]
+    gpu_required: true
+    resource_class: projected_from_bc
+    config_path: configs/experiments/e12_dagger.yaml
+    script_path: scripts/experiments/12_dagger.sh
+    expected_inputs: [BC checkpoints, frozen observation graph, Oracle labels]
+    expected_outputs: [DAgger generations and checkpoints]
+    metrics: [utility gain, regret improvement, rounds]
+    paper_role: optional BC correction
+    phase: router_training
+    resumable: true
+  - id: E13
+    purpose: Run the frozen main benchmark matrix on Video-MME long, LVBench, and LongVideoBench.
+    evidence_class: paper
+    dependencies: [E11]
+    required_gates: [bc_evaluation, zero_leakage, label_audit]
+    produces_gates: [main_benchmark]
+    dataset_split: official frozen evaluation splits, video-disjoint from training
+    model_roles: [router, frozen answerer]
+    gpu_required: true
+    resource_class: projected_from_oracle_and_bc
+    config_path: configs/experiments/e13_main.yaml
+    script_path: scripts/experiments/13_main.sh
+    expected_inputs: [all policy checkpoints, frozen benchmark observations]
+    expected_outputs: [per-seed raw predictions, cost rows, Pareto summaries]
+    metrics: [accuracy, Pareto AUC, Cost@Accuracy, fixed-budget accuracy]
+    paper_role: main C1 tables and Pareto figures
+    phase: evaluation
+    resumable: true
+  - id: E14
+    purpose: Run memory hierarchy, Router-state, and auxiliary-head ablations.
+    evidence_class: paper
+    dependencies: [E13]
+    required_gates: [main_benchmark]
+    produces_gates: [ablations_complete]
+    dataset_split: frozen benchmark evaluation splits
+    model_roles: [router, frozen answerer]
+    gpu_required: true
+    resource_class: projected_from_main
+    config_path: configs/experiments/e14_ablations.yaml
+    script_path: scripts/experiments/14_ablations.sh
+    expected_inputs: [main checkpoints, frozen observations]
+    expected_outputs: [ablation matrix]
+    metrics: [accuracy-cost deltas, recall, action distribution]
+    paper_role: ablation table
+    phase: evaluation
+    resumable: true
+  - id: E15
+    purpose: Analyze end-to-end cost, Q-amortization, cache savings, latency, and failures.
+    evidence_class: paper
+    dependencies: [E13]
+    required_gates: [main_benchmark]
+    produces_gates: [efficiency_complete]
+    dataset_split: frozen main benchmark outputs
+    model_roles: []
+    gpu_required: false
+    resource_class: cpu_analysis
+    config_path: configs/experiments/e15_efficiency.yaml
+    script_path: scripts/experiments/15_efficiency.sh
+    expected_inputs: [raw CostRecords and main predictions]
+    expected_outputs: [cost tables, Pareto data, cache and latency summaries]
+    metrics: [Q amortization, GPU seconds, wall seconds, tokens, frames, memory]
+    paper_role: C2 and efficiency figures
+    phase: analysis
+    resumable: true
+  - id: E16
+    purpose: Evaluate cross-dataset transfer using frozen Router and observation identities.
+    evidence_class: paper
+    dependencies: [E13]
+    required_gates: [main_benchmark]
+    produces_gates: [cross_dataset]
+    dataset_split: research-owner-frozen transfer protocol
+    model_roles: [router, frozen answerer]
+    gpu_required: true
+    resource_class: optional_after_core_claims
+    config_path: configs/experiments/e16_cross_dataset.yaml
+    script_path: scripts/experiments/16_cross_dataset.sh
+    expected_inputs: [frozen transfer dataset and main Router]
+    expected_outputs: [cross-dataset raw results]
+    metrics: [accuracy-cost transfer delta]
+    paper_role: generalization appendix
+    phase: evaluation
+    resumable: true
+  - id: E17
+    purpose: Optionally evaluate a second frozen model backbone after core claims pass.
+    evidence_class: paper
+    dependencies: [E16]
+    required_gates: [main_benchmark, cross_dataset]
+    produces_gates: [generalization_complete]
+    dataset_split: same frozen benchmark splits
+    model_roles: [second frozen backbone, router]
+    gpu_required: true
+    resource_class: optional_after_core_claims
+    config_path: configs/experiments/e17_cross_model.yaml
+    script_path: scripts/experiments/17_cross_model.sh
+    expected_inputs: [second-backbone Authority, frozen observations]
+    expected_outputs: [cross-model raw results]
+    metrics: [accuracy-cost model transfer delta]
+    paper_role: generalization appendix
+    phase: evaluation
+    resumable: true

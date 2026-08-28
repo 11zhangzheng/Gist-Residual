@@ -1,0 +1,12 @@
+extends: base.yaml
+experiment_id: E14
+required_fields: [production_authority, source.git_commit, inputs.main_checkpoint, inputs.observation_graph]
+inputs:
+  main_checkpoint: RESEARCH_OWNER_DECISION_REQUIRED
+  observation_graph: RESEARCH_OWNER_DECISION_REQUIRED
+ablations: [asr_embedding_only, gist_plus, no_residual, no_visual, no_context, question_only, no_cost_preference, no_sufficiency_head, no_cost_to_go_head]
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_ABLATION_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/ablation_predictions.jsonl, results/ablation_summary.json]

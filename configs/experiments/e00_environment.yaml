@@ -1,0 +1,16 @@
+extends: base.yaml
+experiment_id: E00
+production_authority: null
+source:
+  require_clean: false
+  git_commit: null
+resources:
+  min_free_disk_gb: 1
+  min_free_vram_mb: 0
+required_environment: []
+required_fields: []
+execution:
+  command: [python, -m, fidmem.experiments.pack_tasks, environment, --project-root, .]
+  may_generate_observations: false
+outputs:
+  required: [results/environment.json]

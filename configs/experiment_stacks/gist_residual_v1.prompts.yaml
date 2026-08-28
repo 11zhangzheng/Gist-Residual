@@ -1,0 +1,35 @@
+schema_version: 1
+stack_id: gist-residual-v1
+prompts:
+  gist_summary:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    source: configs/model/gist.yaml
+    reason: No complete production prompt content is present in the approved implementation.
+    name: gist-summary
+    version: null
+    content: null
+  residual_generation:
+    status: FROZEN
+    source: configs/model/residual.yaml
+    name: residual-generation
+    version: residual-v1
+    content: Extract only novel visual event details.
+  visual_event:
+    status: FROZEN
+    source: configs/model/visual.yaml
+    name: visual-event
+    version: visual-v1
+    content: Describe reusable event observations.
+  visual_question:
+    status: FROZEN
+    source: configs/model/visual.yaml
+    name: visual-question
+    version: visual-v1
+    content: Verify the requested visual detail from the observation.
+  answerer_template:
+    status: RESEARCH_OWNER_DECISION_REQUIRED
+    source: configs/model/answerer.yaml
+    reason: Prompt field names exist, but the complete production template is not frozen.
+    name: answerer-template
+    version: null
+    content: null

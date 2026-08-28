@@ -1,0 +1,24 @@
+extends: base.yaml
+experiment_id: E02
+production_authority: null
+required_fields: [source.git_commit, inputs.authority_draft]
+required_environment:
+  - FIDMEM_INFERENCE_BACKEND
+  - FIDMEM_GIT_COMMIT
+  - FIDMEM_DATA_ROOT
+  - FIDMEM_MODEL_ROOT
+  - FIDMEM_CACHE_ROOT
+  - FIDMEM_ARTIFACT_ROOT
+  - FIDMEM_AUTHORITY_DRAFT
+inputs:
+  authority_draft: env:FIDMEM_AUTHORITY_DRAFT
+  stack_config: configs/experiment_stacks/gist_residual_v1.yaml
+  asset_lock: configs/experiment_stacks/gist_residual_v1.assets.lock.json
+required_paths:
+  - env:FIDMEM_AUTHORITY_DRAFT
+  - configs/experiment_stacks/gist_residual_v1.assets.lock.json
+execution:
+  command: [python, -m, fidmem.assets.setup, e02]
+  may_generate_observations: false
+outputs:
+  required: [results/PRODUCTION_AUTHORITY.json, results/authority_gate_result.json]

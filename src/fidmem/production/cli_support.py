@@ -102,9 +102,16 @@ def production_import_result(args: Any, root: Path) -> dict[str, Any]:
 
 
 def production_report_result(
-    root: Path, *, authority_path: str | Path
+    root: Path,
+    *,
+    authority_path: str | Path,
+    selection_manifest_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    validation = validate_production_run(root, authority_path=authority_path)
+    validation = validate_production_run(
+        root,
+        authority_path=authority_path,
+        selection_manifest_path=selection_manifest_path,
+    )
     return {
         **validation,
         "accuracy_primary_gate": False,

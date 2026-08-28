@@ -1,0 +1,11 @@
+extends: base.yaml
+experiment_id: E17
+required_fields: [production_authority, source.git_commit, inputs.second_backbone_authority, inputs.transfer_checkpoint]
+inputs:
+  second_backbone_authority: RESEARCH_OWNER_DECISION_REQUIRED
+  transfer_checkpoint: RESEARCH_OWNER_DECISION_REQUIRED
+execution:
+  command: [RESEARCH_OWNER_DECISION_REQUIRED_CROSS_MODEL_COMMAND]
+  may_generate_observations: false
+outputs:
+  required: [results/cross_model_predictions.jsonl, results/cross_model_summary.json]

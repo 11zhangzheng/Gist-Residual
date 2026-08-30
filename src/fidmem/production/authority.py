@@ -670,7 +670,13 @@ def validate_authority_draft(
                 )
                 validate_split_isolation(video_manifest, question_manifest)
                 if (
-                    dataset_manifest.video_manifest_sha256
+                    dataset_manifest.dataset_name != dataset.dataset_name
+                    or dataset_manifest.dataset_version != dataset.dataset_version
+                    or dataset_manifest.selected_video_count
+                    != len(video_manifest.records)
+                    or dataset_manifest.selected_question_count
+                    != len(question_manifest.records)
+                    or dataset_manifest.video_manifest_sha256
                     != video_manifest.manifest_sha256
                     or dataset_manifest.question_manifest_sha256
                     != question_manifest.manifest_sha256
@@ -681,7 +687,7 @@ def validate_authority_draft(
                     issue(
                         "dataset_manifest_mismatch",
                         "dataset.dataset_manifest",
-                        "dataset manifest does not bind split/question/video identities",
+                        "dataset manifest does not bind dataset/split/question/video identities",
                     )
             except Exception as exc:
                 issue("dataset_manifest_invalid", "dataset", str(exc))

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from fidmem.production.manifests import (
+    DatasetManifest,
     QuestionManifest,
     QuestionManifestRecord,
     VideoManifest,
@@ -11,6 +13,66 @@ from fidmem.production.manifests import (
     selection_rank_sha256,
     validate_split_isolation,
 )
+
+
+def test_partial_dataset_manifest_requires_selection_identity() -> None:
+    with pytest.raises(ValidationError, match="subset selection"):
+        DatasetManifest(
+            dataset_name="MME-Benchmarks/Video-MME-v2",
+            dataset_version="6e4bebb03202e1ddbf3d37703e560e51c5aa2d64",
+            dataset_scope="PARTIAL_DATASET_PILOT",
+            source_metadata_sha256="1" * 64,
+            source_archive_index_sha256="2" * 64,
+            subset_selection_manifest_sha256=None,
+            selected_video_count=45,
+            selected_question_count=180,
+            available_video_count=800,
+            available_question_count=3200,
+            split_policy_id="videomme-v2-pilot-split-v1",
+            split_policy_sha256="3" * 64,
+            video_manifest_sha256="4" * 64,
+            question_manifest_sha256="5" * 64,
+        )
+
+
+def test_dataset_manifest_selected_counts_cannot_exceed_available_counts() -> None:
+    with pytest.raises(ValidationError, match="selected video count exceeds"):
+        DatasetManifest(
+            dataset_name="MME-Benchmarks/Video-MME-v2",
+            dataset_version="6e4bebb03202e1ddbf3d37703e560e51c5aa2d64",
+            dataset_scope="PARTIAL_DATASET_PILOT",
+            source_metadata_sha256="1" * 64,
+            source_archive_index_sha256="2" * 64,
+            subset_selection_manifest_sha256="6" * 64,
+            selected_video_count=801,
+            selected_question_count=180,
+            available_video_count=800,
+            available_question_count=3200,
+            split_policy_id="videomme-v2-pilot-split-v1",
+            split_policy_sha256="3" * 64,
+            video_manifest_sha256="4" * 64,
+            question_manifest_sha256="5" * 64,
+        )
+
+
+def test_full_dataset_manifest_forbids_selection_identity() -> None:
+    with pytest.raises(ValidationError, match="full dataset forbids"):
+        DatasetManifest(
+            dataset_name="MME-Benchmarks/Video-MME-v2",
+            dataset_version="6e4bebb03202e1ddbf3d37703e560e51c5aa2d64",
+            dataset_scope="FULL_DATASET",
+            source_metadata_sha256="1" * 64,
+            source_archive_index_sha256="2" * 64,
+            subset_selection_manifest_sha256="6" * 64,
+            selected_video_count=800,
+            selected_question_count=3200,
+            available_video_count=800,
+            available_question_count=3200,
+            split_policy_id="videomme-v2-pilot-split-v1",
+            split_policy_sha256="3" * 64,
+            video_manifest_sha256="4" * 64,
+            question_manifest_sha256="5" * 64,
+        )
 
 
 def video(video_id: str, group: str) -> VideoManifestRecord:

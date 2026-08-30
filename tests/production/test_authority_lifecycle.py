@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 
 import pytest
@@ -98,6 +99,51 @@ def test_mutated_manifest_is_rejected(tmp_path) -> None:
     (tmp_path / draft.dataset.video_manifest_path).write_text("{}\n", encoding="utf-8")
 
     assert "manifest_hash_mismatch" in validate(draft, tmp_path).error_codes
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dataset_scope", "PARTIAL_DATASET_PILOT"),
+        ("source_metadata_sha256", "9" * 64),
+    ],
+)
+def test_dataset_manifest_provenance_tampering_is_rejected(
+    tmp_path, field, value
+) -> None:
+    draft = complete_draft(tmp_path)
+    dataset_path = tmp_path / draft.dataset.dataset_manifest_path
+    payload = json.loads(dataset_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    dataset_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert "manifest_hash_mismatch" in validate(draft, tmp_path).error_codes
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dataset_name", "OtherDataset"),
+        ("dataset_version", "other-version"),
+        ("selected_video_count", 0),
+        ("selected_question_count", 0),
+    ],
+)
+def test_dataset_manifest_identity_and_counts_must_match_bound_manifests(
+    tmp_path, field, value
+) -> None:
+    draft = complete_draft(tmp_path)
+    dataset_path = tmp_path / draft.dataset.dataset_manifest_path
+    payload = json.loads(dataset_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    dataset_path.write_text(json.dumps(payload), encoding="utf-8")
+    changed_dataset = draft.dataset.model_copy(
+        update={"dataset_manifest_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest()}
+    )
+
+    report = validate(draft.model_copy(update={"dataset": changed_dataset}), tmp_path)
+
+    assert "dataset_manifest_mismatch" in report.error_codes
 
 
 def test_repository_identity_mismatch_is_rejected(tmp_path) -> None:

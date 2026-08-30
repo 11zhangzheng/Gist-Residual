@@ -10,6 +10,7 @@ from fidmem.production.authority import canonical_sha256
 
 ExperimentGroup = Literal["development", "canary", "oracle", "holdout"]
 GroundTruthScope = Literal["none", "oracle", "evaluation"]
+DatasetScope = Literal["PARTIAL_DATASET_PILOT", "FULL_DATASET"]
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 
@@ -78,10 +79,38 @@ class DatasetManifest(_FrozenModel):
     schema_version: Literal[1] = 1
     dataset_name: str = Field(min_length=1)
     dataset_version: str = Field(min_length=1)
+    dataset_scope: DatasetScope
+    source_metadata_sha256: str = Field(pattern=_SHA256_PATTERN)
+    source_archive_index_sha256: str = Field(pattern=_SHA256_PATTERN)
+    subset_selection_manifest_sha256: str | None = Field(
+        pattern=_SHA256_PATTERN
+    )
+    selected_video_count: int = Field(ge=0)
+    selected_question_count: int = Field(ge=0)
+    available_video_count: int = Field(ge=0)
+    available_question_count: int = Field(ge=0)
     split_policy_id: str = Field(min_length=1)
     split_policy_sha256: str = Field(pattern=_SHA256_PATTERN)
     video_manifest_sha256: str = Field(pattern=_SHA256_PATTERN)
     question_manifest_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def dataset_scope_is_bound_to_provenance(self) -> Self:
+        if self.selected_video_count > self.available_video_count:
+            raise ValueError("selected video count exceeds available video count")
+        if self.selected_question_count > self.available_question_count:
+            raise ValueError("selected question count exceeds available question count")
+        if (
+            self.dataset_scope == "PARTIAL_DATASET_PILOT"
+            and self.subset_selection_manifest_sha256 is None
+        ):
+            raise ValueError("partial dataset requires a subset selection identity")
+        if (
+            self.dataset_scope == "FULL_DATASET"
+            and self.subset_selection_manifest_sha256 is not None
+        ):
+            raise ValueError("full dataset forbids a subset selection identity")
+        return self
 
 
 class SelectionManifest(_FrozenModel):

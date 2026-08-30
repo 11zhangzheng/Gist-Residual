@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from fidmem.assets.stack import ExperimentStack, load_experiment_stack
+from fidmem.assets.stack import ExperimentStack, PhysicalAsset, load_experiment_stack
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,3 +34,30 @@ def test_stack_rejects_mutable_or_short_revision(revision: str) -> None:
     payload["physical_assets"]["bge_m3"]["immutable_revision"] = revision
     with pytest.raises(ValidationError, match="full lowercase commit SHA"):
         ExperimentStack.model_validate(payload)
+
+
+def test_dataset_include_files_are_normalized_and_safe() -> None:
+    asset = PhysicalAsset(
+        repo_id="owner/dataset",
+        repo_type="dataset",
+        backend="huggingface_hub",
+        include_files=("test.parquet", "README.md", "test.parquet"),
+    )
+
+    assert asset.include_files == ("README.md", "test.parquet")
+
+    for unsafe_name in (
+        "",
+        "   ",
+        "/README.md",
+        "C:\\README.md",
+        "../README.md",
+        "data/../test.parquet",
+    ):
+        with pytest.raises(ValidationError, match="include_files"):
+            PhysicalAsset(
+                repo_id="owner/dataset",
+                repo_type="dataset",
+                backend="huggingface_hub",
+                include_files=(unsafe_name,),
+            )

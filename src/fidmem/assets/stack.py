@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal, Self
 
 from omegaconf import OmegaConf
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _FORBIDDEN_REVISIONS = {"main", "master", "latest"}
@@ -23,6 +23,7 @@ class PhysicalAsset(_FrozenModel):
     immutable_revision: str | None = None
     backend: str = Field(min_length=1)
     dtype: str | None = None
+    include_files: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def revision_is_immutable(self) -> Self:
@@ -32,6 +33,23 @@ class PhysicalAsset(_FrozenModel):
         if revision in _FORBIDDEN_REVISIONS or not _COMMIT_RE.fullmatch(revision):
             raise ValueError("immutable_revision must be a full lowercase commit SHA")
         return self
+
+    @field_validator("include_files")
+    @classmethod
+    def include_files_are_safe(cls, include_files: tuple[str, ...]) -> tuple[str, ...]:
+        include_files = tuple(sorted(set(include_files)))
+        for name in include_files:
+            posix_path = PurePosixPath(name)
+            windows_path = PureWindowsPath(name)
+            if (
+                not name.strip()
+                or posix_path.is_absolute()
+                or windows_path.is_absolute()
+                or ".." in posix_path.parts
+                or ".." in windows_path.parts
+            ):
+                raise ValueError("include_files must contain safe relative file names")
+        return include_files
 
 
 class BenchmarkIdentity(_FrozenModel):

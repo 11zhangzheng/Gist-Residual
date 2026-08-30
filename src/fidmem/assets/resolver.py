@@ -14,7 +14,7 @@ from typing import Any, Callable, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from fidmem.assets.stack import ExperimentStack
+from fidmem.assets.stack import ExperimentStack, PhysicalAsset
 from fidmem.production.authority import canonical_json_bytes, canonical_sha256
 
 RESOLVER_VERSION = "fidmem.asset-resolver/v1"
@@ -145,19 +145,7 @@ def write_asset_lock(path: str | Path, lock: AssetLock) -> None:
 def initial_lock(stack: ExperimentStack) -> AssetLock:
     now = utc_now()
     entries = {
-        asset_id: AssetLockEntry(
-            repo_id=asset.repo_id,
-            repo_type=asset.repo_type,
-            immutable_revision=asset.immutable_revision,
-            state=(
-                AssetState.RESOLVED
-                if asset.immutable_revision is not None
-                else AssetState.UNRESOLVED
-            ),
-            backend=asset.backend,
-            dtype=asset.dtype,
-            resolved_at=now if asset.immutable_revision is not None else None,
-        )
+        asset_id: _initial_entry(asset, now=now)
         for asset_id, asset in stack.physical_assets.items()
     }
     return AssetLock.create(
@@ -166,6 +154,55 @@ def initial_lock(stack: ExperimentStack) -> AssetLock:
         logical_roles=dict(stack.logical_roles),
         physical_assets=entries,
         huggingface_hub_version=None,
+    )
+
+
+def _initial_entry(asset: PhysicalAsset, *, now: str) -> AssetLockEntry:
+    return AssetLockEntry(
+        repo_id=asset.repo_id,
+        repo_type=asset.repo_type,
+        immutable_revision=asset.immutable_revision,
+        state=(
+            AssetState.RESOLVED
+            if asset.immutable_revision is not None
+            else AssetState.UNRESOLVED
+        ),
+        backend=asset.backend,
+        dtype=asset.dtype,
+        resolved_at=now if asset.immutable_revision is not None else None,
+    )
+
+
+def _asset_identity(asset: PhysicalAsset | AssetLockEntry) -> tuple[
+    str, str, str | None, str, str | None
+]:
+    return (
+        asset.repo_id,
+        asset.repo_type,
+        asset.immutable_revision,
+        asset.backend,
+        asset.dtype,
+    )
+
+
+def reconcile_lock(stack: ExperimentStack, previous: AssetLock) -> AssetLock:
+    """Rebuild a stack lock while retaining entries with exact immutable identity."""
+    now = utc_now()
+    previous_by_identity = {
+        _asset_identity(entry): entry for entry in previous.physical_assets.values()
+    }
+    entries = {
+        asset_id: previous_by_identity.get(
+            _asset_identity(asset), _initial_entry(asset, now=now)
+        )
+        for asset_id, asset in stack.physical_assets.items()
+    }
+    return AssetLock.create(
+        stack_id=stack.stack_id,
+        generated_at=now,
+        logical_roles=dict(stack.logical_roles),
+        physical_assets=entries,
+        huggingface_hub_version=previous.huggingface_hub_version,
     )
 
 
@@ -262,15 +299,24 @@ def resolve_entry(
     entry: AssetLockEntry,
     *,
     info_loader: Callable[[str, str], tuple[str, tuple[str, ...]]],
+    required_files: tuple[str, ...] = (),
 ) -> AssetLockEntry:
     revision, files = info_loader(entry.repo_id, entry.repo_type)
     if not re.fullmatch(_COMMIT_PATTERN, revision):
         raise ValueError("remote resolver did not return a full immutable commit SHA")
+    remote_files = tuple(sorted(set(files)))
+    missing = sorted(set(required_files) - set(remote_files))
+    if missing:
+        raise ValueError(f"required remote files are missing: {missing}")
     return entry.model_copy(
         update={
             "immutable_revision": revision,
             "state": AssetState.RESOLVED,
-            "expected_files": tuple(sorted(set(files))),
+            "expected_files": (
+                remote_files
+                if entry.repo_type == "model"
+                else required_files or remote_files
+            ),
             "resolved_at": utc_now(),
             "failure": None,
         }

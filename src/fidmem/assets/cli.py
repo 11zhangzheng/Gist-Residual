@@ -16,6 +16,7 @@ from fidmem.assets.resolver import (
     check_storage_roots,
     huggingface_info_loader,
     load_asset_lock,
+    reconcile_lock,
     resolve_entry,
     snapshot_download_entry,
     storage_roots,
@@ -68,6 +69,32 @@ def _failed(entry: AssetLockEntry, exc: Exception) -> AssetLockEntry:
     )
 
 
+def _reconciliation_asset_ids(
+    stack, lock: AssetLock
+) -> tuple[list[str], list[str]]:
+    previous_identities = {
+        (
+            entry.repo_id,
+            entry.repo_type,
+            entry.immutable_revision,
+            entry.backend,
+            entry.dtype,
+        )
+        for entry in lock.physical_assets.values()
+    }
+    preserved, reset = [], []
+    for asset_id, asset in sorted(stack.physical_assets.items()):
+        identity = (
+            asset.repo_id,
+            asset.repo_type,
+            asset.immutable_revision,
+            asset.backend,
+            asset.dtype,
+        )
+        (preserved if identity in previous_identities else reset).append(asset_id)
+    return preserved, reset
+
+
 def operate(
     action: str,
     *,
@@ -85,12 +112,40 @@ def operate(
 ) -> dict[str, object]:
     stack = load_experiment_stack(stack_path)
     lock = load_asset_lock(lock_path)
-    if lock.stack_id != stack.stack_id or lock.logical_roles != stack.logical_roles:
+    effective_action = "verify" if verify_only else action
+    if (
+        effective_action != "reconcile"
+        and (lock.stack_id != stack.stack_id or lock.logical_roles != stack.logical_roles)
+    ):
         raise ValueError("stack config and asset lock identities differ")
+    if effective_action == "reconcile":
+        reconciled = reconcile_lock(stack, lock)
+        preserved_asset_ids, reset_asset_ids = _reconciliation_asset_ids(stack, lock)
+        if dry_run:
+            return {
+                "status": "DRY_RUN",
+                "action": effective_action,
+                "preserved_asset_ids": preserved_asset_ids,
+                "reset_asset_ids": reset_asset_ids,
+            }
+        if check:
+            return {
+                "status": "CHECK_PASSED",
+                "action": effective_action,
+                "preserved_asset_ids": preserved_asset_ids,
+                "reset_asset_ids": reset_asset_ids,
+            }
+        write_asset_lock(lock_path, reconciled)
+        return {
+            "status": "COMPLETED",
+            "action": effective_action,
+            "lock_sha256": reconciled.lock_sha256,
+            "preserved_asset_ids": preserved_asset_ids,
+            "reset_asset_ids": reset_asset_ids,
+        }
     selected = _selected(lock, asset_kind)
     if not selected:
         raise ValueError("asset selection is empty")
-    effective_action = "verify" if verify_only else action
     roots = storage_roots() if effective_action in {"download", "verify"} else None
     storage_report = check_storage_roots(roots) if roots is not None else {}
     plan = [
@@ -125,7 +180,9 @@ def operate(
             if effective_action == "resolve":
                 revision, files = info_loader(entry.repo_id, entry.repo_type)
                 resolved = resolve_entry(
-                    entry, info_loader=lambda _repo, _type: (revision, files)
+                    entry,
+                    info_loader=lambda _repo, _type: (revision, files),
+                    required_files=stack.physical_assets[asset_id].include_files,
                 )
                 checked.append(
                     {
@@ -159,7 +216,9 @@ def operate(
         for asset_id in selected:
             try:
                 entries[asset_id] = resolve_entry(
-                    entries[asset_id], info_loader=info_loader
+                    entries[asset_id],
+                    info_loader=info_loader,
+                    required_files=stack.physical_assets[asset_id].include_files,
                 )
             except Exception as exc:
                 entries[asset_id] = _failed(entries[asset_id], exc)
@@ -241,7 +300,9 @@ def operate(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("resolve", "download", "verify", "lock"))
+    parser.add_argument(
+        "action", choices=("resolve", "download", "verify", "lock", "reconcile")
+    )
     parser.add_argument(
         "--stack", default="configs/experiment_stacks/gist_residual_v1.yaml"
     )

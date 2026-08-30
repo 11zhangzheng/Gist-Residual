@@ -3,27 +3,34 @@
 from __future__ import annotations
 
 import json
+import sys
 from io import BufferedReader
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import duckdb
 import pytest
 
 from fidmem.assets.videomme_v2 import (
+    DATASET_ID,
     FROZEN_REVISION,
     HumanAuditManifest,
     METADATA_FILES,
     OfficialFileIdentity,
+    OFFICIAL_ARCHIVE_PATHS,
     POOL_ALGORITHM,
     POOL_SEED,
     build_human_audit_manifest,
     build_archive_index,
     full_scope_media,
+    load_official_archive_identities,
+    open_official_archive,
     select_pilot,
     validate_human_audit_result,
     verify_metadata,
 )
+from fidmem.production.authority import canonical_sha256
 
 
 def _rows(*, videos: int = 25) -> list[tuple[object, ...]]:
@@ -373,6 +380,9 @@ def test_archive_index_records_only_safe_canonical_members_and_exact_metadata_co
     [
         ("../escape.mp4", "unsafe ZIP member path"),
         ("/absolute.mp4", "unsafe ZIP member path"),
+        (r"..\escape.mp4", "unsafe ZIP member path"),
+        (r"C:\escape.mp4", "unsafe ZIP member path"),
+        (r"\\server\share\escape.mp4", "unsafe ZIP member path"),
         ("not-a-video.txt", "non-MP4 ZIP member"),
     ],
 )
@@ -480,8 +490,12 @@ def test_pilot_selection_is_archive_aware_deterministic_and_question_independent
         def questions(self) -> tuple[object, ...]:
             raise AssertionError("pilot selection must not inspect questions or answers")
 
-    first = select_pilot(MetadataWithoutQuestionContents(), index)
-    second = select_pilot(MetadataWithoutQuestionContents(), index)
+    first = select_pilot(
+        MetadataWithoutQuestionContents(), index, _expected_video_ids=metadata.video_ids
+    )
+    second = select_pilot(
+        MetadataWithoutQuestionContents(), index, _expected_video_ids=metadata.video_ids
+    )
 
     assert first.pool_algorithm == POOL_ALGORITHM
     assert first.pool_seed == POOL_SEED
@@ -492,6 +506,174 @@ def test_pilot_selection_is_archive_aware_deterministic_and_question_independent
     assert set(first.selected_video_ids).issubset(
         {member.video_id for member in index.members}
     )
+
+
+def _uneven_archive_fixtures(
+    root: Path, members_by_archive: tuple[tuple[str, ...], ...]
+) -> tuple[OfficialFileIdentity, ...]:
+    root.mkdir()
+    identities = []
+    for archive_number, video_ids in enumerate(members_by_archive, start=1):
+        archive_path = f"videos/{archive_number:03d}.zip"
+        local_path = root / f"{archive_number:03d}.zip"
+        with ZipFile(local_path, "w", compression=ZIP_DEFLATED) as archive:
+            for video_id in video_ids:
+                archive.writestr(f"{video_id}.mp4", b"engineering-mp4")
+        identities.append(
+            OfficialFileIdentity(
+                path=archive_path,
+                size=local_path.stat().st_size,
+                upstream_sha256=f"{archive_number:064x}",
+            )
+        )
+    return tuple(identities)
+
+
+def _independent_pilot_expected(
+    members_by_archive: tuple[tuple[str, ...], ...], count: int
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    archive_by_video = {
+        video_id: f"videos/{archive_number:03d}.zip"
+        for archive_number, video_ids in enumerate(members_by_archive, start=1)
+        for video_id in video_ids
+    }
+    rank = lambda video_id: (
+        canonical_sha256(
+            {"algorithm": POOL_ALGORITHM, "seed": POOL_SEED, "video_id": video_id}
+        ),
+        video_id,
+    )
+    covered: set[str] = set()
+    selected_archives: set[str] = set()
+    for video_id in sorted(archive_by_video, key=rank):
+        if video_id not in covered:
+            archive_path = archive_by_video[video_id]
+            selected_archives.add(archive_path)
+            archive_number = int(Path(archive_path).stem)
+            covered.update(members_by_archive[archive_number - 1])
+        if len(covered) >= count:
+            break
+    return tuple(sorted(selected_archives)), tuple(sorted(covered, key=rank)[:count])
+
+
+def test_pilot_selection_matches_independent_uneven_archive_hash_ranking(
+    tmp_path: Path,
+) -> None:
+    members_by_archive = (
+        tuple(f"{number:03d}" for number in range(0, 12)),
+        tuple(f"{number:03d}" for number in range(12, 58)),
+        tuple(f"{number:03d}" for number in range(58, 80)),
+    )
+    metadata_root = tmp_path / "metadata"
+    _metadata(metadata_root, rows=_rows(videos=80))
+    metadata = _verify(metadata_root, expected_question_count=320, expected_video_count=80)
+    archive_root = tmp_path / "archives"
+    identities = _uneven_archive_fixtures(archive_root, members_by_archive)
+    index = build_archive_index(
+        identities,
+        _fixture_opener(archive_root),
+        metadata_video_ids=metadata.video_ids,
+        _expected_archive_paths=tuple(identity.path for identity in identities),
+    )
+
+    selected = select_pilot(
+        metadata, index, _expected_video_ids=metadata.video_ids
+    )
+    expected_archives, expected_videos = _independent_pilot_expected(
+        members_by_archive, count=45
+    )
+
+    assert selected.selected_archive_paths == expected_archives
+    assert selected.selected_video_ids == expected_videos
+
+
+def test_pilot_selection_default_rejects_non_official_source_population(
+    tmp_path: Path,
+) -> None:
+    metadata_root = tmp_path / "metadata"
+    _metadata(metadata_root, rows=_rows(videos=60))
+    metadata = _verify(metadata_root, expected_question_count=240, expected_video_count=60)
+    archive_root = tmp_path / "archives"
+    identities = _archive_fixtures(archive_root)
+    index = build_archive_index(
+        identities,
+        _fixture_opener(archive_root),
+        metadata_video_ids=metadata.video_ids,
+        _expected_archive_paths=tuple(identity.path for identity in identities),
+    )
+
+    with pytest.raises(ValueError, match="full source population"):
+        select_pilot(metadata, index)
+
+
+def _official_hub_siblings(*, extra_archive: bool = False) -> tuple[object, ...]:
+    paths = OFFICIAL_ARCHIVE_PATHS + (("videos/041.zip",) if extra_archive else ())
+    return tuple(
+        SimpleNamespace(
+            rfilename=path,
+            size=100 + number,
+            lfs=SimpleNamespace(sha256=f"{number:064x}"),
+        )
+        for number, path in enumerate(paths, start=1)
+    )
+
+
+def test_remote_archive_helpers_use_exact_pinned_hub_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    stream = object()
+
+    class FakeHfApi:
+        def dataset_info(self, **kwargs: object) -> object:
+            calls["dataset_info"] = kwargs
+            return SimpleNamespace(siblings=_official_hub_siblings())
+
+    class FakeHfFileSystem:
+        def __init__(self, *, token: bool) -> None:
+            calls["token"] = token
+
+        def open(self, path: str, mode: str, *, block_size: int) -> object:
+            calls["open"] = (path, mode, block_size)
+            return stream
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(HfApi=FakeHfApi, HfFileSystem=FakeHfFileSystem),
+    )
+
+    identities = load_official_archive_identities()
+    opened = open_official_archive(identities[0])
+
+    assert calls["dataset_info"] == {
+        "repo_id": DATASET_ID,
+        "revision": FROZEN_REVISION,
+        "files_metadata": True,
+    }
+    assert tuple(identity.path for identity in identities) == OFFICIAL_ARCHIVE_PATHS
+    assert calls["token"] is False
+    assert calls["open"] == (
+        f"datasets/{DATASET_ID}@{FROZEN_REVISION}/{OFFICIAL_ARCHIVE_PATHS[0]}",
+        "rb",
+        1024 * 1024,
+    )
+    assert opened is stream
+
+
+def test_remote_archive_identity_loading_rejects_unexpected_video_zip_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeHfApi:
+        def dataset_info(self, **kwargs: object) -> object:
+            return SimpleNamespace(siblings=_official_hub_siblings(extra_archive=True))
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeHfApi)
+    )
+
+    with pytest.raises(ValueError, match="unexpected official archive siblings"):
+        load_official_archive_identities()
 
 
 def test_full_scope_media_has_all_pinned_archives_and_videos_without_a_selection_hash(

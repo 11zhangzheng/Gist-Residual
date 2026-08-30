@@ -24,6 +24,7 @@ DATASET_ID = "MME-Benchmarks/Video-MME-v2"
 FROZEN_REVISION = "6e4bebb03202e1ddbf3d37703e560e51c5aa2d64"
 METADATA_FILES = ("README.md", "subtitle.zip", "test.parquet")
 OFFICIAL_ARCHIVE_PATHS = tuple(f"videos/{number:03d}.zip" for number in range(1, 41))
+OFFICIAL_VIDEO_IDS = tuple(f"{number:03d}" for number in range(800))
 POOL_SEED = "videomme-v2-partial-pilot-pool-v1"
 POOL_ALGORITHM = "videomme-v2-archive-aware-hash-v1"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -312,6 +313,13 @@ def load_official_archive_identities() -> tuple[OfficialFileIdentity, ...]:
     siblings = {str(item.rfilename): item for item in (info.siblings or ())}
     if set(OFFICIAL_ARCHIVE_PATHS) - set(siblings):
         raise ValueError("Video-MME-v2 official archive siblings are missing")
+    archive_siblings = {
+        path
+        for path in siblings
+        if path.startswith("videos/") and path.endswith(".zip")
+    }
+    if archive_siblings - set(OFFICIAL_ARCHIVE_PATHS):
+        raise ValueError("Video-MME-v2 remote contains unexpected official archive siblings")
     identities: list[OfficialFileIdentity] = []
     for path in OFFICIAL_ARCHIVE_PATHS:
         sibling = siblings[path]
@@ -358,10 +366,16 @@ def select_pilot(
     metadata: ParsedVideoMME,
     archive_index: ArchiveIndex,
     count: int = 45,
+    *,
+    _expected_video_ids: tuple[str, ...] = OFFICIAL_VIDEO_IDS,
 ) -> PilotSelectionManifest:
     """Select a deterministic archive-aware pilot without reading question content."""
     if count <= 0:
         raise ValueError("pilot selection count must be positive")
+    if tuple(metadata.video_ids) != tuple(_expected_video_ids):
+        raise ValueError(
+            "Video-MME-v2 pilot selection requires the exact full source population"
+        )
     _validate_metadata_coverage(metadata.video_ids, archive_index.video_ids)
     if count > len(archive_index.video_ids):
         raise ValueError("pilot selection count exceeds available videos")

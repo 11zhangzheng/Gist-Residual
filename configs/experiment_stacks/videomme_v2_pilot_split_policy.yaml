@@ -1,0 +1,17 @@
+schema_version: 1
+split_policy_id: videomme-v2-pilot-split-v1
+dataset_scope: PARTIAL_DATASET_PILOT
+split_unit: video_id
+pool:
+  video_count: 45
+  seed: videomme-v2-partial-pilot-pool-v1
+  algorithm: videomme-v2-archive-aware-hash-v1
+  question_independent: true
+split:
+  seed: videomme-v2-partial-pilot-split-v1
+  algorithm: videomme-v2-partial-pilot-split-v1
+  video_groups:
+    oracle: 25
+    canary: 4
+    holdout: 4
+    development: 12

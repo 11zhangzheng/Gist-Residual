@@ -86,7 +86,7 @@ def test_failed_resolution_is_atomically_recorded(monkeypatch, tmp_path: Path) -
             verify_only=False,
             info_loader=fail_resolution,
         )
-    failed = load_asset_lock(lock_path).physical_assets["longtvqa_metadata"]
+    failed = load_asset_lock(lock_path).physical_assets["videomme_v2_metadata"]
     assert failed.state is AssetState.FAILED
     assert failed.failure == "RuntimeError: engineering fixture resolution failure"
 
@@ -108,7 +108,7 @@ def test_reconcile_check_reports_preserved_and_reset_assets_without_writing(
         stack_payload["physical_assets"][asset_id]["immutable_revision"] = (
             entry.immutable_revision
         )
-    replacement = stack_payload["physical_assets"].pop("longtvqa_metadata")
+    replacement = stack_payload["physical_assets"].pop("videomme_v2_metadata")
     replacement.update(
         {"repo_id": "owner/replacement-dataset", "immutable_revision": "b" * 40}
     )
@@ -157,7 +157,7 @@ def test_reconcile_writes_changed_dataset_with_preserved_verified_models(
         stack_payload["physical_assets"][asset_id]["immutable_revision"] = (
             entry.immutable_revision
         )
-    replacement = stack_payload["physical_assets"].pop("longtvqa_metadata")
+    replacement = stack_payload["physical_assets"].pop("videomme_v2_metadata")
     replacement.update(
         {"repo_id": "owner/replacement-dataset", "immutable_revision": "b" * 40}
     )

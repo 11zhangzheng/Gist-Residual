@@ -25,11 +25,11 @@ REVISION = "a" * 40
 REMOTE_FILES = ("README.md", "subtitle.zip", "test.parquet", "videos/001.zip")
 
 
-def test_initial_lock_preserves_unresolved_asset_and_reuse() -> None:
+def test_initial_lock_preserves_pinned_asset_identity_and_reuse() -> None:
     lock = initial_lock(
         load_experiment_stack(ROOT / "configs/experiment_stacks/gist_residual_v1.yaml")
     )
-    assert lock.physical_assets["qwen3_vl_8b_instruct"].state is AssetState.UNRESOLVED
+    assert lock.physical_assets["qwen3_vl_8b_instruct"].state is AssetState.RESOLVED
     assert lock.logical_roles["residual_model"] == lock.logical_roles["visual_model"]
     with pytest.raises(ValueError, match="not VERIFIED"):
         assert_verified_lock(lock)
@@ -119,7 +119,7 @@ def test_reconcile_preserves_exact_model_identities_and_resets_changed_dataset()
         stack_payload["physical_assets"][asset_id]["immutable_revision"] = (
             entry.immutable_revision
         )
-    stack_payload["physical_assets"]["longtvqa_metadata"].update(
+    stack_payload["physical_assets"]["videomme_v2_metadata"].update(
         {"repo_id": "owner/replacement-dataset", "immutable_revision": "b" * 40}
     )
 
@@ -133,7 +133,7 @@ def test_reconcile_preserves_exact_model_identities_and_resets_changed_dataset()
     ):
         assert reconciled.physical_assets[asset_id] == previous.physical_assets[asset_id]
         assert reconciled.physical_assets[asset_id].state is AssetState.VERIFIED
-    replacement = reconciled.physical_assets["longtvqa_metadata"]
+    replacement = reconciled.physical_assets["videomme_v2_metadata"]
     assert replacement.repo_id == "owner/replacement-dataset"
     assert replacement.immutable_revision == "b" * 40
     assert replacement.state is AssetState.RESOLVED

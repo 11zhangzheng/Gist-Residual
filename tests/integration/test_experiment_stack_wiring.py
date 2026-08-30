@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
 from fidmem.experiments.execution_pack import (
     CheckFailure,
@@ -54,6 +55,39 @@ def test_e03_points_to_stack_contract_without_changing_canary_size() -> None:
         config["inputs"]["provider_backend_factory"]
         == "env:FIDMEM_PROVIDER_BACKEND_FACTORY"
     )
+
+
+def test_videomme_pilot_policy_is_video_disjoint_and_question_independent() -> None:
+    """Changing deterministic pilot selection or group sizes must fail this contract."""
+    policy = OmegaConf.to_container(
+        OmegaConf.load(
+            ROOT / "configs/experiment_stacks/videomme_v2_pilot_split_policy.yaml"
+        ),
+        resolve=True,
+    )
+
+    assert policy == {
+        "schema_version": 1,
+        "split_policy_id": "videomme-v2-pilot-split-v1",
+        "dataset_scope": "PARTIAL_DATASET_PILOT",
+        "split_unit": "video_id",
+        "pool": {
+            "video_count": 45,
+            "seed": "videomme-v2-partial-pilot-pool-v1",
+            "algorithm": "videomme-v2-archive-aware-hash-v1",
+            "question_independent": True,
+        },
+        "split": {
+            "seed": "videomme-v2-partial-pilot-split-v1",
+            "algorithm": "videomme-v2-partial-pilot-split-v1",
+            "video_groups": {
+                "oracle": 25,
+                "canary": 4,
+                "holdout": 4,
+                "development": 12,
+            },
+        },
+    }
 
 
 def test_environment_references_are_resolved_before_run_hashing(monkeypatch) -> None:

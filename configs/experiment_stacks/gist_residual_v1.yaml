@@ -4,12 +4,13 @@ status: CANDIDATE_ASSETS_UNVERIFIED
 backend: HuggingFace Transformers
 dtype: bfloat16
 physical_assets:
-  longtvqa_metadata:
-    repo_id: longvideoagent/LongTVQA
+  videomme_v2_metadata:
+    repo_id: MME-Benchmarks/Video-MME-v2
     repo_type: dataset
-    immutable_revision: 6831b8467c69b08055dc5b055d3133a8db1177b4
+    immutable_revision: 6e4bebb03202e1ddbf3d37703e560e51c5aa2d64
     backend: huggingface_hub
     dtype: null
+    include_files: [README.md, subtitle.zip, test.parquet]
   bge_m3:
     repo_id: BAAI/bge-m3
     repo_type: model
@@ -25,7 +26,7 @@ physical_assets:
   qwen3_vl_8b_instruct:
     repo_id: Qwen/Qwen3-VL-8B-Instruct
     repo_type: model
-    immutable_revision: null
+    immutable_revision: 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
     backend: HuggingFace Transformers
     dtype: bfloat16
   qwen3_8b:
@@ -35,7 +36,7 @@ physical_assets:
     backend: HuggingFace Transformers
     dtype: bfloat16
 logical_roles:
-  source_dataset: longtvqa_metadata
+  source_dataset: videomme_v2_metadata
   gist_text_encoder: bge_m3
   gist_visual_encoder: siglip2_so400m_patch14_384
   embedding_model: bge_m3
@@ -43,12 +44,12 @@ logical_roles:
   visual_model: qwen3_vl_8b_instruct
   answerer: qwen3_8b
 target_benchmarks:
-  video_mme_v2:
-    repo_id: Video-MME-v2
-    status: DEFERRED
   lvbench:
     repo_id: LVBench
     status: DEFERRED
   longvideobench:
     repo_id: LongVideoBench
+    status: DEFERRED
+  mlvu:
+    repo_id: MLVU
     status: DEFERRED

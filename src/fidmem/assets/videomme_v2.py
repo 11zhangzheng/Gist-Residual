@@ -6,9 +6,13 @@ import ast
 import hashlib
 import json
 from collections import Counter
+from collections.abc import Callable
+from contextlib import closing
+from pathlib import PurePosixPath
 from pathlib import Path
-from typing import Any, Literal, Self
-from zipfile import BadZipFile, ZipFile
+import re
+from typing import Any, BinaryIO, Literal, Self
+from zipfile import BadZipFile, ZipFile, ZipInfo
 
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,6 +23,10 @@ from fidmem.production.authority import canonical_sha256
 DATASET_ID = "MME-Benchmarks/Video-MME-v2"
 FROZEN_REVISION = "6e4bebb03202e1ddbf3d37703e560e51c5aa2d64"
 METADATA_FILES = ("README.md", "subtitle.zip", "test.parquet")
+OFFICIAL_ARCHIVE_PATHS = tuple(f"videos/{number:03d}.zip" for number in range(1, 41))
+POOL_SEED = "videomme-v2-partial-pilot-pool-v1"
+POOL_ALGORITHM = "videomme-v2-archive-aware-hash-v1"
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _EXPECTED_COLUMNS = (
     "video_id",
     "url",
@@ -76,6 +84,331 @@ class ParsedVideoMME(_FrozenModel):
     questions: tuple[VideoMMEQuestion, ...]
     video_ids: tuple[str, ...]
     report: MetadataVerificationReport
+
+
+class OfficialFileIdentity(_FrozenModel):
+    """Pinned identity of one official Video-MME-v2 ZIP sibling."""
+
+    path: str = Field(min_length=1)
+    size: int = Field(gt=0)
+    upstream_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+
+class ArchiveMemberIdentity(_FrozenModel):
+    """A media member observed from a ZIP central directory only."""
+
+    archive_path: str = Field(min_length=1)
+    video_id: str = Field(pattern=r"^\d{3}$")
+    member_path: str = Field(min_length=1)
+    crc32: int = Field(ge=0, le=0xFFFFFFFF)
+    compressed_size: int = Field(ge=0)
+    uncompressed_size: int = Field(gt=0)
+
+
+class ArchiveIndex(_FrozenModel):
+    """Canonical, hash-bound inventory of official archive central directories."""
+
+    schema_version: Literal[1] = 1
+    dataset_id: Literal[DATASET_ID] = DATASET_ID
+    immutable_revision: Literal[FROZEN_REVISION] = FROZEN_REVISION
+    archives: tuple[OfficialFileIdentity, ...] = Field(min_length=1)
+    members: tuple[ArchiveMemberIdentity, ...] = Field(min_length=1)
+    archive_index_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def canonical_contents_and_hash_match(self) -> Self:
+        archive_paths = tuple(archive.path for archive in self.archives)
+        if archive_paths != tuple(sorted(archive_paths)) or len(archive_paths) != len(
+            set(archive_paths)
+        ):
+            raise ValueError("archive index archive paths must be unique and canonical")
+        member_keys = tuple(
+            (member.archive_path, member.member_path) for member in self.members
+        )
+        if member_keys != tuple(sorted(member_keys)) or len(member_keys) != len(
+            set(member_keys)
+        ):
+            raise ValueError("archive index members must be unique and canonical")
+        video_ids = tuple(member.video_id for member in self.members)
+        if len(video_ids) != len(set(video_ids)):
+            raise ValueError("archive index contains duplicate video IDs")
+        payload = self.model_dump(mode="json", exclude={"archive_index_sha256"})
+        if canonical_sha256(payload) != self.archive_index_sha256:
+            raise ValueError("archive_index_sha256 does not match archive index content")
+        return self
+
+    @property
+    def video_ids(self) -> tuple[str, ...]:
+        return tuple(member.video_id for member in self.members)
+
+
+class PilotSelectionManifest(_FrozenModel):
+    """Question-independent deterministic archive-aware Video-MME-v2 pilot."""
+
+    schema_version: Literal[1] = 1
+    dataset_id: Literal[DATASET_ID] = DATASET_ID
+    immutable_revision: Literal[FROZEN_REVISION] = FROZEN_REVISION
+    source_metadata_sha256: str = Field(pattern=_SHA256_PATTERN)
+    source_archive_index_sha256: str = Field(pattern=_SHA256_PATTERN)
+    pool_seed: Literal[POOL_SEED] = POOL_SEED
+    pool_algorithm: Literal[POOL_ALGORITHM] = POOL_ALGORITHM
+    available_video_count: int = Field(gt=0)
+    selected_video_count: int = Field(gt=0)
+    selected_archive_paths: tuple[str, ...] = Field(min_length=1)
+    selected_video_ids: tuple[str, ...] = Field(min_length=1)
+    selection_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def selection_is_canonical_and_hash_bound(self) -> Self:
+        if self.selected_video_count != len(self.selected_video_ids):
+            raise ValueError("selected video count differs from selected video IDs")
+        if self.selected_video_count > self.available_video_count:
+            raise ValueError("selected video count exceeds available video count")
+        if self.selected_archive_paths != tuple(sorted(self.selected_archive_paths)):
+            raise ValueError("selected archive paths must be canonical")
+        if len(self.selected_video_ids) != len(set(self.selected_video_ids)):
+            raise ValueError("selected video IDs must be unique")
+        payload = self.model_dump(mode="json", exclude={"selection_sha256"})
+        if canonical_sha256(payload) != self.selection_sha256:
+            raise ValueError("selection_sha256 does not match pilot selection content")
+        return self
+
+
+def _validate_official_archive_identity(
+    identity: OfficialFileIdentity,
+    *,
+    expected_archive_paths: tuple[str, ...],
+) -> None:
+    if identity.path not in expected_archive_paths:
+        raise ValueError("Video-MME-v2 archive path is not an official pinned archive")
+    if identity.size <= 0:
+        raise ValueError("Video-MME-v2 official archive size must be positive")
+    if not re.fullmatch(_SHA256_PATTERN, identity.upstream_sha256):
+        raise ValueError("Video-MME-v2 official archive lacks a lowercase upstream SHA-256")
+
+
+def _safe_media_member(info: ZipInfo, identity: OfficialFileIdentity) -> ArchiveMemberIdentity:
+    member_path = PurePosixPath(info.filename)
+    if (
+        not info.filename
+        or "\\" in info.filename
+        or member_path.is_absolute()
+        or ".." in member_path.parts
+        or member_path.parent != PurePosixPath(".")
+    ):
+        raise ValueError("unsafe ZIP member path")
+    if info.is_dir() or member_path.suffix != ".mp4":
+        raise ValueError("non-MP4 ZIP member")
+    if not re.fullmatch(r"\d{3}", member_path.stem):
+        raise ValueError("Video-MME-v2 ZIP member has an invalid video ID")
+    # POSIX mode type bits identify symlinks without ever opening a member payload.
+    if (info.external_attr >> 16) & 0o170000 == 0o120000:
+        raise ValueError("unsafe ZIP member symlink")
+    return ArchiveMemberIdentity(
+        archive_path=identity.path,
+        video_id=member_path.stem,
+        member_path=info.filename,
+        crc32=info.CRC,
+        compressed_size=info.compress_size,
+        uncompressed_size=info.file_size,
+    )
+
+
+def inspect_zip_central_directory(
+    stream: BinaryIO, official_identity: OfficialFileIdentity
+) -> tuple[ArchiveMemberIdentity, ...]:
+    """Read only a seekable ZIP central directory, never an MP4 payload."""
+    try:
+        stream.seek(0, 2)
+        observed_size = stream.tell()
+        stream.seek(0)
+        if observed_size != official_identity.size:
+            raise ValueError("Video-MME-v2 archive size differs from official identity")
+        with ZipFile(stream) as archive:
+            members = tuple(
+                _safe_media_member(info, official_identity) for info in archive.infolist()
+            )
+    except BadZipFile as error:
+        raise ValueError("Video-MME-v2 official archive is not a valid ZIP") from error
+    if not members:
+        raise ValueError("Video-MME-v2 official archive has no MP4 members")
+    return tuple(sorted(members, key=lambda member: member.member_path))
+
+
+def _validate_metadata_coverage(
+    metadata_video_ids: tuple[str, ...], archive_video_ids: tuple[str, ...]
+) -> None:
+    metadata_ids = tuple(metadata_video_ids)
+    if len(metadata_ids) != len(set(metadata_ids)):
+        raise ValueError("Video-MME-v2 metadata contains duplicate video IDs")
+    metadata_set = set(metadata_ids)
+    archive_set = set(archive_video_ids)
+    if unexpected := sorted(archive_set - metadata_set):
+        raise ValueError(
+            f"Video-MME-v2 archive video IDs are absent from metadata: {unexpected}"
+        )
+    if missing := sorted(metadata_set - archive_set):
+        raise ValueError(
+            f"Video-MME-v2 metadata video IDs are missing from archives: {missing}"
+        )
+
+
+def build_archive_index(
+    file_identities: tuple[OfficialFileIdentity, ...],
+    opener: Callable[[OfficialFileIdentity], BinaryIO],
+    *,
+    metadata_video_ids: tuple[str, ...] | None = None,
+    _expected_archive_paths: tuple[str, ...] = OFFICIAL_ARCHIVE_PATHS,
+) -> ArchiveIndex:
+    """Build a canonical official archive index through injected seekable streams."""
+    expected_paths = tuple(_expected_archive_paths)
+    identities = tuple(sorted(file_identities, key=lambda identity: identity.path))
+    if tuple(identity.path for identity in identities) != expected_paths:
+        raise ValueError("Video-MME-v2 archive siblings differ from the pinned official set")
+    for identity in identities:
+        _validate_official_archive_identity(
+            identity, expected_archive_paths=expected_paths
+        )
+    members: list[ArchiveMemberIdentity] = []
+    for identity in identities:
+        with closing(opener(identity)) as stream:
+            members.extend(inspect_zip_central_directory(stream, identity))
+    members_tuple = tuple(
+        sorted(members, key=lambda member: (member.archive_path, member.member_path))
+    )
+    video_ids = tuple(member.video_id for member in members_tuple)
+    if len(video_ids) != len(set(video_ids)):
+        raise ValueError("Video-MME-v2 archive index contains duplicate video IDs")
+    if metadata_video_ids is not None:
+        _validate_metadata_coverage(metadata_video_ids, video_ids)
+    elif expected_paths == OFFICIAL_ARCHIVE_PATHS:
+        _validate_metadata_coverage(
+            tuple(f"{number:03d}" for number in range(800)), video_ids
+        )
+    payload = {
+        "schema_version": 1,
+        "dataset_id": DATASET_ID,
+        "immutable_revision": FROZEN_REVISION,
+        "archives": [identity.model_dump(mode="json") for identity in identities],
+        "members": [member.model_dump(mode="json") for member in members_tuple],
+    }
+    return ArchiveIndex(
+        **payload,
+        archive_index_sha256=canonical_sha256(payload),
+    )
+
+
+def load_official_archive_identities() -> tuple[OfficialFileIdentity, ...]:
+    """Load the exact pinned remote ZIP sibling identities, without downloading them."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as error:
+        raise RuntimeError("huggingface_hub is required for Video-MME-v2 archives") from error
+    info = HfApi().dataset_info(
+        repo_id=DATASET_ID,
+        revision=FROZEN_REVISION,
+        files_metadata=True,
+    )
+    siblings = {str(item.rfilename): item for item in (info.siblings or ())}
+    if set(OFFICIAL_ARCHIVE_PATHS) - set(siblings):
+        raise ValueError("Video-MME-v2 official archive siblings are missing")
+    identities: list[OfficialFileIdentity] = []
+    for path in OFFICIAL_ARCHIVE_PATHS:
+        sibling = siblings[path]
+        lfs = getattr(sibling, "lfs", None)
+        sha256 = lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
+        try:
+            identity = OfficialFileIdentity(
+                path=path,
+                size=getattr(sibling, "size", None),
+                upstream_sha256=sha256,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("Video-MME-v2 official archive identity is invalid") from error
+        _validate_official_archive_identity(
+            identity, expected_archive_paths=OFFICIAL_ARCHIVE_PATHS
+        )
+        identities.append(identity)
+    return tuple(identities)
+
+
+def open_official_archive(identity: OfficialFileIdentity) -> BinaryIO:
+    """Open an official archive through the pinned Hub filesystem range reader."""
+    _validate_official_archive_identity(
+        identity, expected_archive_paths=OFFICIAL_ARCHIVE_PATHS
+    )
+    try:
+        from huggingface_hub import HfFileSystem
+    except ImportError as error:
+        raise RuntimeError("huggingface_hub is required for Video-MME-v2 archives") from error
+    path = f"datasets/{DATASET_ID}@{FROZEN_REVISION}/{identity.path}"
+    return HfFileSystem(token=False).open(path, "rb", block_size=1024 * 1024)
+
+
+def _pilot_rank(video_id: str) -> tuple[str, str]:
+    return (
+        canonical_sha256(
+            {"algorithm": POOL_ALGORITHM, "seed": POOL_SEED, "video_id": video_id}
+        ),
+        video_id,
+    )
+
+
+def select_pilot(
+    metadata: ParsedVideoMME,
+    archive_index: ArchiveIndex,
+    count: int = 45,
+) -> PilotSelectionManifest:
+    """Select a deterministic archive-aware pilot without reading question content."""
+    if count <= 0:
+        raise ValueError("pilot selection count must be positive")
+    _validate_metadata_coverage(metadata.video_ids, archive_index.video_ids)
+    if count > len(archive_index.video_ids):
+        raise ValueError("pilot selection count exceeds available videos")
+    archive_by_video = {
+        member.video_id: member.archive_path for member in archive_index.members
+    }
+    members_by_archive: dict[str, list[str]] = {}
+    for member in archive_index.members:
+        members_by_archive.setdefault(member.archive_path, []).append(member.video_id)
+    selected_archives: set[str] = set()
+    covered: set[str] = set()
+    for video_id in sorted(metadata.video_ids, key=_pilot_rank):
+        if video_id in covered:
+            continue
+        archive_path = archive_by_video[video_id]
+        selected_archives.add(archive_path)
+        covered.update(members_by_archive[archive_path])
+        if len(covered) >= count:
+            break
+    selected_video_ids = tuple(sorted(covered, key=_pilot_rank)[:count])
+    payload = {
+        "schema_version": 1,
+        "dataset_id": DATASET_ID,
+        "immutable_revision": FROZEN_REVISION,
+        "source_metadata_sha256": metadata.report.metadata_sha256,
+        "source_archive_index_sha256": archive_index.archive_index_sha256,
+        "pool_seed": POOL_SEED,
+        "pool_algorithm": POOL_ALGORITHM,
+        "available_video_count": len(archive_index.video_ids),
+        "selected_video_count": len(selected_video_ids),
+        "selected_archive_paths": tuple(sorted(selected_archives)),
+        "selected_video_ids": selected_video_ids,
+    }
+    return PilotSelectionManifest(
+        **payload,
+        selection_sha256=canonical_sha256(payload),
+    )
+
+
+def full_scope_media(archive_index: ArchiveIndex) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return only the canonical full media scope; full scope has no subset hash."""
+    archive_paths = tuple(archive.path for archive in archive_index.archives)
+    video_ids = tuple(sorted(archive_index.video_ids))
+    expected_video_ids = tuple(f"{number:03d}" for number in range(800))
+    if archive_paths != OFFICIAL_ARCHIVE_PATHS or video_ids != expected_video_ids:
+        raise ValueError("Video-MME-v2 full scope requires all 40 official archives and 800 videos")
+    return archive_paths, video_ids
 
 
 class HumanAuditItem(_FrozenModel):

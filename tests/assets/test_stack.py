@@ -46,18 +46,42 @@ def test_dataset_include_files_are_normalized_and_safe() -> None:
 
     assert asset.include_files == ("README.md", "test.parquet")
 
-    for unsafe_name in (
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    (
         "",
         "   ",
+        ".",
+        "./README.md",
+        "data//x",
+        "data/./x",
         "/README.md",
         "C:\\README.md",
+        "C:README.md",
+        "\\README.md",
+        "data\\x",
         "../README.md",
         "data/../test.parquet",
-    ):
-        with pytest.raises(ValidationError, match="include_files"):
-            PhysicalAsset(
-                repo_id="owner/dataset",
-                repo_type="dataset",
-                backend="huggingface_hub",
-                include_files=(unsafe_name,),
-            )
+    ),
+)
+def test_dataset_include_files_reject_noncanonical_paths(unsafe_name: str) -> None:
+    with pytest.raises(ValidationError, match="include_files"):
+        PhysicalAsset(
+            repo_id="owner/dataset",
+            repo_type="dataset",
+            backend="huggingface_hub",
+            include_files=(unsafe_name,),
+        )
+
+
+def test_dataset_include_files_accept_canonical_nested_posix_path() -> None:
+    asset = PhysicalAsset(
+        repo_id="owner/dataset",
+        repo_type="dataset",
+        backend="huggingface_hub",
+        include_files=("videos/001.zip",),
+    )
+
+    assert asset.include_files == ("videos/001.zip",)

@@ -43,10 +43,11 @@ class PhysicalAsset(_FrozenModel):
             windows_path = PureWindowsPath(name)
             if (
                 not name.strip()
+                or "\\" in name
                 or posix_path.is_absolute()
-                or windows_path.is_absolute()
-                or ".." in posix_path.parts
-                or ".." in windows_path.parts
+                or bool(windows_path.drive)
+                or bool(windows_path.root)
+                or any(part in {"", ".", ".."} for part in name.split("/"))
             ):
                 raise ValueError("include_files must contain safe relative file names")
         return include_files

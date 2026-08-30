@@ -113,10 +113,9 @@ def operate(
     stack = load_experiment_stack(stack_path)
     lock = load_asset_lock(lock_path)
     effective_action = "verify" if verify_only else action
-    if (
-        effective_action != "reconcile"
-        and (lock.stack_id != stack.stack_id or lock.logical_roles != stack.logical_roles)
-    ):
+    if lock.stack_id != stack.stack_id:
+        raise ValueError("stack config and asset lock identities differ")
+    if effective_action != "reconcile" and lock.logical_roles != stack.logical_roles:
         raise ValueError("stack config and asset lock identities differ")
     if effective_action == "reconcile":
         reconciled = reconcile_lock(stack, lock)

@@ -6,7 +6,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from fidmem.assets.cli import operate
-from fidmem.assets.resolver import AssetState, load_asset_lock
+from fidmem.assets.resolver import AssetLock, AssetState, load_asset_lock, write_asset_lock
 from fidmem.assets.stack import load_experiment_stack
 
 
@@ -182,3 +182,33 @@ def test_reconcile_writes_changed_dataset_with_preserved_verified_models(
     assert reconciled.physical_assets["bge_m3"] == previous.physical_assets["bge_m3"]
     assert reconciled.physical_assets["replacement_dataset"].state is AssetState.RESOLVED
     assert reconciled.physical_assets["replacement_dataset"].repo_id == "owner/replacement-dataset"
+
+
+def test_reconcile_rejects_foreign_stack_lock_without_writing(tmp_path: Path) -> None:
+    lock_path = tmp_path / "assets.lock.json"
+    previous = load_asset_lock(
+        ROOT / "configs/experiment_stacks/gist_residual_v1.assets.lock.json"
+    )
+    foreign_lock = AssetLock.create(
+        stack_id="foreign-stack",
+        generated_at=previous.generated_at,
+        logical_roles=dict(previous.logical_roles),
+        physical_assets=dict(previous.physical_assets),
+        huggingface_hub_version=previous.huggingface_hub_version,
+    )
+    write_asset_lock(lock_path, foreign_lock)
+    before = lock_path.read_bytes()
+
+    with pytest.raises(ValueError, match="stack config and asset lock identities differ"):
+        operate(
+            "reconcile",
+            stack_path=ROOT / "configs/experiment_stacks/gist_residual_v1.yaml",
+            lock_path=lock_path,
+            asset_kind="all",
+            check=False,
+            dry_run=False,
+            resume=False,
+            verify_only=False,
+        )
+
+    assert lock_path.read_bytes() == before

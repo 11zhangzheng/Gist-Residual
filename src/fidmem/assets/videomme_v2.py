@@ -7,11 +7,11 @@ import hashlib
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from zipfile import BadZipFile, ZipFile
 
 import duckdb
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from fidmem.production.authority import canonical_sha256
 
@@ -93,6 +93,12 @@ class HumanAuditManifest(_FrozenModel):
     required_items: Literal[100] = 100
     items: tuple[HumanAuditItem, ...] = Field(min_length=100, max_length=100)
     status: Literal["PENDING_HUMAN_AUDIT"] = "PENDING_HUMAN_AUDIT"
+
+    @model_validator(mode="after")
+    def question_ids_are_unique(self) -> Self:
+        if len({item.question_id for item in self.items}) != self.required_items:
+            raise ValueError("Video-MME-v2 human audit requires 100 unique question IDs")
+        return self
 
     @property
     def manifest_sha256(self) -> str:
@@ -307,9 +313,11 @@ def validate_human_audit_result(
         raise ValueError("Video-MME-v2 human audit has the wrong completed item count")
     if any(not isinstance(item, dict) for item in items):
         raise ValueError("Video-MME-v2 human audit items must be objects")
+    observed_ids = tuple(str(item.get("question_id", "")) for item in items)
+    if len(observed_ids) != len(set(observed_ids)):
+        raise ValueError("Video-MME-v2 human audit result contains duplicate question IDs")
     expected = {item.question_id for item in manifest.items}
-    observed = {str(item.get("question_id", "")) for item in items}
-    if observed != expected:
+    if set(observed_ids) != expected:
         raise ValueError("Video-MME-v2 human audit completed-item identities differ from manifest")
     if any(item.get("outcome") != "PASS" for item in items):
         raise ValueError("Video-MME-v2 human audit contains a non-PASS outcome")

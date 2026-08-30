@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from fidmem.actions.environment import ActionObservation
+from fidmem.assets.resolver import initial_lock, write_asset_lock
+from fidmem.assets.stack import load_experiment_stack
 from fidmem.providers.stack_v1 import (
     ExecutionRequest,
     MeasuredOperation,
@@ -115,12 +117,20 @@ def test_check_never_invokes_model_and_resume_skips_complete_request(
     assert backend.executed == 1
 
 
-def test_current_unresolved_stack_fails_closed_before_e03() -> None:
+def test_unverified_stack_fails_closed_before_e03(tmp_path: Path) -> None:
+    lock_path = tmp_path / "gist_residual_v1.assets.lock.json"
+    write_asset_lock(
+        lock_path,
+        initial_lock(
+            load_experiment_stack(
+                ROOT / "configs/experiment_stacks/gist_residual_v1.yaml"
+            )
+        ),
+    )
     with pytest.raises(ValueError, match="asset .* is not VERIFIED"):
         check_stack_assets(
             stack_path=ROOT / "configs/experiment_stacks/gist_residual_v1.yaml",
-            lock_path=ROOT
-            / "configs/experiment_stacks/gist_residual_v1.assets.lock.json",
+            lock_path=lock_path,
             authority_path=None,
         )
 

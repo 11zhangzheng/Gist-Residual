@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-from omegaconf import OmegaConf
 
 from fidmem.assets.longtvqa import (
     METADATA_FILES,
@@ -15,7 +14,6 @@ from fidmem.assets.longtvqa import (
     verify_raw_videos,
 )
 from fidmem.data.video import VideoProbe
-from fidmem.production.manifests import validate_split_isolation
 
 
 REVISION = "a" * 40
@@ -173,9 +171,7 @@ def test_duplicate_video_content_identity_fails_source_gate(tmp_path: Path) -> N
     assert report.duplicate_video_ids == ("episode-000", "episode-001")
 
 
-def test_builds_existing_video_disjoint_manifests_and_fixed_selections(
-    tmp_path: Path,
-) -> None:
+def test_longtvqa_manifest_builder_is_retired(tmp_path: Path) -> None:
     metadata_root = tmp_path / "metadata"
     video_root = tmp_path / "videos"
     _metadata(metadata_root)
@@ -188,32 +184,16 @@ def test_builds_existing_video_disjoint_manifests_and_fixed_selections(
         decode=lambda _path, _timestamp: None,
     )
     assert video_report.status == "PASS"
-    assignments = {"episode-000": "development", "episode-001": "holdout"}
-    assignments.update({f"episode-{index:03d}": "canary" for index in range(2, 4)})
-    assignments.update({f"episode-{index:03d}": "oracle" for index in range(4, 24)})
-    payload = {
-        "schema_version": 1,
-        "split_policy_id": "engineering-fixture-only",
-        "status": "FROZEN",
-        "split_unit": "video_id",
-        "video_groups": assignments,
-        "selections": {
-            "canary": {"count": 10, "seed": "fixture-canary"},
-            "oracle": {"count": 100, "seed": "fixture-oracle"},
-        },
-    }
-    policy_path = tmp_path / "policy.yaml"
-    OmegaConf.save(config=OmegaConf.create(payload), f=policy_path)
-    videos, questions, dataset, canary, oracle = build_manifests(
-        parsed, video_report, split_policy_path=policy_path
-    )
-    validate_split_isolation(videos, questions)
-    assert dataset.video_manifest_sha256 == videos.manifest_sha256
-    assert len(canary.question_ids) == 10
-    assert len(oracle.question_ids) == 100
+    with pytest.raises(
+        ValueError,
+        match="^LongTVQA source adapter is retired; Video-MME-v2 must be used$",
+    ):
+        build_manifests(parsed, video_report, split_policy_path="unused")
 
 
-def test_unfrozen_split_policy_fails_closed(tmp_path: Path) -> None:
+def test_retired_builder_fails_closed_before_split_policy_validation(
+    tmp_path: Path,
+) -> None:
     metadata_root = tmp_path / "metadata"
     video_root = tmp_path / "videos"
     _metadata(metadata_root)
@@ -224,5 +204,8 @@ def test_unfrozen_split_policy_fails_closed(tmp_path: Path) -> None:
     )
     policy = tmp_path / "policy.yaml"
     policy.write_text("status: RESEARCH_OWNER_DECISION_REQUIRED\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="RESEARCH_OWNER_DECISION_REQUIRED"):
+    with pytest.raises(
+        ValueError,
+        match="^LongTVQA source adapter is retired; Video-MME-v2 must be used$",
+    ):
         build_manifests(parsed, video_report, split_policy_path=policy)

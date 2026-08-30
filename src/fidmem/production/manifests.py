@@ -76,7 +76,7 @@ class QuestionManifest(_FrozenModel):
 
 
 class DatasetManifest(_FrozenModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     dataset_name: str = Field(min_length=1)
     dataset_version: str = Field(min_length=1)
     dataset_scope: DatasetScope

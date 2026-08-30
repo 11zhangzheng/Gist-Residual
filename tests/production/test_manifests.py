@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -72,6 +74,32 @@ def test_full_dataset_manifest_forbids_selection_identity() -> None:
             split_policy_sha256="3" * 64,
             video_manifest_sha256="4" * 64,
             question_manifest_sha256="5" * 64,
+        )
+
+
+def test_dataset_manifest_serializes_schema_v2_and_rejects_v1_input() -> None:
+    manifest = DatasetManifest(
+        dataset_name="MME-Benchmarks/Video-MME-v2",
+        dataset_version="6e4bebb03202e1ddbf3d37703e560e51c5aa2d64",
+        dataset_scope="FULL_DATASET",
+        source_metadata_sha256="1" * 64,
+        source_archive_index_sha256="2" * 64,
+        subset_selection_manifest_sha256=None,
+        selected_video_count=800,
+        selected_question_count=3200,
+        available_video_count=800,
+        available_question_count=3200,
+        split_policy_id="videomme-v2-full-split-v1",
+        split_policy_sha256="3" * 64,
+        video_manifest_sha256="4" * 64,
+        question_manifest_sha256="5" * 64,
+    )
+
+    serialized = manifest.model_dump_json()
+    assert json.loads(serialized)["schema_version"] == 2
+    with pytest.raises(ValidationError, match="schema_version"):
+        DatasetManifest.model_validate_json(
+            json.dumps({**manifest.model_dump(mode="json"), "schema_version": 1})
         )
 
 

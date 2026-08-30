@@ -431,6 +431,9 @@ def build_manifests(
     SelectionManifest,
     SelectionManifest,
 ]:
+    raise ValueError(
+        "LongTVQA source adapter is retired; Video-MME-v2 must be used"
+    )
     if videos.status != "PASS":
         raise ValueError("raw-video Source Gate must PASS before manifest construction")
     policy_path = Path(split_policy_path)

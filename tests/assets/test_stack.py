@@ -50,19 +50,74 @@ def test_videomme_source_replaces_longtvqa_without_changing_model_snapshots() ->
     assert stack.logical_roles["visual_model"] == "qwen3_vl_8b_instruct"
     assert stack.logical_roles["answerer"] == "qwen3_8b"
 
-    expected_model_hashes = {
-        "bge_m3": "78f38848464972447ce0a70b3c29cff2480f9586234590ace6ba3e43334f0591",
-        "siglip2_so400m_patch14_384": "8e9391da171c97d0ecbf619cc0f26178e158ed569a7527a8df8a24552616f021",
-        "qwen3_vl_8b_instruct": "c37cd4285c6cb9089b0ab8a8c27cce3bfedfd4b680061a5403cdb42f8b965b96",
-        "qwen3_8b": "4a133fa0d16ea3fdd42e987d7aa5135f3f8562ce45c55bf478b2f777f53e6fad",
+    assert lock.logical_roles == {
+        "source_dataset": "videomme_v2_metadata",
+        "gist_text_encoder": "bge_m3",
+        "gist_visual_encoder": "siglip2_so400m_patch14_384",
+        "embedding_model": "bge_m3",
+        "residual_model": "qwen3_vl_8b_instruct",
+        "visual_model": "qwen3_vl_8b_instruct",
+        "answerer": "qwen3_8b",
     }
-    assert set(lock.physical_assets) == set(expected_model_hashes) | {
+    expected_models = {
+        "bge_m3": {
+            "repo_id": "BAAI/bge-m3",
+            "immutable_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+            "backend": "HuggingFace Transformers",
+            "dtype": "bfloat16",
+            "local_snapshot_path": "/mnt/disk1/zhangzheng/fidmem/models/bge_m3",
+            "local_snapshot_sha256": "78f38848464972447ce0a70b3c29cff2480f9586234590ace6ba3e43334f0591",
+        },
+        "siglip2_so400m_patch14_384": {
+            "repo_id": "google/siglip2-so400m-patch14-384",
+            "immutable_revision": "e8e487298228002f3d8a82e0cd5c8ea9c567f57f",
+            "backend": "HuggingFace Transformers",
+            "dtype": "bfloat16",
+            "local_snapshot_path": "/mnt/disk1/zhangzheng/fidmem/models/siglip2_so400m_patch14_384",
+            "local_snapshot_sha256": "8e9391da171c97d0ecbf619cc0f26178e158ed569a7527a8df8a24552616f021",
+        },
+        "qwen3_vl_8b_instruct": {
+            "repo_id": "Qwen/Qwen3-VL-8B-Instruct",
+            "immutable_revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+            "backend": "HuggingFace Transformers",
+            "dtype": "bfloat16",
+            "local_snapshot_path": "/mnt/disk1/zhangzheng/fidmem/models/qwen3_vl_8b_instruct",
+            "local_snapshot_sha256": "c37cd4285c6cb9089b0ab8a8c27cce3bfedfd4b680061a5403cdb42f8b965b96",
+        },
+        "qwen3_8b": {
+            "repo_id": "Qwen/Qwen3-8B",
+            "immutable_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+            "backend": "HuggingFace Transformers",
+            "dtype": "bfloat16",
+            "local_snapshot_path": "/mnt/disk1/zhangzheng/fidmem/models/qwen3_8b",
+            "local_snapshot_sha256": "4a133fa0d16ea3fdd42e987d7aa5135f3f8562ce45c55bf478b2f777f53e6fad",
+        },
+    }
+    assert set(lock.physical_assets) == set(expected_models) | {
         "videomme_v2_metadata"
     }
-    for asset_id, snapshot_hash in expected_model_hashes.items():
+    for asset_id, expected in expected_models.items():
         entry = lock.physical_assets[asset_id]
+        assert entry.repo_type == "model"
+        assert entry.repo_id == expected["repo_id"]
+        assert entry.immutable_revision == expected["immutable_revision"]
+        assert entry.backend == expected["backend"]
+        assert entry.dtype == expected["dtype"]
         assert entry.state is AssetState.VERIFIED
-        assert entry.local_snapshot_sha256 == snapshot_hash
+        assert entry.local_snapshot_path == expected["local_snapshot_path"]
+        assert entry.local_snapshot_sha256 == expected["local_snapshot_sha256"]
+
+    source_entry = lock.physical_assets["videomme_v2_metadata"]
+    assert source_entry.repo_id == "MME-Benchmarks/Video-MME-v2"
+    assert source_entry.repo_type == "dataset"
+    assert source_entry.immutable_revision == "6e4bebb03202e1ddbf3d37703e560e51c5aa2d64"
+    assert source_entry.backend == "huggingface_hub"
+    assert source_entry.dtype is None
+    assert source_entry.state is AssetState.RESOLVED
+    assert source_entry.expected_files == ()
+    assert source_entry.local_snapshot_path is None
+    assert source_entry.local_snapshot_sha256 is None
+    assert source_entry.verified_at is None
 
 
 def test_final_targets_exclude_source_dataset() -> None:

@@ -105,15 +105,35 @@ class ParsedLongTVQA:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8-sig") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValueError(f"{path.name}:{line_number} must be an object")
-            rows.append(value)
+        try:
+            document = json.load(stream)
+        except json.JSONDecodeError:
+            stream.seek(0)
+            rows = []
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError(f"{path.name}:{line_number} must be an object")
+                rows.append(value)
+        else:
+            if isinstance(document, list):
+                rows = document
+            elif isinstance(document, dict) and all(
+                isinstance(value, str) for value in document.values()
+            ):
+                rows = [
+                    {"video_id": key, "text": value}
+                    for key, value in document.items()
+                ]
+            elif isinstance(document, dict):
+                rows = [document]
+            else:
+                raise ValueError(f"{path.name} must contain objects")
+            if any(not isinstance(row, dict) for row in rows):
+                raise ValueError(f"{path.name} must contain objects")
     if not rows:
         raise ValueError(f"metadata file is empty: {path.name}")
     return rows
@@ -137,23 +157,40 @@ def question_id(row: dict[str, Any]) -> str:
 def video_id(row: dict[str, Any]) -> str:
     value = _first(
         row,
-        ("video_id", "video", "episode_id", "episode", "vid", "show_episode"),
+        (
+            "video_id",
+            "video",
+            "episode_id",
+            "episode",
+            "episode_name",
+            "vid",
+            "show_episode",
+        ),
     )
     if value is None:
         raise ValueError("LongTVQA record lacks an episode/video ID")
     return Path(str(value)).stem
 
 
-def _subtitle_ids(rows: list[dict[str, Any]]) -> frozenset[str]:
-    return frozenset(video_id(row) for row in rows)
+def _subtitle_ids(
+    rows: list[dict[str, Any]], *, clip_level: bool = False
+) -> frozenset[str]:
+    ids = (video_id(row) for row in rows)
+    if clip_level:
+        return frozenset(value.partition("_seg")[0] for value in ids)
+    return frozenset(ids)
 
 
 def _qa_constructible(row: dict[str, Any]) -> bool:
-    prompt = _first(row, ("question", "query", "prompt"))
+    prompt = _first(row, ("question", "q", "query", "prompt"))
     answer = _first(row, ("answer", "correct_answer", "label"))
     options = _first(row, ("options", "choices", "candidates"))
     if options is None:
-        options = [row.get(key) for key in ("A", "B", "C", "D") if row.get(key)]
+        options = [
+            row.get(key)
+            for key in ("A", "B", "C", "D", "a0", "a1", "a2", "a3", "a4")
+            if row.get(key)
+        ]
     return bool(prompt and answer is not None and options)
 
 
@@ -181,7 +218,8 @@ def verify_metadata(root: str | Path, *, immutable_revision: str) -> ParsedLongT
     if len(ids) != len(set(ids)):
         raise ValueError("LongTVQA metadata contains duplicate question IDs")
     clip_ids = _subtitle_ids(
-        _read_jsonl(directory / "LongTVQA_subtitles_clip_level.jsonl")
+        _read_jsonl(directory / "LongTVQA_subtitles_clip_level.jsonl"),
+        clip_level=True,
     )
     episode_ids = _subtitle_ids(
         _read_jsonl(directory / "LongTVQA_subtitles_episode_level.jsonl")
@@ -239,7 +277,14 @@ def build_human_audit_manifest(
                 source_split=str(row["_source_split"]),
                 source_timestamp=_first(
                     row,
-                    ("timestamp", "timestamps", "time", "start_end", "relevant_window"),
+                    (
+                        "timestamp",
+                        "timestamps",
+                        "ts",
+                        "time",
+                        "start_end",
+                        "relevant_window",
+                    ),
                 ),
             )
             for row in ranked

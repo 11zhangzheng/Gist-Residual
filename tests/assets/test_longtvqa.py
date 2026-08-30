@@ -80,6 +80,60 @@ def test_metadata_and_human_audit_remain_engineering_pending(tmp_path: Path) -> 
         validate_human_audit_result(audit, result)
 
 
+def test_metadata_accepts_official_pretty_json_shapes(tmp_path: Path) -> None:
+    metadata_root = tmp_path / "metadata"
+    metadata_root.mkdir()
+    train = [
+        {
+            "qid": 1,
+            "q": "Where is the character?",
+            "a0": "Inside",
+            "a1": "Outside",
+            "a2": "Unknown",
+            "a3": "Home",
+            "a4": "Work",
+            "ts": [1.0, 2.0],
+            "episode_name": "show_s01e01",
+            "occur_clip": "show_s01e01_seg02_clip_00",
+            "answer": "a1",
+        }
+    ]
+    val = [{**train[0], "qid": 2, "episode_name": "show_s01e02"}]
+    (metadata_root / "LongTVQA_train.jsonl").write_text(
+        json.dumps(train, indent=2), encoding="utf-8"
+    )
+    (metadata_root / "LongTVQA_val.jsonl").write_text(
+        json.dumps(val, indent=2), encoding="utf-8"
+    )
+    (metadata_root / "LongTVQA_subtitles_clip_level.jsonl").write_text(
+        json.dumps(
+            {
+                "show_s01e01_seg02_clip_00": "train subtitle",
+                "show_s01e02_seg02_clip_00": "val subtitle",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (metadata_root / "LongTVQA_subtitles_episode_level.jsonl").write_text(
+        json.dumps(
+            {"show_s01e01": "train subtitle", "show_s01e02": "val subtitle"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (metadata_root / "README.md").write_text("official shape", encoding="utf-8")
+
+    parsed = verify_metadata(metadata_root, immutable_revision=REVISION)
+
+    assert parsed.report.question_count == 2
+    assert parsed.report.video_count == 2
+    assert parsed.report.qa_constructible_count == 2
+    assert parsed.clip_video_ids == frozenset({"show_s01e01", "show_s01e02"})
+    assert parsed.episode_video_ids == frozenset({"show_s01e01", "show_s01e02"})
+    assert parsed.questions[0]["_source_split"] == "train"
+
+
 def test_missing_or_corrupt_video_fails_source_gate(tmp_path: Path) -> None:
     metadata_root = tmp_path / "metadata"
     video_root = tmp_path / "videos"

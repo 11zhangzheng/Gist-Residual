@@ -13,12 +13,15 @@ import duckdb
 import pytest
 
 from fidmem.assets.videomme_v2 import (
+    ArchiveIndex,
+    ArchiveMemberIdentity,
     DATASET_ID,
     FROZEN_REVISION,
     HumanAuditManifest,
     METADATA_FILES,
     OfficialFileIdentity,
     OFFICIAL_ARCHIVE_PATHS,
+    OFFICIAL_VIDEO_IDS,
     POOL_ALGORITHM,
     POOL_SEED,
     build_human_audit_manifest,
@@ -468,34 +471,18 @@ def test_archive_index_requires_exact_metadata_coverage(tmp_path: Path) -> None:
 
 
 def test_pilot_selection_is_archive_aware_deterministic_and_question_independent(
-    tmp_path: Path,
 ) -> None:
-    metadata_root = tmp_path / "metadata"
-    _metadata(metadata_root, rows=_rows(videos=60))
-    metadata = _verify(metadata_root, expected_question_count=240, expected_video_count=60)
-    archive_root = tmp_path / "archives"
-    identities = _archive_fixtures(archive_root)
-    index = build_archive_index(
-        identities,
-        _fixture_opener(archive_root),
-        metadata_video_ids=metadata.video_ids,
-        _expected_archive_paths=tuple(identity.path for identity in identities),
-    )
-
     class MetadataWithoutQuestionContents:
-        video_ids = metadata.video_ids
-        report = metadata.report
+        video_ids = OFFICIAL_VIDEO_IDS
+        report = SimpleNamespace(metadata_sha256="1" * 64)
 
         @property
         def questions(self) -> tuple[object, ...]:
             raise AssertionError("pilot selection must not inspect questions or answers")
 
-    first = select_pilot(
-        MetadataWithoutQuestionContents(), index, _expected_video_ids=metadata.video_ids
-    )
-    second = select_pilot(
-        MetadataWithoutQuestionContents(), index, _expected_video_ids=metadata.video_ids
-    )
+    index = _full_population_archive_index(_even_archive_members())
+    first = select_pilot(MetadataWithoutQuestionContents(), index)
+    second = select_pilot(MetadataWithoutQuestionContents(), index)
 
     assert first.pool_algorithm == POOL_ALGORITHM
     assert first.pool_seed == POOL_SEED
@@ -508,25 +495,61 @@ def test_pilot_selection_is_archive_aware_deterministic_and_question_independent
     )
 
 
-def _uneven_archive_fixtures(
-    root: Path, members_by_archive: tuple[tuple[str, ...], ...]
-) -> tuple[OfficialFileIdentity, ...]:
-    root.mkdir()
-    identities = []
-    for archive_number, video_ids in enumerate(members_by_archive, start=1):
-        archive_path = f"videos/{archive_number:03d}.zip"
-        local_path = root / f"{archive_number:03d}.zip"
-        with ZipFile(local_path, "w", compression=ZIP_DEFLATED) as archive:
-            for video_id in video_ids:
-                archive.writestr(f"{video_id}.mp4", b"engineering-mp4")
-        identities.append(
-            OfficialFileIdentity(
-                path=archive_path,
-                size=local_path.stat().st_size,
-                upstream_sha256=f"{archive_number:064x}",
-            )
+def _full_population_archive_index(
+    members_by_archive: tuple[tuple[str, ...], ...]
+) -> ArchiveIndex:
+    assert len(members_by_archive) == len(OFFICIAL_ARCHIVE_PATHS)
+    assert tuple(video_id for ids in members_by_archive for video_id in ids) == OFFICIAL_VIDEO_IDS
+    archives = tuple(
+        OfficialFileIdentity(
+            path=archive_path,
+            size=archive_number,
+            upstream_sha256=f"{archive_number:064x}",
         )
-    return tuple(identities)
+        for archive_number, archive_path in enumerate(OFFICIAL_ARCHIVE_PATHS, start=1)
+    )
+    members = tuple(
+        ArchiveMemberIdentity(
+            archive_path=archive_path,
+            video_id=video_id,
+            member_path=f"{video_id}.mp4",
+            crc32=archive_number,
+            compressed_size=1,
+            uncompressed_size=1,
+        )
+        for archive_number, (archive_path, video_ids) in enumerate(
+            zip(OFFICIAL_ARCHIVE_PATHS, members_by_archive, strict=True), start=1
+        )
+        for video_id in video_ids
+    )
+    payload = {
+        "schema_version": 1,
+        "dataset_id": DATASET_ID,
+        "immutable_revision": FROZEN_REVISION,
+        "archives": [archive.model_dump(mode="json") for archive in archives],
+        "members": [member.model_dump(mode="json") for member in members],
+    }
+    return ArchiveIndex(
+        **payload, archive_index_sha256=canonical_sha256(payload)
+    )
+
+
+def _even_archive_members() -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        tuple(f"{video:03d}" for video in range(start, start + 20))
+        for start in range(0, 800, 20)
+    )
+
+
+def _uneven_full_archive_members() -> tuple[tuple[str, ...], ...]:
+    sizes = (101, 7, 39) + (17,) * 36 + (41,)
+    assert len(sizes) == 40 and sum(sizes) == 800
+    start = 0
+    members = []
+    for size in sizes:
+        members.append(tuple(f"{video:03d}" for video in range(start, start + size)))
+        start += size
+    return tuple(members)
 
 
 def _independent_pilot_expected(
@@ -557,28 +580,14 @@ def _independent_pilot_expected(
 
 
 def test_pilot_selection_matches_independent_uneven_archive_hash_ranking(
-    tmp_path: Path,
 ) -> None:
-    members_by_archive = (
-        tuple(f"{number:03d}" for number in range(0, 12)),
-        tuple(f"{number:03d}" for number in range(12, 58)),
-        tuple(f"{number:03d}" for number in range(58, 80)),
+    members_by_archive = _uneven_full_archive_members()
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="2" * 64)
     )
-    metadata_root = tmp_path / "metadata"
-    _metadata(metadata_root, rows=_rows(videos=80))
-    metadata = _verify(metadata_root, expected_question_count=320, expected_video_count=80)
-    archive_root = tmp_path / "archives"
-    identities = _uneven_archive_fixtures(archive_root, members_by_archive)
-    index = build_archive_index(
-        identities,
-        _fixture_opener(archive_root),
-        metadata_video_ids=metadata.video_ids,
-        _expected_archive_paths=tuple(identity.path for identity in identities),
-    )
+    index = _full_population_archive_index(members_by_archive)
 
-    selected = select_pilot(
-        metadata, index, _expected_video_ids=metadata.video_ids
-    )
+    selected = select_pilot(metadata, index)
     expected_archives, expected_videos = _independent_pilot_expected(
         members_by_archive, count=45
     )
@@ -587,23 +596,25 @@ def test_pilot_selection_matches_independent_uneven_archive_hash_ranking(
     assert selected.selected_video_ids == expected_videos
 
 
-def test_pilot_selection_default_rejects_non_official_source_population(
-    tmp_path: Path,
+def test_pilot_selection_requires_canonical_full_population_without_a_public_bypass(
 ) -> None:
-    metadata_root = tmp_path / "metadata"
-    _metadata(metadata_root, rows=_rows(videos=60))
-    metadata = _verify(metadata_root, expected_question_count=240, expected_video_count=60)
-    archive_root = tmp_path / "archives"
-    identities = _archive_fixtures(archive_root)
-    index = build_archive_index(
-        identities,
-        _fixture_opener(archive_root),
-        metadata_video_ids=metadata.video_ids,
-        _expected_archive_paths=tuple(identity.path for identity in identities),
+    index = _full_population_archive_index(_even_archive_members())
+    unordered_metadata = SimpleNamespace(
+        video_ids=tuple(reversed(OFFICIAL_VIDEO_IDS)),
+        report=SimpleNamespace(metadata_sha256="3" * 64),
     )
 
     with pytest.raises(ValueError, match="full source population"):
-        select_pilot(metadata, index)
+        select_pilot(unordered_metadata, index)
+    with pytest.raises(TypeError, match="_expected_video_ids"):
+        select_pilot(  # type: ignore[call-arg]
+            SimpleNamespace(
+                video_ids=OFFICIAL_VIDEO_IDS,
+                report=SimpleNamespace(metadata_sha256="4" * 64),
+            ),
+            index,
+            _expected_video_ids=OFFICIAL_VIDEO_IDS,
+        )
 
 
 def _official_hub_siblings(*, extra_archive: bool = False) -> tuple[object, ...]:

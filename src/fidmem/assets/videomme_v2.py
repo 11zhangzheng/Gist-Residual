@@ -366,13 +366,11 @@ def select_pilot(
     metadata: ParsedVideoMME,
     archive_index: ArchiveIndex,
     count: int = 45,
-    *,
-    _expected_video_ids: tuple[str, ...] = OFFICIAL_VIDEO_IDS,
 ) -> PilotSelectionManifest:
     """Select a deterministic archive-aware pilot without reading question content."""
     if count <= 0:
         raise ValueError("pilot selection count must be positive")
-    if tuple(metadata.video_ids) != tuple(_expected_video_ids):
+    if tuple(metadata.video_ids) != OFFICIAL_VIDEO_IDS:
         raise ValueError(
             "Video-MME-v2 pilot selection requires the exact full source population"
         )

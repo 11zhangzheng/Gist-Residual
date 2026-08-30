@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
+import shutil
 import sys
 from io import BufferedReader
 from pathlib import Path
 from types import SimpleNamespace
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import duckdb
 import pytest
@@ -16,6 +20,7 @@ from fidmem.assets.videomme_v2 import (
     ArchiveIndex,
     ArchiveMemberIdentity,
     DATASET_ID,
+    DownloadPlan,
     FROZEN_REVISION,
     HumanAuditManifest,
     METADATA_FILES,
@@ -24,6 +29,10 @@ from fidmem.assets.videomme_v2 import (
     OFFICIAL_VIDEO_IDS,
     POOL_ALGORITHM,
     POOL_SEED,
+    check_download_capacity,
+    download_pinned_file,
+    extract_selected_media,
+    prepare_videos,
     build_human_audit_manifest,
     build_archive_index,
     full_scope_media,
@@ -699,3 +708,657 @@ def test_full_scope_media_has_all_pinned_archives_and_videos_without_a_selection
     assert archive_paths == tuple(f"videos/{archive:03d}.zip" for archive in range(1, 41))
     assert video_ids == tuple(f"{video:03d}" for video in range(800))
     assert not hasattr((archive_paths, video_ids), "selection_sha256")
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _download_identity(content: bytes, path: str = "videos/001.zip") -> OfficialFileIdentity:
+    return OfficialFileIdentity(
+        path=path,
+        size=len(content),
+        upstream_sha256=_sha256_bytes(content),
+    )
+
+
+def test_download_resumes_partial_sibling_from_its_exact_size(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    content = b"0123456789abcdef"
+    identity = _download_identity(content)
+    destination = tmp_path / "001.zip"
+    partial = destination.with_suffix(".partial")
+    partial.write_bytes(content[:7])
+    calls: list[tuple[str, int, int]] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            hf_hub_url=lambda **kwargs: (
+                f"https://example.invalid/{kwargs['repo_id']}/{kwargs['filename']}"
+            )
+        ),
+    )
+
+    def getter(url: str, stream: object, resume_size: int, expected_size: int) -> None:
+        calls.append((url, resume_size, expected_size))
+        stream.write(content[resume_size:])
+
+    returned = download_pinned_file(identity, destination, resume=True, http_getter=getter)
+
+    assert returned == destination
+    assert destination.read_bytes() == content
+    assert not partial.exists()
+    assert calls == [
+        (
+            f"https://example.invalid/{DATASET_ID}/videos/001.zip",
+            7,
+            len(content),
+        )
+    ]
+
+
+def test_download_logs_local_path_and_byte_state_without_remote_credentials(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    content = b"logged-payload"
+    identity = _download_identity(content)
+    destination = tmp_path / "001.zip"
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            hf_hub_url=lambda **_kwargs: "https://user:secret@example.invalid/archive"
+        ),
+    )
+
+    def getter(_url: str, stream: object, resume_size: int, _size: int) -> None:
+        stream.write(content[resume_size:])
+
+    with caplog.at_level(logging.INFO, logger="fidmem.assets.videomme_v2"):
+        download_pinned_file(identity, destination, resume=True, http_getter=getter)
+
+    messages = "\n".join(caplog.messages)
+    assert str(destination) in messages
+    assert f"expected_bytes={len(content)}" in messages
+    assert "state=VERIFIED" in messages
+    assert "secret" not in messages
+
+
+def test_download_reuses_completed_hash_matching_file_without_network(
+    tmp_path: Path,
+) -> None:
+    content = b"already-complete"
+    identity = _download_identity(content)
+    destination = tmp_path / "001.zip"
+    destination.write_bytes(content)
+    before = destination.stat().st_mtime_ns
+
+    def forbidden_getter(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("verified completed download must be reused")
+
+    assert download_pinned_file(
+        identity, destination, resume=True, http_getter=forbidden_getter
+    ) == destination
+    assert destination.stat().st_mtime_ns == before
+
+
+def test_download_promotes_completed_hash_matching_partial_without_network(
+    tmp_path: Path,
+) -> None:
+    content = b"completed-partial"
+    identity = _download_identity(content)
+    destination = tmp_path / "001.zip"
+    partial = destination.with_suffix(".partial")
+    partial.write_bytes(content)
+
+    def forbidden_getter(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("completed verified partial must not use the network")
+
+    returned = download_pinned_file(
+        identity, destination, resume=True, http_getter=forbidden_getter
+    )
+
+    assert returned.read_bytes() == content
+    assert not partial.exists()
+
+
+def test_download_hash_mismatch_preserves_existing_final_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected = b"new-official-payload"
+    identity = _download_identity(expected)
+    destination = tmp_path / "001.zip"
+    destination.write_bytes(b"last-visible-final")
+    partial = destination.with_suffix(".partial")
+    partial.write_bytes(b"bad")
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(hf_hub_url=lambda **_kwargs: "https://example.invalid/archive"),
+    )
+
+    def bad_getter(
+        _url: str, stream: object, resume_size: int, _expected_size: int
+    ) -> None:
+        stream.write(b"x" * (len(expected) - resume_size))
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        download_pinned_file(identity, destination, resume=True, http_getter=bad_getter)
+
+    assert destination.read_bytes() == b"last-visible-final"
+    assert partial.exists()
+
+
+def test_download_rejects_oversized_partial_before_network(tmp_path: Path) -> None:
+    identity = _download_identity(b"short")
+    destination = tmp_path / "001.zip"
+    destination.with_suffix(".partial").write_bytes(b"too-long")
+
+    def forbidden_getter(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("oversized partial must fail before network")
+
+    with pytest.raises(ValueError, match="partial.*larger"):
+        download_pinned_file(
+            identity, destination, resume=True, http_getter=forbidden_getter
+        )
+
+
+def _download_plan(*, archive_bytes: int, extracted_bytes: int) -> DownloadPlan:
+    archive = OfficialFileIdentity(
+        path="videos/001.zip", size=archive_bytes, upstream_sha256="1" * 64
+    )
+    member = ArchiveMemberIdentity(
+        archive_path=archive.path,
+        video_id="000",
+        member_path="000.mp4",
+        crc32=1,
+        compressed_size=1,
+        uncompressed_size=extracted_bytes,
+    )
+    return DownloadPlan(
+        scope="pilot",
+        archives=(archive,),
+        selected_members=(member,),
+        archive_bytes_remaining=archive_bytes,
+    )
+
+
+def test_capacity_requires_remaining_archives_selected_mp4s_and_20_gib(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    margin = 20 * 1024**3
+    plan = _download_plan(archive_bytes=13, extracted_bytes=29)
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=margin + 41, used=0, free=margin + 41),
+    )
+
+    with pytest.raises(ValueError, match="insufficient.*space"):
+        check_download_capacity(plan, tmp_path)
+
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=margin + 42, used=0, free=margin + 42),
+    )
+    assert check_download_capacity(plan, tmp_path) is None
+
+
+def _single_archive_index(
+    archive_path: Path,
+    *,
+    member_names: tuple[str, ...] = ("000.mp4", "001.mp4"),
+) -> ArchiveIndex:
+    with ZipFile(archive_path) as archive:
+        infos = {info.filename: info for info in archive.infolist()}
+    identity = OfficialFileIdentity(
+        path="videos/001.zip",
+        size=archive_path.stat().st_size,
+        upstream_sha256=hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+    )
+    members = tuple(
+        ArchiveMemberIdentity(
+            archive_path=identity.path,
+            video_id=Path(name.rstrip("/")).stem,
+            member_path=name,
+            crc32=infos[name].CRC,
+            compressed_size=infos[name].compress_size,
+            uncompressed_size=infos[name].file_size,
+        )
+        for name in member_names
+    )
+    payload = {
+        "schema_version": 1,
+        "dataset_id": DATASET_ID,
+        "immutable_revision": FROZEN_REVISION,
+        "archives": [identity.model_dump(mode="json")],
+        "members": [member.model_dump(mode="json") for member in members],
+    }
+    return ArchiveIndex(**payload, archive_index_sha256=canonical_sha256(payload))
+
+
+def _subtitle_fixture(path: Path, video_ids: tuple[str, ...]) -> None:
+    with ZipFile(path, "w", compression=ZIP_STORED) as archive:
+        for video_id in video_ids:
+            archive.writestr(f"{video_id}.jsonl", f'{{"video_id":"{video_id}"}}\n')
+
+
+def test_extract_writes_only_selected_mp4s_and_subtitles_atomically(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    video_ids = tuple(f"{number:03d}" for number in range(60))
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        for video_id in video_ids:
+            archive.writestr(f"{video_id}.mp4", f"mp4-{video_id}".encode())
+    index = _single_archive_index(archive_path, member_names=tuple(f"{v}.mp4" for v in video_ids))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, video_ids)
+    selected = video_ids[:45]
+    video_root = tmp_path / "videos"
+
+    paths = extract_selected_media(
+        selected, index, archive_root, video_root, subtitle_zip
+    )
+
+    assert paths == tuple(video_root / f"{video_id}.mp4" for video_id in selected)
+    assert tuple(path.name for path in sorted(video_root.glob("*.mp4"))) == tuple(
+        f"{video_id}.mp4" for video_id in selected
+    )
+    assert tuple(
+        path.name for path in sorted((tmp_path / "subtitles").glob("*.jsonl"))
+    ) == tuple(f"{video_id}.jsonl" for video_id in selected)
+    assert not tuple(tmp_path.rglob("*.tmp"))
+
+
+def test_extract_reuses_output_only_while_recorded_size_and_hash_match(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("000.mp4", b"official-video")
+    index = _single_archive_index(archive_path, member_names=("000.mp4",))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, ("000",))
+    video_root = tmp_path / "videos"
+    output = extract_selected_media(
+        ("000",), index, archive_root, video_root, subtitle_zip
+    )[0]
+    first_mtime = output.stat().st_mtime_ns
+
+    extract_selected_media(("000",), index, archive_root, video_root, subtitle_zip)
+    assert output.stat().st_mtime_ns == first_mtime
+
+    output.write_bytes(b"same-size-wrong")
+    os.utime(output, ns=(first_mtime, first_mtime))
+    extract_selected_media(("000",), index, archive_root, video_root, subtitle_zip)
+    assert output.read_bytes() == b"official-video"
+
+
+def test_extract_never_trusts_a_symlinked_reuse_identity_record(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("000.mp4", b"official-video")
+    index = _single_archive_index(archive_path, member_names=("000.mp4",))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, ("000",))
+    video_root = tmp_path / "videos"
+    output = extract_selected_media(
+        ("000",), index, archive_root, video_root, subtitle_zip
+    )[0]
+    record_path = output.with_suffix(".mp4.identity.json")
+    forged = json.loads(record_path.read_text(encoding="utf-8"))
+    output.write_bytes(b"forged-content")
+    forged["size"] = len(b"forged-content")
+    forged["sha256"] = hashlib.sha256(b"forged-content").hexdigest()
+    outside_record = tmp_path / "outside-record.json"
+    outside_record.write_text(json.dumps(forged), encoding="utf-8")
+    record_path.unlink()
+    record_path.symlink_to(outside_record)
+
+    extract_selected_media(("000",), index, archive_root, video_root, subtitle_zip)
+
+    assert output.read_bytes() == b"official-video"
+    assert not record_path.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("unsafe_name", "message"),
+    [
+        ("../000.mp4", "unsafe ZIP member path"),
+        ("/000.mp4", "unsafe ZIP member path"),
+        ("000.mp4/", "directory.*media"),
+    ],
+)
+def test_extract_rejects_unsafe_or_disguised_local_archive_members(
+    tmp_path: Path, unsafe_name: str, message: str
+) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr(unsafe_name, b"unsafe")
+    index = _single_archive_index(archive_path, member_names=(unsafe_name,))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, ("000",))
+
+    with pytest.raises(ValueError, match=message):
+        extract_selected_media(("000",), index, archive_root, tmp_path / "videos", subtitle_zip)
+
+
+def test_extract_rejects_symlink_and_unexpected_selected_names(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    link = ZipInfo("000.mp4")
+    link.external_attr = (0o120777 << 16)
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr(link, b"target")
+    index = _single_archive_index(archive_path, member_names=("000.mp4",))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, ("000",))
+
+    with pytest.raises(ValueError, match="symlink"):
+        extract_selected_media(("000",), index, archive_root, tmp_path / "videos", subtitle_zip)
+
+    clean_path = archive_root / "001.zip"
+    with ZipFile(clean_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("000.mp4", b"video")
+    clean_index = _single_archive_index(clean_path, member_names=("000.mp4",))
+    with pytest.raises(ValueError, match="selected video IDs"):
+        extract_selected_media(
+            ("001",), clean_index, archive_root, tmp_path / "videos", subtitle_zip
+        )
+
+
+def test_extract_rejects_directory_mode_disguised_as_mp4(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    disguised = ZipInfo("000.mp4")
+    disguised.external_attr = 0o040755 << 16
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr(disguised, b"directory-content")
+    index = _single_archive_index(archive_path, member_names=("000.mp4",))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, ("000",))
+
+    with pytest.raises(ValueError, match="directory.*media"):
+        extract_selected_media(
+            ("000",), index, archive_root, tmp_path / "videos", subtitle_zip
+        )
+
+
+def test_extract_crc_failure_never_replaces_verified_output(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive_path = archive_root / "001.zip"
+    payload = b"crc-protected-payload"
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("000.mp4", payload)
+    raw = bytearray(archive_path.read_bytes())
+    payload_offset = raw.index(payload)
+    raw[payload_offset] ^= 0xFF
+    archive_path.write_bytes(raw)
+    index = _single_archive_index(archive_path, member_names=("000.mp4",))
+    subtitle_zip = tmp_path / "subtitle.zip"
+    _subtitle_fixture(subtitle_zip, ("000",))
+    video_root = tmp_path / "videos"
+    video_root.mkdir()
+    final = video_root / "000.mp4"
+    final.write_bytes(b"last-verified-output")
+
+    with pytest.raises(ValueError, match="CRC"):
+        extract_selected_media(("000",), index, archive_root, video_root, subtitle_zip)
+
+    assert final.read_bytes() == b"last-verified-output"
+
+
+def test_prepare_check_plans_exact_pilot_and_full_scopes_without_downloading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    index = _full_population_archive_index(_even_archive_members())
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="2" * 64)
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities",
+        lambda: index.archives,
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", lambda *_args, **_kwargs: index
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100 * 1024**3, used=0, free=100 * 1024**3),
+    )
+
+    pilot = prepare_videos(
+        metadata,
+        tmp_path / "pilot-raw",
+        tmp_path / "pilot-cache",
+        scope="pilot",
+        check=True,
+        resume=False,
+        verify_only=False,
+    )
+    full = prepare_videos(
+        metadata,
+        tmp_path / "full-raw",
+        tmp_path / "full-cache",
+        scope="full",
+        check=True,
+        resume=False,
+        verify_only=False,
+    )
+
+    expected_pilot = select_pilot(metadata, index)
+    assert pilot.status == "CHECKED"
+    assert pilot.plan.video_ids == expected_pilot.selected_video_ids
+    assert tuple(item.path for item in pilot.plan.archives) == expected_pilot.selected_archive_paths
+    assert len(full.plan.archives) == 40
+    assert len(full.plan.video_ids) == 800
+    assert full.selection is None
+
+
+def test_prepare_capacity_fails_before_downloader_is_invoked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    index = _full_population_archive_index(_even_archive_members())
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="3" * 64)
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities",
+        lambda: index.archives,
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", lambda *_args, **_kwargs: index
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=1, used=0, free=1),
+    )
+
+    def forbidden_download(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("capacity must be checked before download")
+
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.download_pinned_file", forbidden_download
+    )
+    with pytest.raises(ValueError, match="insufficient.*space"):
+        prepare_videos(
+            metadata,
+            tmp_path / "raw",
+            tmp_path / "cache",
+            scope="pilot",
+            check=False,
+            resume=True,
+            verify_only=False,
+        )
+
+
+@pytest.mark.parametrize("partial_kind", ["symlink", "complete_hash_mismatch"])
+def test_prepare_check_rejects_unsafe_or_invalid_existing_partial(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, partial_kind: str
+) -> None:
+    index = _full_population_archive_index(_even_archive_members())
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="6" * 64)
+    )
+    selection = select_pilot(metadata, index)
+    first_archive = next(
+        archive
+        for archive in index.archives
+        if archive.path == selection.selected_archive_paths[0]
+    )
+    raw_root = tmp_path / "raw"
+    archive_root = raw_root / "archives"
+    archive_root.mkdir(parents=True)
+    partial = archive_root / f"{Path(first_archive.path).stem}.partial"
+    if partial_kind == "symlink":
+        outside = tmp_path / "outside-partial"
+        outside.write_bytes(b"x")
+        partial.symlink_to(outside)
+        message = "partial archive is unsafe"
+    else:
+        partial.write_bytes(b"x" * first_archive.size)
+        message = "completed partial archive SHA-256"
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities",
+        lambda: index.archives,
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", lambda *_args, **_kwargs: index
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100 * 1024**3, used=0, free=100 * 1024**3),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        prepare_videos(
+            metadata,
+            raw_root,
+            tmp_path / "cache",
+            scope="pilot",
+            check=True,
+            resume=False,
+            verify_only=False,
+        )
+
+
+def test_prepare_verify_only_uses_recorded_plan_and_never_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    index = _full_population_archive_index(_even_archive_members())
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="4" * 64)
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities",
+        lambda: index.archives,
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", lambda *_args, **_kwargs: index
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100 * 1024**3, used=0, free=100 * 1024**3),
+    )
+    raw_root = tmp_path / "raw"
+    cache_root = tmp_path / "cache"
+    prepare_videos(
+        metadata,
+        raw_root,
+        cache_root,
+        scope="pilot",
+        check=True,
+        resume=False,
+        verify_only=False,
+    )
+
+    def forbidden_network(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("verify-only must not use the network")
+
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities", forbidden_network
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.open_official_archive", forbidden_network
+    )
+    with pytest.raises(ValueError, match="missing.*archive"):
+        prepare_videos(
+            metadata,
+            raw_root,
+            cache_root,
+            scope="pilot",
+            check=False,
+            resume=False,
+            verify_only=True,
+        )
+
+
+def test_prepare_verify_only_rejects_plan_identity_tampering_before_media_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    index = _full_population_archive_index(_even_archive_members())
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="5" * 64)
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities",
+        lambda: index.archives,
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", lambda *_args, **_kwargs: index
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100 * 1024**3, used=0, free=100 * 1024**3),
+    )
+    raw_root = tmp_path / "raw"
+    cache_root = tmp_path / "cache"
+    prepare_videos(
+        metadata,
+        raw_root,
+        cache_root,
+        scope="pilot",
+        check=True,
+        resume=False,
+        verify_only=False,
+    )
+    state_path = cache_root / "videomme-v2-pilot-download-plan.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["plan"]["archives"][0]["upstream_sha256"] = "0" * 64
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="download plan.*archive index"):
+        prepare_videos(
+            metadata,
+            raw_root,
+            cache_root,
+            scope="pilot",
+            check=False,
+            resume=False,
+            verify_only=True,
+        )

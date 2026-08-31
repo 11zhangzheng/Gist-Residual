@@ -257,7 +257,7 @@ experiments:
     phase: router_training
     resumable: true
   - id: E13
-    purpose: Run the frozen main benchmark matrix on Video-MME long, LVBench, and LongVideoBench.
+    purpose: Run the frozen main benchmark matrix on LongVideoBench, LVBench, and MLVU.
     evidence_class: paper
     dependencies: [E11]
     required_gates: [bc_evaluation, zero_leakage, label_audit]

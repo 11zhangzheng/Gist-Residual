@@ -16,7 +16,7 @@ from fidmem.experiments.execution_pack import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_e01_uses_existing_runner_with_longtvqa_setup_command() -> None:
+def test_e01_uses_videomme_v2_preparation_with_existing_runner() -> None:
     config = load_experiment_config(ROOT / "configs/experiments/e01_dataset.yaml")
     assert config["execution"]["command"] == [
         "python",
@@ -25,6 +25,15 @@ def test_e01_uses_existing_runner_with_longtvqa_setup_command() -> None:
         "e01",
     ]
     assert config["inputs"]["stack_config"].endswith("gist_residual_v1.yaml")
+    assert config["inputs"]["official_metadata"] == "asset-lock:videomme_v2_metadata"
+    assert "FIDMEM_VIDEOMME_V2_PREPARATION_ROOT" in config["required_environment"]
+    assert "FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT" in config["required_environment"]
+    assert config["required_paths"][-1].endswith("videomme_v2_pilot_split_policy.yaml")
+
+
+def test_final_targets_exclude_source_dataset() -> None:
+    config = load_experiment_config(ROOT / "configs/experiments/e13_main.yaml")
+    assert config["benchmarks"] == ["longvideobench", "lvbench", "mlvu"]
 
 
 def test_e02_uses_existing_authority_schema_setup_command() -> None:

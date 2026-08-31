@@ -71,7 +71,7 @@ def test_failed_resolution_is_atomically_recorded(monkeypatch, tmp_path: Path) -
     )
     monkeypatch.setattr("fidmem.assets.cli._hub_version", lambda: "engineering-fixture")
 
-    def fail_resolution(_repo: str, _repo_type: str):
+    def fail_resolution(_repo: str, _repo_type: str, _revision: str | None):
         raise RuntimeError("engineering fixture resolution failure")
 
     with pytest.raises(RuntimeError, match="engineering fixture"):
@@ -210,5 +210,35 @@ def test_reconcile_rejects_foreign_stack_lock_without_writing(tmp_path: Path) ->
             resume=False,
             verify_only=False,
         )
-
     assert lock_path.read_bytes() == before
+
+
+def test_non_reconcile_rejects_physical_identity_drift(tmp_path: Path) -> None:
+    original = load_asset_lock(
+        ROOT / "configs/experiment_stacks/gist_residual_v1.assets.lock.json"
+    )
+    entries = dict(original.physical_assets)
+    entries["videomme_v2_metadata"] = entries["videomme_v2_metadata"].model_copy(
+        update={"repo_id": "owner/drifted-dataset"}
+    )
+    drifted = AssetLock.create(
+        stack_id=original.stack_id,
+        generated_at=original.generated_at,
+        logical_roles=dict(original.logical_roles),
+        physical_assets=entries,
+        huggingface_hub_version=original.huggingface_hub_version,
+    )
+    lock_path = tmp_path / "assets.lock.json"
+    write_asset_lock(lock_path, drifted)
+
+    with pytest.raises(ValueError, match="physical identities differ"):
+        operate(
+            "download",
+            stack_path=ROOT / "configs/experiment_stacks/gist_residual_v1.yaml",
+            lock_path=lock_path,
+            asset_kind="dataset",
+            check=True,
+            dry_run=False,
+            resume=False,
+            verify_only=False,
+        )

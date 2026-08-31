@@ -113,11 +113,11 @@ def test_videomme_source_replaces_longtvqa_without_changing_model_snapshots() ->
     assert source_entry.immutable_revision == "6e4bebb03202e1ddbf3d37703e560e51c5aa2d64"
     assert source_entry.backend == "huggingface_hub"
     assert source_entry.dtype is None
-    assert source_entry.state is AssetState.RESOLVED
-    assert source_entry.expected_files == ()
-    assert source_entry.local_snapshot_path is None
-    assert source_entry.local_snapshot_sha256 is None
-    assert source_entry.verified_at is None
+    assert source_entry.state is AssetState.VERIFIED
+    assert source_entry.expected_files == ("README.md", "subtitle.zip", "test.parquet")
+    assert source_entry.local_snapshot_path == "/mnt/disk1/zhangzheng/fidmem/datasets/videomme_v2_metadata"
+    assert source_entry.local_snapshot_sha256 == "04cf8ecdf9e25cd76bfce496330bc06e9bd8e2d529ddf3d9e845f6d172960a3a"
+    assert source_entry.verified_at is not None
 
 
 def test_final_targets_exclude_source_dataset() -> None:

@@ -13,6 +13,7 @@ from fidmem.assets.resolver import (
     assert_verified_lock,
     initial_lock,
     reconcile_lock,
+    snapshot_download_entry,
     resolve_entry,
     snapshot_sha256,
     verify_entry,
@@ -51,8 +52,31 @@ def test_resolution_requires_full_commit() -> None:
     )
     with pytest.raises(ValueError, match="full immutable"):
         resolve_entry(
-            entry, info_loader=lambda _repo, _type: ("main", ("config.json",))
+            entry, info_loader=lambda _repo, _type, _revision: ("main", ("config.json",))
         )
+
+
+def test_resolution_requires_remote_identity_to_match_existing_pin() -> None:
+    entry = AssetLockEntry(
+        repo_id="owner/repo",
+        repo_type="model",
+        immutable_revision=REVISION,
+        state="RESOLVED",
+        backend="test",
+        resolved_at="2026-08-31T00:00:00+00:00",
+    )
+    observed: list[str | None] = []
+
+    with pytest.raises(ValueError, match="differs from pinned revision"):
+        resolve_entry(
+            entry,
+            info_loader=lambda _repo, _type, revision: (
+                observed.append(revision) or "b" * 40,
+                ("config.json",),
+            ),
+        )
+
+    assert observed == [REVISION]
 
 
 def test_dataset_resolution_keeps_only_required_remote_files() -> None:
@@ -65,7 +89,7 @@ def test_dataset_resolution_keeps_only_required_remote_files() -> None:
 
     resolved = resolve_entry(
         dataset_entry,
-        info_loader=lambda _repo, _type: (REVISION, REMOTE_FILES),
+        info_loader=lambda _repo, _type, _revision: (REVISION, REMOTE_FILES),
         required_files=("README.md", "subtitle.zip", "test.parquet"),
     )
 
@@ -84,7 +108,7 @@ def test_dataset_resolution_rejects_missing_required_remote_file() -> None:
     with pytest.raises(ValueError, match="required remote files are missing"):
         resolve_entry(
             dataset_entry,
-            info_loader=lambda _repo, _type: (REVISION, REMOTE_FILES),
+            info_loader=lambda _repo, _type, _revision: (REVISION, REMOTE_FILES),
             required_files=("README.md", "missing.parquet"),
         )
 
@@ -99,7 +123,7 @@ def test_model_resolution_keeps_full_remote_listing() -> None:
 
     resolved = resolve_entry(
         model_entry,
-        info_loader=lambda _repo, _type: (REVISION, REMOTE_FILES),
+        info_loader=lambda _repo, _type, _revision: (REVISION, REMOTE_FILES),
         required_files=("README.md",),
     )
 
@@ -139,6 +163,65 @@ def test_reconcile_preserves_exact_model_identities_and_resets_changed_dataset()
     assert replacement.state is AssetState.RESOLVED
     assert replacement.expected_files == ()
     assert replacement.local_snapshot_path is None
+
+
+def test_reconcile_resets_selective_dataset_when_required_file_manifest_differs() -> None:
+    previous = AssetLock.model_validate_json(
+        (ROOT / "configs/experiment_stacks/gist_residual_v1.assets.lock.json").read_text()
+    )
+    previous = AssetLock.create(
+        stack_id=previous.stack_id,
+        generated_at=previous.generated_at,
+        logical_roles=dict(previous.logical_roles),
+        physical_assets={
+            **previous.physical_assets,
+            "videomme_v2_metadata": previous.physical_assets["videomme_v2_metadata"].model_copy(
+                update={
+                    "state": AssetState.RESOLVED,
+                    "expected_files": (),
+                    "local_snapshot_path": None,
+                    "local_snapshot_sha256": None,
+                    "resolved_at": "2026-08-30T00:00:00+00:00",
+                    "verified_at": None,
+                }
+            ),
+        },
+        huggingface_hub_version=previous.huggingface_hub_version,
+    )
+    stack = load_experiment_stack(ROOT / "configs/experiment_stacks/gist_residual_v1.yaml")
+
+    reconciled = reconcile_lock(stack, previous)
+
+    for asset_id in ("bge_m3", "qwen3_8b", "qwen3_vl_8b_instruct", "siglip2_so400m_patch14_384"):
+        assert reconciled.physical_assets[asset_id] == previous.physical_assets[asset_id]
+    dataset = reconciled.physical_assets["videomme_v2_metadata"]
+    assert dataset.state is AssetState.RESOLVED
+    assert dataset.expected_files == ()
+    assert dataset.resolved_at != previous.physical_assets["videomme_v2_metadata"].resolved_at
+
+
+def test_snapshot_download_is_restricted_to_resolved_expected_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_snapshot_download(**kwargs: object) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    entry = AssetLockEntry(
+        repo_id="owner/dataset",
+        repo_type="dataset",
+        immutable_revision=REVISION,
+        state="RESOLVED",
+        backend="huggingface_hub",
+        expected_files=("README.md", "subtitle.zip", "test.parquet"),
+        resolved_at="2026-08-31T00:00:00+00:00",
+    )
+
+    snapshot_download_entry(entry, destination=tmp_path / "snapshot", cache_root=tmp_path / "cache")
+
+    assert observed["allow_patterns"] == list(entry.expected_files)
 
 
 def test_incomplete_snapshot_is_rejected(tmp_path: Path) -> None:

@@ -28,7 +28,7 @@ def test_authority_draft_rejects_unverified_checked_in_assets(tmp_path: Path) ->
             asset_lock_path=lock_path,
             manifests_root=tmp_path,
             split_policy_path=ROOT
-            / "configs/experiment_stacks/longtvqa_split_policy.yaml",
+            / "configs/experiment_stacks/videomme_v2_pilot_split_policy.yaml",
             prompt_config_path=ROOT
             / "configs/experiment_stacks/gist_residual_v1.prompts.yaml",
             observation_config_path=ROOT

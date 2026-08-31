@@ -4,7 +4,7 @@ required_fields: [production_authority, source.git_commit, inputs.observation_gr
 inputs:
   observation_graph: RESEARCH_OWNER_DECISION_REQUIRED
   policy_manifest: RESEARCH_OWNER_DECISION_REQUIRED
-benchmarks: [video_mme_long, lvbench, longvideobench]
+benchmarks: [longvideobench, lvbench, mlvu]
 policies: [uniform_frames, gist_only, gist_residual, gist_visual, full_residual, rule, prompt_vlm, text_adaptive, question_only, bc]
 seeds: [2026, 2027, 2028]
 cost_preferences: [0.0, 0.1, 0.3, 1.0]

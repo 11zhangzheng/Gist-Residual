@@ -26,7 +26,7 @@ dataset when preflight fails.
 Before E01/E02 on a new host, follow the first-time setup in `README.md`.
 Resolve metadata, download by immutable commit with `--resume`, then verify.
 Residual/Visual must share one Qwen3-VL directory; Gist-text/embedding must
-share one BGE-M3 directory. Do not copy either snapshot or obtain LongTVQA
+share one BGE-M3 directory. Do not copy either snapshot or obtain Video-MME-v2
 videos from an unapproved third-party source.
 
 The Linux order immediately before the first Canary is:
@@ -36,15 +36,16 @@ bash scripts/setup/01_resolve_stack_assets.sh --check
 bash scripts/setup/01_resolve_stack_assets.sh
 bash scripts/setup/02_download_models.sh --resume
 bash scripts/setup/03_verify_models.sh --verify-only
-bash scripts/setup/04_download_longtvqa_metadata.sh --resume
-bash scripts/setup/05_verify_longtvqa_metadata.sh --check
-bash scripts/setup/06_verify_longtvqa_videos.sh --check
-bash scripts/setup/07_build_longtvqa_manifests.sh --check
+bash scripts/setup/04_download_videomme_v2_metadata.sh --resume
+bash scripts/setup/05_verify_videomme_v2_metadata.sh --check
+bash scripts/setup/06_prepare_videomme_v2_videos.sh --check --scope pilot
+bash scripts/setup/06_prepare_videomme_v2_videos.sh --verify-only --scope pilot
+bash scripts/setup/07_build_videomme_v2_manifests.sh --check
 bash scripts/experiments/00_environment.sh --check --run-id environment-v1
 bash scripts/experiments/00_environment.sh --run-id environment-v1
 # Record environment_ready from E00 results before checking E01.
-bash scripts/experiments/01_dataset.sh --check --run-id longtvqa-freeze-v1
-bash scripts/experiments/01_dataset.sh --run-id longtvqa-freeze-v1
+bash scripts/experiments/01_dataset.sh --check --run-id videomme-v2-pilot-freeze-v1
+bash scripts/experiments/01_dataset.sh --run-id videomme-v2-pilot-freeze-v1
 # Record dataset_frozen from results/source_gate.json before checking E02.
 bash scripts/setup/08_build_authority_draft.sh --check
 bash scripts/setup/08_build_authority_draft.sh

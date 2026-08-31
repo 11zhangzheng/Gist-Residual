@@ -35,13 +35,19 @@ from fidmem.assets.videomme_v2 import (
     prepare_videos,
     build_human_audit_manifest,
     build_archive_index,
+    build_manifests,
+    build_pilot_split,
     full_scope_media,
     load_official_archive_identities,
     open_official_archive,
     select_pilot,
     validate_human_audit_result,
     verify_metadata,
+    verify_raw_videos,
+    write_dataset_preparation,
+    prepare_e01,
 )
+from fidmem.data.video import VideoProbe
 from fidmem.production.authority import canonical_sha256
 
 
@@ -60,7 +66,7 @@ def _rows(*, videos: int = 25) -> list[tuple[object, ...]]:
             "visual",
             "detail",
         )
-        for video in range(videos)
+        for video in range(1, videos + 1)
         for question in range(4)
     ]
 
@@ -100,8 +106,9 @@ def _metadata(root: Path, *, rows: list[tuple[object, ...]] | None = None) -> No
         connection.close()
     video_ids = {str(row[0]) for row in values}
     with ZipFile(root / "subtitle.zip", "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("subtitle/", b"")
         for video_id in sorted(video_ids):
-            archive.writestr(f"{video_id}.jsonl", json.dumps({"text": "fixture"}) + "\n")
+            archive.writestr(f"subtitle/{video_id}.jsonl", json.dumps({"text": "fixture"}) + "\n")
     (root / "README.md").write_text("Engineering fixture only.\n", encoding="utf-8")
     assert tuple(path.name for path in sorted(root.iterdir())) == tuple(sorted(METADATA_FILES))
 
@@ -132,6 +139,152 @@ def _completed_audit_payload(audit: HumanAuditManifest) -> dict[str, object]:
 
 def _write_audit_result(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_pilot_split_is_exact_deterministic_and_video_disjoint(tmp_path: Path) -> None:
+    root = tmp_path / "metadata"
+    _metadata(root, rows=_rows(videos=45))
+    parsed = _verify(root, expected_question_count=180, expected_video_count=45)
+    selected = tuple(f"{item:03d}" for item in range(1, 46))
+
+    split = build_pilot_split(parsed, selected)
+    repeated = build_pilot_split(parsed, tuple(reversed(selected)))
+
+    assert split == repeated
+    assert {group: len(ids) for group, ids in split.video_groups.items()} == {
+        "oracle": 25,
+        "canary": 4,
+        "holdout": 4,
+        "development": 12,
+    }
+    groups = tuple(set(ids) for ids in split.video_groups.values())
+    assert set.union(*groups) == set(selected)
+    assert all(left.isdisjoint(right) for index, left in enumerate(groups) for right in groups[index + 1 :])
+
+
+def test_source_gate_verifies_unique_selected_videos_and_midpoint_decodes(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    videos = raw / "videos"
+    subtitles = raw / "subtitles"
+    videos.mkdir(parents=True)
+    subtitles.mkdir()
+    selected = tuple(f"{item:03d}" for item in range(1, 46))
+    for index, video_id in enumerate(selected):
+        (videos / f"{video_id}.mp4").write_bytes(f"video-{index}".encode())
+        (subtitles / f"{video_id}.jsonl").write_text('{"text":"fixture"}\n')
+    decoded: list[str] = []
+
+    report = verify_raw_videos(
+        selected,
+        raw,
+        probe=lambda path: VideoProbe(Path(path), 60.0, 384, 216, 24.0),
+        decode=lambda path, timestamp: decoded.append(f"{path.stem}:{timestamp}"),
+    )
+
+    assert report.status == "PASS"
+    assert report.expected_video_count == report.verified_video_count == 45
+    assert report.random_decode_required == report.random_decode_completed == 20
+    assert len(decoded) == 20
+
+
+def test_source_gate_fails_closed_for_missing_or_duplicate_content(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    videos = raw / "videos"
+    subtitles = raw / "subtitles"
+    videos.mkdir(parents=True)
+    subtitles.mkdir()
+    selected = tuple(f"{item:03d}" for item in range(1, 46))
+    for video_id in selected:
+        (videos / f"{video_id}.mp4").write_bytes(b"same")
+        (subtitles / f"{video_id}.jsonl").write_text("{}\n")
+    (videos / "044.mp4").unlink()
+
+    report = verify_raw_videos(
+        selected,
+        raw,
+        probe=lambda path: VideoProbe(Path(path), 1.0, 1, 1, 1.0),
+        decode=lambda path, timestamp: None,
+    )
+
+    assert report.status == "FAIL"
+    assert report.missing_video_ids == ("044",)
+    assert report.duplicate_video_ids
+
+
+def test_manifests_bind_pilot_provenance_and_gold_scope(tmp_path: Path) -> None:
+    metadata_root = tmp_path / "metadata"
+    _metadata(metadata_root, rows=_rows(videos=45))
+    parsed = _verify(metadata_root, expected_question_count=180, expected_video_count=45)
+    selected = tuple(f"{item:03d}" for item in range(1, 46))
+    raw = tmp_path / "raw"
+    (raw / "videos").mkdir(parents=True)
+    (raw / "subtitles").mkdir()
+    for index, video_id in enumerate(selected):
+        (raw / "videos" / f"{video_id}.mp4").write_bytes(f"video-{index}".encode())
+        (raw / "subtitles" / f"{video_id}.jsonl").write_text("{}\n")
+    videos = verify_raw_videos(
+        selected,
+        raw,
+        probe=lambda path: VideoProbe(Path(path), 60.0, 1, 1, 1.0),
+        decode=lambda path, timestamp: None,
+    )
+    selection = SimpleNamespace(
+        selection_sha256="2" * 64,
+        source_archive_index_sha256="3" * 64,
+        available_video_count=800,
+        selected_video_ids=selected,
+    )
+
+    video_manifest, question_manifest, dataset_manifest, canary, oracle, split = build_manifests(
+        parsed, videos, selection
+    )
+
+    assert len(video_manifest.records) == 45
+    assert len(question_manifest.records) == 180
+    assert dataset_manifest.dataset_scope == "PARTIAL_DATASET_PILOT"
+    assert dataset_manifest.selected_video_count == 45
+    assert dataset_manifest.selected_question_count == 180
+    assert len(canary.question_ids) == 16
+    assert len(oracle.question_ids) == 100
+    assert set(canary.video_ids).isdisjoint(oracle.video_ids)
+    assert all(record.gold_answer_sha256 is None for record in question_manifest.records if record.group in {"development", "canary"})
+    assert all(record.gold_answer_sha256 for record in question_manifest.records if record.group in {"oracle", "holdout"})
+    assert split.policy_sha256 == dataset_manifest.split_policy_sha256
+
+
+def test_dataset_preparation_is_pending_and_formal_e01_requires_real_audit(tmp_path: Path) -> None:
+    metadata_root = tmp_path / "metadata"
+    _metadata(metadata_root, rows=_rows(videos=45))
+    parsed = _verify(metadata_root, expected_question_count=180, expected_video_count=45)
+    selected = tuple(f"{item:03d}" for item in range(1, 46))
+    raw = tmp_path / "raw"
+    (raw / "videos").mkdir(parents=True)
+    (raw / "subtitles").mkdir()
+    for index, video_id in enumerate(selected):
+        (raw / "videos" / f"{video_id}.mp4").write_bytes(f"video-{index}".encode())
+        (raw / "subtitles" / f"{video_id}.jsonl").write_text("{}\n")
+    videos = verify_raw_videos(
+        selected, raw,
+        probe=lambda path: VideoProbe(Path(path), 60.0, 1, 1, 1.0),
+        decode=lambda path, timestamp: None,
+    )
+    selection = SimpleNamespace(
+        selection_sha256="2" * 64,
+        source_archive_index_sha256="3" * 64,
+        available_video_count=800,
+        selected_video_ids=selected,
+    )
+    output = tmp_path / "preparation"
+
+    archive_index = SimpleNamespace(archive_index_sha256="3" * 64)
+    payload = write_dataset_preparation(parsed, videos, archive_index, selection, output)
+
+    assert payload["status"] == "PENDING_HUMAN_AUDIT"
+    assert (output / "archive_index.json").is_file()
+    assert (output / "split_policy.json").is_file()
+    assert (output / "dataset_manifest.json").is_file()
+    with pytest.raises(ValueError, match="human audit result is missing"):
+        prepare_e01(output, tmp_path / "missing-audit.json", check=True)
 
 
 def test_metadata_parses_official_shape_and_hashes_ordered_files(tmp_path: Path) -> None:
@@ -205,6 +358,16 @@ def test_metadata_rejects_unexpected_files_and_wrong_revision(tmp_path: Path) ->
         )
 
 
+def test_metadata_allows_only_huggingface_housekeeping_directory(tmp_path: Path) -> None:
+    root = tmp_path / "metadata"
+    _metadata(root)
+    housekeeping = root / ".cache" / "huggingface"
+    housekeeping.mkdir(parents=True)
+    (housekeeping / ".gitignore").write_text("*\n")
+
+    assert _verify(root).report.status == "VERIFIED"
+
+
 def test_human_audit_is_pending_and_binds_exact_selected_question_ids(
     tmp_path: Path,
 ) -> None:
@@ -214,7 +377,7 @@ def test_human_audit_is_pending_and_binds_exact_selected_question_ids(
 
     audit = build_human_audit_manifest(
         parsed,
-        selected_video_ids=tuple(f"{item:03d}" for item in range(25)),
+        selected_video_ids=tuple(f"{item:03d}" for item in range(1, 26)),
         seed="fixture-seed",
     )
 
@@ -234,7 +397,7 @@ def test_human_audit_manifest_rejects_duplicate_question_ids(tmp_path: Path) -> 
     _metadata(root)
     audit = build_human_audit_manifest(
         _verify(root),
-        selected_video_ids=tuple(f"{item:03d}" for item in range(25)),
+        selected_video_ids=tuple(f"{item:03d}" for item in range(1, 26)),
         seed="fixture-seed",
     )
 
@@ -252,7 +415,7 @@ def test_human_audit_rejects_duplicate_result_ids_for_a_forged_manifest(
     _metadata(root)
     audit = build_human_audit_manifest(
         _verify(root),
-        selected_video_ids=tuple(f"{item:03d}" for item in range(25)),
+        selected_video_ids=tuple(f"{item:03d}" for item in range(1, 26)),
         seed="fixture-seed",
     )
     forged = audit.model_copy(update={"items": (audit.items[0],) * 100})
@@ -281,7 +444,7 @@ def test_human_audit_rejects_invalid_bound_results(
     _metadata(root)
     audit = build_human_audit_manifest(
         _verify(root),
-        selected_video_ids=tuple(f"{item:03d}" for item in range(25)),
+        selected_video_ids=tuple(f"{item:03d}" for item in range(1, 26)),
         seed="fixture-seed",
     )
     payload = _completed_audit_payload(audit)
@@ -334,7 +497,7 @@ def _archive_fixtures(
         archive_path = f"videos/{archive_number:03d}.zip"
         local_path = root / f"{archive_number:03d}.zip"
         with ZipFile(local_path, "w", compression=ZIP_DEFLATED) as archive:
-            first_video = (archive_number - 1) * members_per_archive
+            first_video = (archive_number - 1) * members_per_archive + 1
             for video_number in range(first_video, first_video + members_per_archive):
                 archive.writestr(f"{video_number:03d}.mp4", b"engineering-mp4")
             for member in (extra_members or {}).get(archive_path, ()):
@@ -375,9 +538,9 @@ def test_archive_index_records_only_safe_canonical_members_and_exact_metadata_co
     assert tuple(archive.path for archive in index.archives) == tuple(
         identity.path for identity in identities
     )
-    assert index.video_ids == tuple(f"{video:03d}" for video in range(60))
+    assert index.video_ids == tuple(f"{video:03d}" for video in range(1, 61))
     assert tuple(member.member_path for member in index.members[:20]) == tuple(
-        f"{video:03d}.mp4" for video in range(20)
+        f"{video:03d}.mp4" for video in range(1, 21)
     )
     assert index.archive_index_sha256 == build_archive_index(
         tuple(reversed(identities)),
@@ -410,7 +573,7 @@ def test_archive_index_rejects_unsafe_or_non_mp4_members(
         build_archive_index(
             identities,
             _fixture_opener(archive_root),
-            metadata_video_ids=tuple(f"{video:03d}" for video in range(60)),
+            metadata_video_ids=tuple(f"{video:03d}" for video in range(1, 61)),
             _expected_archive_paths=tuple(identity.path for identity in identities),
         )
 
@@ -421,7 +584,7 @@ def test_archive_index_rejects_duplicate_members_and_nonmatching_identities(
     archive_root = tmp_path / "archives"
     identities = _archive_fixtures(archive_root)
     with ZipFile(archive_root / "002.zip", "a", compression=ZIP_DEFLATED) as archive:
-        archive.writestr("000.mp4", b"duplicate-video")
+        archive.writestr("001.mp4", b"duplicate-video")
     identities = (
         identities[0],
         identities[1].model_copy(update={"size": (archive_root / "002.zip").stat().st_size}),
@@ -432,7 +595,7 @@ def test_archive_index_rejects_duplicate_members_and_nonmatching_identities(
         build_archive_index(
             identities,
             _fixture_opener(archive_root),
-            metadata_video_ids=tuple(f"{video:03d}" for video in range(60)),
+            metadata_video_ids=tuple(f"{video:03d}" for video in range(1, 61)),
             _expected_archive_paths=tuple(identity.path for identity in identities),
         )
 
@@ -446,14 +609,14 @@ def test_archive_index_rejects_duplicate_members_and_nonmatching_identities(
                 upstream_sha256="",
             ), *clean_identities[1:]),
             _fixture_opener(clean_root),
-            metadata_video_ids=tuple(f"{video:03d}" for video in range(60)),
+            metadata_video_ids=tuple(f"{video:03d}" for video in range(1, 61)),
             _expected_archive_paths=tuple(identity.path for identity in clean_identities),
         )
     with pytest.raises(ValueError, match="archive size differs"):
         build_archive_index(
             (clean_identities[0].model_copy(update={"size": clean_identities[0].size + 1}), *clean_identities[1:]),
             _fixture_opener(clean_root),
-            metadata_video_ids=tuple(f"{video:03d}" for video in range(60)),
+            metadata_video_ids=tuple(f"{video:03d}" for video in range(1, 61)),
             _expected_archive_paths=tuple(identity.path for identity in clean_identities),
         )
 
@@ -543,17 +706,52 @@ def _full_population_archive_index(
     )
 
 
+def test_formal_e01_revalidates_archive_selection_and_manifest_chain(tmp_path: Path) -> None:
+    metadata_root = tmp_path / "metadata"
+    _metadata(metadata_root, rows=_rows(videos=800))
+    metadata = _verify(metadata_root, expected_question_count=3200, expected_video_count=800)
+    archive_index = _full_population_archive_index(_even_archive_members())
+    selection = select_pilot(metadata, archive_index)
+    raw = tmp_path / "raw"
+    (raw / "videos").mkdir(parents=True)
+    (raw / "subtitles").mkdir()
+    for index, video_id in enumerate(selection.selected_video_ids):
+        (raw / "videos" / f"{video_id}.mp4").write_bytes(f"video-{index}".encode())
+        (raw / "subtitles" / f"{video_id}.jsonl").write_text("{}\n")
+    videos = verify_raw_videos(
+        selection.selected_video_ids,
+        raw,
+        probe=lambda path: VideoProbe(Path(path), 60.0, 1, 1, 1.0),
+        decode=lambda path, timestamp: None,
+    )
+    preparation = tmp_path / "preparation"
+    write_dataset_preparation(metadata, videos, archive_index, selection, preparation)
+    audit = HumanAuditManifest.model_validate_json(
+        (preparation / "human_audit_manifest.json").read_text()
+    )
+    audit_result = tmp_path / "audit-result.json"
+    _write_audit_result(audit_result, _completed_audit_payload(audit))
+
+    assert prepare_e01(preparation, audit_result, check=True)["source_gate"] == "PASS"
+
+    archive_payload = json.loads((preparation / "archive_index.json").read_text())
+    archive_payload["archives"][0]["size"] += 1
+    (preparation / "archive_index.json").write_text(json.dumps(archive_payload))
+    with pytest.raises(ValueError, match="archive_index_sha256"):
+        prepare_e01(preparation, audit_result, check=True)
+
+
 def _even_archive_members() -> tuple[tuple[str, ...], ...]:
     return tuple(
         tuple(f"{video:03d}" for video in range(start, start + 20))
-        for start in range(0, 800, 20)
+        for start in range(1, 801, 20)
     )
 
 
 def _uneven_full_archive_members() -> tuple[tuple[str, ...], ...]:
     sizes = (101, 7, 39) + (17,) * 36 + (41,)
     assert len(sizes) == 40 and sum(sizes) == 800
-    start = 0
+    start = 1
     members = []
     for size in sizes:
         members.append(tuple(f"{video:03d}" for video in range(start, start + size)))
@@ -706,7 +904,7 @@ def test_full_scope_media_has_all_pinned_archives_and_videos_without_a_selection
     archive_paths, video_ids = full_scope_media(index)
 
     assert archive_paths == tuple(f"videos/{archive:03d}.zip" for archive in range(1, 41))
-    assert video_ids == tuple(f"{video:03d}" for video in range(800))
+    assert video_ids == tuple(f"{video:03d}" for video in range(1, 801))
     assert not hasattr((archive_paths, video_ids), "selection_sha256")
 
 
@@ -945,8 +1143,9 @@ def _single_archive_index(
 
 def _subtitle_fixture(path: Path, video_ids: tuple[str, ...]) -> None:
     with ZipFile(path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("subtitle/", b"")
         for video_id in video_ids:
-            archive.writestr(f"{video_id}.jsonl", f'{{"video_id":"{video_id}"}}\n')
+            archive.writestr(f"subtitle/{video_id}.jsonl", f'{{"video_id":"{video_id}"}}\n')
 
 
 def test_extract_writes_only_selected_mp4s_and_subtitles_atomically(
@@ -955,7 +1154,7 @@ def test_extract_writes_only_selected_mp4s_and_subtitles_atomically(
     archive_root = tmp_path / "archives"
     archive_root.mkdir()
     archive_path = archive_root / "001.zip"
-    video_ids = tuple(f"{number:03d}" for number in range(60))
+    video_ids = tuple(f"{number:03d}" for number in range(1, 61))
     with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
         for video_id in video_ids:
             archive.writestr(f"{video_id}.mp4", f"mp4-{video_id}".encode())
@@ -1169,6 +1368,7 @@ def test_prepare_check_plans_exact_pilot_and_full_scopes_without_downloading(
 
     expected_pilot = select_pilot(metadata, index)
     assert pilot.status == "CHECKED"
+    assert pilot.archive_index.archive_index_sha256 == index.archive_index_sha256
     assert pilot.plan.video_ids == expected_pilot.selected_video_ids
     assert tuple(item.path for item in pilot.plan.archives) == expected_pilot.selected_archive_paths
     assert len(full.plan.archives) == 40

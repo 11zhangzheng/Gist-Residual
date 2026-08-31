@@ -67,7 +67,7 @@ PYTHONPATH=src python -m fidmem.experiments.pack_cli --list
 E00-E17 remain the only experiment DAG. Asset preparation is a pre-Authority
 input to E01/E02, not a second runner or gate framework. Copy `.env.example`,
 set storage roots for the current host, and provide only a researcher-approved
-LongTVQA raw-video root:
+Video-MME-v2 raw-video root:
 
 ```bash
 export FIDMEM_DATA_ROOT=/data/fidmem/datasets
@@ -75,17 +75,18 @@ export FIDMEM_MODEL_ROOT=/data/fidmem/models
 export FIDMEM_CACHE_ROOT=/data/fidmem/cache
 export FIDMEM_ARTIFACT_ROOT="$PWD/artifacts"
 export FIDMEM_GIT_COMMIT="$(git rev-parse HEAD)"
-export FIDMEM_LONGTVQA_VIDEO_ROOT=/approved/LongTVQA/videos
+export FIDMEM_VIDEOMME_V2_RAW_ROOT=/approved/Video-MME-v2
+export FIDMEM_VIDEOMME_V2_PREPARATION_ROOT="$FIDMEM_ARTIFACT_ROOT/dataset-preparation/videomme-v2-pilot-v1"
 
 bash scripts/setup/01_resolve_stack_assets.sh --check
 bash scripts/setup/01_resolve_stack_assets.sh
 bash scripts/setup/02_download_models.sh --check
 bash scripts/setup/02_download_models.sh --resume
 bash scripts/setup/03_verify_models.sh --verify-only
-bash scripts/setup/04_download_longtvqa_metadata.sh --check
-bash scripts/setup/04_download_longtvqa_metadata.sh --resume
-bash scripts/setup/05_verify_longtvqa_metadata.sh --check
-bash scripts/setup/06_verify_longtvqa_videos.sh --check
+bash scripts/setup/04_download_videomme_v2_metadata.sh --check
+bash scripts/setup/04_download_videomme_v2_metadata.sh --resume
+bash scripts/setup/05_verify_videomme_v2_metadata.sh --check
+bash scripts/setup/06_prepare_videomme_v2_videos.sh --check
 ```
 
 `--check` performs metadata, revision, dependency, storage, permission, and
@@ -95,23 +96,23 @@ mechanism. `--verify-only` hashes existing local files. Logical roles map to
 five physical assets: BGE-M3 is shared by Gist text and embedding, and one
 Qwen3-VL snapshot is shared by Residual and Visual.
 
-The checked-in lock is only a candidate: it contains four metadata-resolved
-commit SHAs, leaves Qwen3-VL unresolved, and contains no `VERIFIED` asset.
-Running a resolver is not verification. E02 re-hashes every local snapshot and
-accepts only a fully `VERIFIED` lock.
+The checked-in lock binds four already verified shared model snapshots and a
+resolved Video-MME-v2 metadata asset. Running a resolver is not verification;
+E02 re-hashes every local snapshot and accepts only a fully `VERIFIED` lock.
 
 After approved raw videos are present, generate the automatic Source Gate and
 the deterministic 100-item human audit manifest:
 
 ```bash
-bash scripts/setup/06_verify_longtvqa_videos.sh \
-  --output "$FIDMEM_ARTIFACT_ROOT/longtvqa-source-gate"
+bash scripts/setup/06_prepare_videomme_v2_videos.sh --resume --scope pilot \
+  --output "$FIDMEM_VIDEOMME_V2_PREPARATION_ROOT"
+bash scripts/setup/06_prepare_videomme_v2_videos.sh --verify-only --scope pilot
 # A real researcher completes the generated audit; do not edit its status.
-export FIDMEM_LONGTVQA_HUMAN_AUDIT_RESULT=/approved/audit-result.json
-# First freeze configs/experiment_stacks/longtvqa_split_policy.yaml.
-bash scripts/setup/07_build_longtvqa_manifests.sh \
-  --output "$FIDMEM_ARTIFACT_ROOT/dataset-freeze"
-export FIDMEM_E01_RESULTS_ROOT="$FIDMEM_ARTIFACT_ROOT/dataset-freeze"
+export FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT=/approved/audit-result.json
+bash scripts/setup/07_build_videomme_v2_manifests.sh \
+  --output "$FIDMEM_VIDEOMME_V2_PREPARATION_ROOT"
+# This preparation remains explicitly PARTIAL_DATASET_PILOT and
+# PENDING_HUMAN_AUDIT until the separately completed result validates.
 bash scripts/setup/08_build_authority_draft.sh --check
 bash scripts/setup/08_build_authority_draft.sh
 ```
@@ -252,7 +253,7 @@ new approved protocol version if a prospective change is scientifically
 necessary.
 
 Current unresolved owner choices are the Qwen3-VL immutable revision, approved
-raw LongTVQA videos, video-level split assignments/seeds, completed human
+raw Video-MME-v2 videos, video-level split assignments/seeds, completed human
 timestamp audit, the prompt/config items listed above, the concrete frozen
 Transformers backend factory/request materializer, target GPU/runtime, Oracle
 headroom/missing-rate thresholds, Gist recall threshold, transfer protocol,

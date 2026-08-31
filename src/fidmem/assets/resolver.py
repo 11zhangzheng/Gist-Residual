@@ -185,18 +185,29 @@ def _asset_identity(asset: PhysicalAsset | AssetLockEntry) -> tuple[
     )
 
 
+def can_preserve_entry(asset: PhysicalAsset, entry: AssetLockEntry) -> bool:
+    """Require both immutable identity and selective remote-file identity."""
+    if _asset_identity(asset) != _asset_identity(entry):
+        return False
+    return not asset.include_files or entry.expected_files == asset.include_files
+
+
+def physical_identity_matches(asset: PhysicalAsset, entry: AssetLockEntry) -> bool:
+    """Compare only immutable physical identity, independent of lifecycle state."""
+    return _asset_identity(asset) == _asset_identity(entry)
+
+
 def reconcile_lock(stack: ExperimentStack, previous: AssetLock) -> AssetLock:
     """Rebuild a stack lock while retaining entries with exact immutable identity."""
     now = utc_now()
-    previous_by_identity = {
-        _asset_identity(entry): entry for entry in previous.physical_assets.values()
-    }
-    entries = {
-        asset_id: previous_by_identity.get(
-            _asset_identity(asset), _initial_entry(asset, now=now)
+    previous_entries = tuple(previous.physical_assets.values())
+    entries = {}
+    for asset_id, asset in stack.physical_assets.items():
+        matched = next(
+            (entry for entry in previous_entries if can_preserve_entry(asset, entry)),
+            None,
         )
-        for asset_id, asset in stack.physical_assets.items()
-    }
+        entries[asset_id] = matched or _initial_entry(asset, now=now)
     return AssetLock.create(
         stack_id=stack.stack_id,
         generated_at=now,
@@ -298,12 +309,16 @@ def check_storage_roots(
 def resolve_entry(
     entry: AssetLockEntry,
     *,
-    info_loader: Callable[[str, str], tuple[str, tuple[str, ...]]],
+    info_loader: Callable[[str, str, str | None], tuple[str, tuple[str, ...]]],
     required_files: tuple[str, ...] = (),
 ) -> AssetLockEntry:
-    revision, files = info_loader(entry.repo_id, entry.repo_type)
+    revision, files = info_loader(
+        entry.repo_id, entry.repo_type, entry.immutable_revision
+    )
     if not re.fullmatch(_COMMIT_PATTERN, revision):
         raise ValueError("remote resolver did not return a full immutable commit SHA")
+    if entry.immutable_revision is not None and revision != entry.immutable_revision:
+        raise ValueError("remote revision differs from pinned revision")
     remote_files = tuple(sorted(set(files)))
     missing = sorted(set(required_files) - set(remote_files))
     if missing:
@@ -324,7 +339,7 @@ def resolve_entry(
 
 
 def huggingface_info_loader(
-    repo_id: str, repo_type: str
+    repo_id: str, repo_type: str, revision: str | None
 ) -> tuple[str, tuple[str, ...]]:
     try:
         from huggingface_hub import HfApi
@@ -332,9 +347,9 @@ def huggingface_info_loader(
         raise RuntimeError("huggingface_hub is required for remote resolution") from exc
     api = HfApi()
     info: Any = (
-        api.dataset_info(repo_id=repo_id)
+        api.dataset_info(repo_id=repo_id, revision=revision)
         if repo_type == "dataset"
-        else api.model_info(repo_id=repo_id)
+        else api.model_info(repo_id=repo_id, revision=revision)
     )
     revision = str(info.sha)
     files = tuple(str(item.rfilename) for item in (info.siblings or ()))
@@ -349,6 +364,8 @@ def snapshot_download_entry(
 ) -> AssetLockEntry:
     if entry.immutable_revision is None:
         raise ValueError("download requires a resolved immutable revision")
+    if not entry.expected_files:
+        raise ValueError("download requires a resolved remote file manifest")
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
@@ -360,6 +377,7 @@ def snapshot_download_entry(
         revision=entry.immutable_revision,
         local_dir=destination,
         cache_dir=cache_root,
+        allow_patterns=list(entry.expected_files),
     )
     return entry.model_copy(
         update={

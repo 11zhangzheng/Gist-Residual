@@ -9,17 +9,17 @@ required_environment:
   - FIDMEM_MODEL_ROOT
   - FIDMEM_CACHE_ROOT
   - FIDMEM_ARTIFACT_ROOT
-  - FIDMEM_LONGTVQA_VIDEO_ROOT
-  - FIDMEM_LONGTVQA_HUMAN_AUDIT_RESULT
+  - FIDMEM_VIDEOMME_V2_PREPARATION_ROOT
+  - FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT
 required_paths:
   - configs/experiment_stacks/gist_residual_v1.yaml
   - configs/experiment_stacks/gist_residual_v1.assets.lock.json
-  - configs/experiment_stacks/longtvqa_split_policy.yaml
+  - configs/experiment_stacks/videomme_v2_pilot_split_policy.yaml
 inputs:
   stack_config: configs/experiment_stacks/gist_residual_v1.yaml
   asset_lock: configs/experiment_stacks/gist_residual_v1.assets.lock.json
   dataset_root: env:FIDMEM_DATA_ROOT
-  official_metadata: asset-lock:longtvqa_metadata
+  official_metadata: asset-lock:videomme_v2_metadata
 execution:
   command: [python, -m, fidmem.assets.setup, e01]
   may_generate_observations: false

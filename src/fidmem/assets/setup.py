@@ -1,4 +1,4 @@
-"""Manual LongTVQA/E01/E02 setup commands; never performs model inference."""
+"""Manual Video-MME-v2/E01/E02 setup commands; never performs model inference."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from fidmem.assets.authority_draft import build_authority_draft, write_authority_draft
-from fidmem.assets.longtvqa import (
+from fidmem.assets.videomme_v2 import (
     DATASET_ID,
-    atomic_write_model,
-    build_human_audit_manifest,
-    build_manifests,
-    validate_human_audit_result,
+    FROZEN_REVISION,
+    prepare_e01 as prepare_videomme_e01,
+    prepare_videos,
     verify_metadata,
     verify_raw_videos,
+    write_dataset_preparation,
 )
 from fidmem.assets.resolver import (
     AssetState,
@@ -33,7 +33,7 @@ from fidmem.production.authority import (
 
 
 STACK_LOCK = Path("configs/experiment_stacks/gist_residual_v1.assets.lock.json")
-SPLIT_POLICY = Path("configs/experiment_stacks/longtvqa_split_policy.yaml")
+SPLIT_POLICY = Path("configs/experiment_stacks/videomme_v2_pilot_split_policy.yaml")
 PROMPTS = Path("configs/experiment_stacks/gist_residual_v1.prompts.yaml")
 OBSERVATION_CONFIGS = Path(
     "configs/experiment_stacks/gist_residual_v1.observation_configs.yaml"
@@ -44,8 +44,7 @@ def _atomic_payload(path: Path, payload: object) -> None:
     from pydantic import BaseModel
 
     if isinstance(payload, BaseModel):
-        atomic_write_model(path, payload)
-        return
+        payload = payload.model_dump(mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -60,71 +59,15 @@ def _metadata_from_lock(lock_path: Path):
     asset_id = lock.logical_roles["source_dataset"]
     entry = lock.physical_assets[asset_id]
     if entry.repo_id != DATASET_ID:
-        raise ValueError("stack source_dataset is not the approved LongTVQA repository")
+        raise ValueError("stack source_dataset is not the approved Video-MME-v2 repository")
     if entry.state is not AssetState.VERIFIED:
-        raise ValueError("LongTVQA metadata asset is not VERIFIED")
+        raise ValueError("Video-MME-v2 metadata asset is not VERIFIED")
     verified = verify_entry(entry)
     if verified.local_snapshot_sha256 != entry.local_snapshot_sha256:
-        raise ValueError("LongTVQA metadata snapshot differs from asset lock")
+        raise ValueError("Video-MME-v2 metadata snapshot differs from asset lock")
     return verify_metadata(
-        str(entry.local_snapshot_path), immutable_revision=str(entry.immutable_revision)
+        str(entry.local_snapshot_path), immutable_revision=FROZEN_REVISION
     )
-
-
-def prepare_e01(
-    *,
-    lock_path: Path,
-    split_policy_path: Path,
-    video_root: Path,
-    human_result: Path,
-    output_dir: Path | None,
-    check: bool,
-) -> dict[str, Any]:
-    metadata = _metadata_from_lock(lock_path)
-    if metadata.report.qa_unconstructible_count:
-        raise ValueError(
-            "LongTVQA contains QA rows that cannot construct approved actions/options"
-        )
-    videos = verify_raw_videos(metadata, video_root)
-    if videos.status != "PASS":
-        raise ValueError("LongTVQA raw-video Source Gate failed")
-    audit = build_human_audit_manifest(metadata, seed="longtvqa-human-audit-v1")
-    validate_human_audit_result(audit, human_result)
-    video_manifest, question_manifest, dataset_manifest, canary, oracle = (
-        build_manifests(
-            metadata,
-            videos,
-            split_policy_path=split_policy_path,
-        )
-    )
-    payload = {
-        "status": "CHECK_PASSED" if check else "COMPLETED",
-        "dataset": DATASET_ID,
-        "dataset_revision": metadata.report.immutable_revision,
-        "metadata_sha256": metadata.report.metadata_sha256,
-        "video_manifest_sha256": video_manifest.manifest_sha256,
-        "question_manifest_sha256": question_manifest.manifest_sha256,
-        "canary_selection_sha256": canary.selection_sha256,
-        "oracle_selection_sha256": oracle.selection_sha256,
-        "human_audit_manifest_sha256": audit.manifest_sha256,
-        "source_gate": "PASS",
-        "manifests_complete": True,
-        "video_disjoint": True,
-        "hashes_valid": True,
-    }
-    if not check:
-        if output_dir is None:
-            raise ValueError("output_dir is required outside --check")
-        atomic_write_model(output_dir / "metadata_verification.json", metadata.report)
-        atomic_write_model(output_dir / "raw_video_verification.json", videos)
-        atomic_write_model(output_dir / "human_audit_manifest.json", audit)
-        atomic_write_model(output_dir / "video_manifest.json", video_manifest)
-        atomic_write_model(output_dir / "question_manifest.json", question_manifest)
-        atomic_write_model(output_dir / "dataset_manifest.json", dataset_manifest)
-        atomic_write_model(output_dir / "canary_selection_manifest.json", canary)
-        atomic_write_model(output_dir / "oracle_selection_manifest.json", oracle)
-        _atomic_payload(output_dir / "source_gate.json", payload)
-    return payload
 
 
 def _config_snapshot() -> dict[str, Any]:
@@ -151,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--project-root", default=".")
         command.add_argument("--lock", default=str(STACK_LOCK))
         command.add_argument("--output")
+        if name == "videos":
+            command.add_argument("--resume", action="store_true")
+            command.add_argument("--verify-only", action="store_true")
+            command.add_argument("--scope", choices=("pilot", "full"), default="pilot")
     args = parser.parse_args(argv)
     root = Path(args.project_root).resolve()
     lock_path = _resolve_project_path(root, args.lock)
@@ -162,38 +109,44 @@ def main(argv: list[str] | None = None) -> int:
             atomic_write_model(Path(args.output), parsed.report)
     elif args.command == "videos":
         parsed = _metadata_from_lock(lock_path)
-        video_value = os.environ.get("FIDMEM_LONGTVQA_VIDEO_ROOT")
-        if not video_value:
-            raise ValueError("FIDMEM_LONGTVQA_VIDEO_ROOT is required")
-        report = verify_raw_videos(parsed, video_value)
-        audit = build_human_audit_manifest(parsed, seed="longtvqa-human-audit-v1")
-        payload = {
-            "raw_video": report.model_dump(mode="json"),
-            "human_audit": audit.model_dump(mode="json"),
-        }
-        if args.output and not args.check:
-            destination = Path(args.output)
-            atomic_write_model(destination / "raw_video_verification.json", report)
-            atomic_write_model(destination / "human_audit_manifest.json", audit)
-    elif args.command in {"manifests", "e01"}:
-        video_value = os.environ.get("FIDMEM_LONGTVQA_VIDEO_ROOT")
-        human_value = os.environ.get("FIDMEM_LONGTVQA_HUMAN_AUDIT_RESULT")
-        if not video_value or not human_value:
-            raise ValueError(
-                "FIDMEM_LONGTVQA_VIDEO_ROOT and FIDMEM_LONGTVQA_HUMAN_AUDIT_RESULT are required"
-            )
+        raw_value = os.environ.get("FIDMEM_VIDEOMME_V2_RAW_ROOT")
+        cache_value = os.environ.get("FIDMEM_CACHE_ROOT")
+        if not raw_value or not cache_value:
+            raise ValueError("FIDMEM_VIDEOMME_V2_RAW_ROOT and FIDMEM_CACHE_ROOT are required")
+        prepared = prepare_videos(
+            parsed, Path(raw_value), Path(cache_value), scope=args.scope,
+            check=args.check, resume=args.resume, verify_only=args.verify_only,
+        )
+        payload = prepared.model_dump(mode="json")
+    elif args.command == "manifests":
+        parsed = _metadata_from_lock(lock_path)
+        raw_value = os.environ.get("FIDMEM_VIDEOMME_V2_RAW_ROOT")
+        cache_value = os.environ.get("FIDMEM_CACHE_ROOT")
+        if not raw_value or not cache_value:
+            raise ValueError("FIDMEM_VIDEOMME_V2_RAW_ROOT and FIDMEM_CACHE_ROOT are required")
+        prepared = prepare_videos(
+            parsed, Path(raw_value), Path(cache_value), scope="pilot",
+            check=False, resume=False, verify_only=True,
+        )
+        if prepared.selection is None:
+            raise ValueError("pilot preparation lacks subset selection")
+        report = verify_raw_videos(prepared.selection.selected_video_ids, Path(raw_value))
         output = (
             Path(args.output)
             if args.output
-            else Path(os.environ["FIDMEM_RUN_DIR"]) / "results"
+            else Path(os.environ["FIDMEM_VIDEOMME_V2_PREPARATION_ROOT"])
         )
-        payload = prepare_e01(
-            lock_path=lock_path,
-            split_policy_path=root / SPLIT_POLICY,
-            video_root=Path(video_value),
-            human_result=Path(human_value),
-            output_dir=output,
-            check=args.check,
+        payload = write_dataset_preparation(
+            parsed, report, prepared.archive_index, prepared.selection, output
+        )
+    elif args.command == "e01":
+        preparation = os.environ.get("FIDMEM_VIDEOMME_V2_PREPARATION_ROOT")
+        human_value = os.environ.get("FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT")
+        if not preparation or not human_value:
+            raise ValueError("FIDMEM_VIDEOMME_V2_PREPARATION_ROOT and FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT are required")
+        output = Path(args.output) if args.output else Path(os.environ["FIDMEM_RUN_DIR"]) / "results"
+        payload = prepare_videomme_e01(
+            Path(preparation), Path(human_value), output_dir=output, check=args.check
         )
     elif args.command == "authority-draft":
         manifests_value = os.environ.get("FIDMEM_E01_RESULTS_ROOT")
@@ -210,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             project_root=root,
             asset_lock_path=lock_path,
             manifests_root=manifests_value,
-            split_policy_path=root / SPLIT_POLICY,
+            split_policy_path=Path(manifests_value) / "split_policy.json",
             prompt_config_path=root / PROMPTS,
             observation_config_path=root / OBSERVATION_CONFIGS,
             evidence_root=roots["FIDMEM_ARTIFACT_ROOT"]

@@ -17,6 +17,8 @@ from fidmem.assets.resolver import (
     huggingface_info_loader,
     load_asset_lock,
     reconcile_lock,
+    can_preserve_entry,
+    physical_identity_matches,
     resolve_entry,
     snapshot_download_entry,
     storage_roots,
@@ -72,26 +74,11 @@ def _failed(entry: AssetLockEntry, exc: Exception) -> AssetLockEntry:
 def _reconciliation_asset_ids(
     stack, lock: AssetLock
 ) -> tuple[list[str], list[str]]:
-    previous_identities = {
-        (
-            entry.repo_id,
-            entry.repo_type,
-            entry.immutable_revision,
-            entry.backend,
-            entry.dtype,
-        )
-        for entry in lock.physical_assets.values()
-    }
+    previous_entries = tuple(lock.physical_assets.values())
     preserved, reset = [], []
     for asset_id, asset in sorted(stack.physical_assets.items()):
-        identity = (
-            asset.repo_id,
-            asset.repo_type,
-            asset.immutable_revision,
-            asset.backend,
-            asset.dtype,
-        )
-        (preserved if identity in previous_identities else reset).append(asset_id)
+        matched = any(can_preserve_entry(asset, entry) for entry in previous_entries)
+        (preserved if matched else reset).append(asset_id)
     return preserved, reset
 
 
@@ -106,7 +93,7 @@ def operate(
     resume: bool,
     verify_only: bool,
     info_loader: Callable[
-        [str, str], tuple[str, tuple[str, ...]]
+        [str, str, str | None], tuple[str, tuple[str, ...]]
     ] = huggingface_info_loader,
     downloader: Callable[..., AssetLockEntry] = snapshot_download_entry,
 ) -> dict[str, object]:
@@ -117,6 +104,16 @@ def operate(
         raise ValueError("stack config and asset lock identities differ")
     if effective_action != "reconcile" and lock.logical_roles != stack.logical_roles:
         raise ValueError("stack config and asset lock identities differ")
+    if effective_action != "reconcile" and (
+        set(lock.physical_assets) != set(stack.physical_assets)
+        or any(
+            not physical_identity_matches(
+                stack.physical_assets[asset_id], lock.physical_assets[asset_id]
+            )
+            for asset_id in stack.physical_assets
+        )
+    ):
+        raise ValueError("stack config and asset lock physical identities differ")
     if effective_action == "reconcile":
         reconciled = reconcile_lock(stack, lock)
         preserved_asset_ids, reset_asset_ids = _reconciliation_asset_ids(stack, lock)
@@ -177,10 +174,12 @@ def operate(
         for asset_id in selected:
             entry = lock.physical_assets[asset_id]
             if effective_action == "resolve":
-                revision, files = info_loader(entry.repo_id, entry.repo_type)
+                revision, files = info_loader(
+                    entry.repo_id, entry.repo_type, entry.immutable_revision
+                )
                 resolved = resolve_entry(
                     entry,
-                    info_loader=lambda _repo, _type: (revision, files),
+                    info_loader=lambda _repo, _type, _revision: (revision, files),
                     required_files=stack.physical_assets[asset_id].include_files,
                 )
                 checked.append(

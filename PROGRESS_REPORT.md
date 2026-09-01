@@ -1,128 +1,234 @@
 # Fidelity-Graded Video Memory Agent — 项目进度报告
 
-> 生成日期：2026-08-24
-> 工作区：`D:/Desktop/Gist`（主实现位于 worktree `D:/Desktop/Gist/.worktrees/fidelity-memory-agent`）
-> 分支：`feat/fidelity-memory-agent`（基线 `b29dec4`）
+> 更新日期：2026-09-01 UTC
+>
+> 工作区：`/home/zhangzheng/projects/Gist-Residual`
+>
+> 当前 HEAD：`63e0fcab8a817b0c6015fbf8c0fe74be45903c9f`（`更换数据集`）
+>
+> 当前状态：Video-MME-v2 工程迁移和 pilot 数据准备完成；正式实验停在 E00 前置条件，尚无 Production Authority、production result 或 paper result。
 
 ---
 
-## 1. 项目概述
+## 1. 当前研究协议
 
-**Fidelity-Graded Video Memory Agent（`fidmem`）** 是一个面向长/超长视频问答的论文驱动研究系统，核心目标：**冻结视觉理解模型与最终 Answerer，只训练一个轻量 Memory Router（100M–300M 参数）**，以验证「可学习成本感知路由」在准确率–成本 Pareto 前沿上的优势。
+### 数据集角色
 
-工作流程：
+| 角色 | 数据集 |
+|---|---|
+| Source / Router development | **Video-MME-v2** |
+| Final independent target benchmarks | **LongVideoBench、LVBench、MLVU** |
+
+Video-MME-v2 不再是 final independent target benchmark。现有 Production Authority、Experiment Execution Pack、E00–E17 DAG、冻结 Gate、Oracle protocol、Answerer stability threshold 和 provenance 规则保持不变。
+
+### 核心研究假设
+
+系统仍以冻结的视觉/语言模型和轻量 Memory Router 验证成本感知的分级视频记忆：
 
 ```text
-Video → 廉价事件切分/ASR/稀疏帧/embedding → Gist Memory Index
-      → Learned Memory Controller (SEARCH_GIST / EXPAND_RESIDUAL /
-        EXPAND_CONTEXT / VERIFY_VISUAL / STOP)
+Video → event segmentation / Gist Memory Index
+      → SEARCH_GIST / EXPAND_RESIDUAL / EXPAND_CONTEXT /
+        VERIFY_VISUAL / STOP
       → Evidence Store → Frozen Answerer
 ```
 
-三条核心主张：
+---
 
-- **C1**：轻量 Learned Memory Controller 相对固定策略、规则 Router 和 Prompt/VLM Controller 获得更优的准确率–端到端成本 Pareto 前沿；
-- **C2**：Gist–Residual–Raw Visual 的逐级解压 + 问题无关 Residual 缓存，同时降低首次查询成本与多查询摊销成本。
+## 2. 冻结模型栈与资产状态
 
-**工程方法**：Superpowers 的 Subagent-Driven Development（SDD），把设计规范拆成 **13 个任务**，测试先行（TDD），每个任务经多轮独立 review 修复后才关闭。
+| Logical role | Hugging Face snapshot | Immutable revision | 状态 |
+|---|---|---|---|
+| Gist text / embedding | `BAAI/bge-m3` | `5617a9f61b028005a4858fdac845db406aefb181` | 已下载并重新哈希验证；两个 logical roles 共用一个 snapshot |
+| Gist visual | `google/siglip2-so400m-patch14-384` | `e8e487298228002f3d8a82e0cd5c8ea9c567f57f` | 已下载并重新哈希验证 |
+| Residual / Visual VLM | `Qwen/Qwen3-VL-8B-Instruct` | `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b` | 已下载并重新哈希验证；两个 logical roles 共用一个 snapshot |
+| Answerer | `Qwen/Qwen3-8B` | `b968826d9c46dd6066d109eabc6255188de91218` | 已下载并重新哈希验证 |
 
-**技术栈**：Python 3.11、PyTorch（`torch>=2.1,<3`）、Transformers、FAISS CPU、Hydra、Pydantic 2、DuckDB/Parquet、Typer、pytest。
+- dtype：`bfloat16`
+- backend：Hugging Face Transformers
+- 模型目录占用：约 **41 GiB**
+- asset lock SHA-256：`c459cc2f97c7dee52d96b8520fa9d7731b74508ca1ddc5f7350f6fc1f1db817d`
+- `03_verify_models.sh --check` 已对四个物理 snapshot 完成磁盘身份校验，没有重复下载共享角色资产。
 
 ---
 
-## 2. 进度总览
+## 3. Video-MME-v2 数据准备
 
-| # | 任务 | 状态 |
+### 3.1 官方 metadata / annotations
+
+- 官方来源：`MME-Benchmarks/Video-MME-v2`
+- 固定 revision：`6e4bebb03202e1ddbf3d37703e560e51c5aa2d64`
+- metadata 覆盖：**800 videos、3,200 questions**，每个 video 4 questions
+- video ID：精确覆盖 `001`–`800`
+- metadata semantic SHA-256：`04cf8ecdf9e25cd76bfce496330bc06e9bd8e2d529ddf3d9e845f6d172960a3a`
+- 官方 README SHA-256：`57ddaf7bb20cb6715518a72a4ffd14afefe211c54a51605ec4ab648277b0b6ca`
+- subtitle archive SHA-256：`adbd3cfd98bd03756398d1c8b63c7bcddf0e5c2494b6a0736ed890456021c287`
+- parquet SHA-256：`8dc7f8c8830aa49dd08a82592f8276899472a145155dde3bea5dd6914a65a9b4`
+
+### 3.2 当前下载范围
+
+当前磁盘无法在既定安全余量内承载完整 Video-MME-v2，因此使用确定性、按 `video_id` 选择的 **`PARTIAL_DATASET_PILOT`**：
+
+- selection seed：`videomme-v2-partial-pilot-pool-v1`
+- selection algorithm：`videomme-v2-archive-aware-hash-v1`
+- pilot pool：**45 videos、180 questions**
+- 官方 video archives：`017`、`027`、`035`
+- selection semantic SHA-256：`cecf538035e0031bc5b048b5ab94602e6791ed7f2689dd0d32533e65e8d0b15f`
+- archive index semantic SHA-256：`61f94457b33c4e71b66f3f523928b992233fe4c289ce48a64ca6b162187e38ae`
+
+验证结果：
+
+- 45/45 raw MP4 存在且通过文件身份验证
+- 45/45 subtitles 存在
+- 20 个视频完成 midpoint decode smoke check
+- 三个归档的待提取成员数均为 0
+- 下载器支持 `--check`、`--resume`、`--verify-only`
+- 已修复 resume 模式误读旧报告的问题；恢复判断现在使用可恢复 state
+
+**证据边界：该子集只能用于方法验证和 E03/E04 pilot，不得表述为 full Video-MME-v2 benchmark result。**
+
+---
+
+## 4. Manifest 与 video-disjoint split
+
+权威工程产物目录：
+
+```text
+artifacts/dataset-preparation/videomme-v2-pilot-v1/
+```
+
+### Manifest 身份
+
+| 产物 | SHA-256 |
+|---|---|
+| `media_preparation.json` | `e7e67835b23587a1467b8c2809315f65ec6e1b7bc61ea7259300d12006ed786c` |
+| `archive_index.json` | `d3fe233c1c5b75fe6b0efea996ec7bf2f04f640291e25059ca57cc78d1cbea1e` |
+| `metadata_verification.json` | `670015369508d23aa9f85d98c0598c5a832e28c759e043200073194b959f1347` |
+| `raw_video_verification.json` | `4083fab7ed151d800e84bdadc5fbd6653432747f7eae32cf56b15194e817ce5b` |
+| `subset_selection_manifest.json` | `d9507f3c598a33d87268180dc79887d75f3de5853b63d7ecc6bce003077723ad` |
+| `split_policy.json` | `8d9d75e2148c5bff9e1adbef2499ab8bf68b5bc239df1dd021a5b68714f0a68b` |
+| `dataset_manifest.json` | `f069f23deeb7bb28f39b4b3601b7918fdd3a43b1424cb4345fc684ce6f8c4ab6` |
+| `video_manifest.json` | `13f0da02a33a8973aba7d585529eb16e3d61188866fff6445a70d43e82b98716` |
+| `question_manifest.json` | `45f2d731f8bfb0e87d6a573c44fd8a4791572f23e58094702c3cdcc3d078a2ee` |
+| `canary_selection_manifest.json` | `f862efc0c43417645e379b6da7358edf847ba6eae782fa7dcb316e1d722f6505` |
+| `oracle_selection_manifest.json` | `fcb1a11cc353a7434fc8bcd846144b39004902c269f27f81bdb191f805abc034` |
+| `human_audit_manifest.json` | `2c79b7ff59c088848429a866ae6c44447e313b6c4438381d97b3f1597c85ce3d` |
+| `source_gate.json` | `ff050c1ea9ac26f5a7a8ee878c8f02b917285fb9462987969ed3e5a41fbade1e` |
+
+Source policy SHA-256：`dbd4ef4a51d548d705c4763d4415c1e4e4680f4639f3c456f20417205b5480fa`
+
+### Split 分布
+
+| Split | Videos | Questions | 用途 |
+|---|---:|---:|---|
+| `development` | 12 | 48 | Source / Router development |
+| `canary` | 4 | 16 | E03 Production Canary |
+| `oracle` | 25 | 100 | E04 Oracle Pilot |
+| `source_holdout` | 4 | 16 | Source holdout |
+| **合计** | **45** | **180** | `PARTIAL_DATASET_PILOT` |
+
+四个 split 已通过 video-disjoint 审计；Canary 与 Oracle 没有共享 `video_id`。
+
+---
+
+## 5. E00–E17 实验状态
+
+| Stage | 当前状态 | 说明 |
 |---|---|---|
-| 1 | 项目骨架、稳定类型与配置校验 | ✅ 完成 |
-| 2 | 内容寻址缓存与可恢复运行存储 | ✅ 完成 |
-| 3 | 全口径成本计量 | ✅ 完成 |
-| 4 | 视频接入、廉价事件切分与泄漏审计 | ✅ 完成 |
-| 5 | Gist Memory 与多模态检索 | ✅ 完成 |
-| 6 | Residual、两级 Visual Cache 与 Context frontier | ✅ 完成 |
-| 7 | 动作环境、硬 Mask 与统一 Answerer | ✅ 完成 |
-| 8 | LongRoute-Train 合成与隔离 | ✅ 完成 |
-| 9 | Oracle 状态图、多偏好标签与稳定性审计 | ✅ 完成 |
-| 10 | Router 三头模型与 Behavior Cloning | ✅ 完成（round 4 review clean） |
-| 11 | DAgger 单步纠偏与策略冻结 | ✅ 完成（round 4 review clean） |
-| 12 | 公平基线、指标与 benchmark Runner | 🔄 进行中 |
-| 13 | CLI、端到端复现与验收门槛 | ⬜ 未开始 |
+| E00 Environment & Asset Freeze | **仅 `--check` 通过，正式阶段未运行** | 配置 SHA-256 `7f79b0c67e4df482b40b4e03158027ede686947fe1f22029db0be56f325ccd23`；当前 `selected_gpus=[]`、NVIDIA driver 不可用 |
+| E01 Production Readiness Audit | **工程准备完成，正式人工审计未签署** | Execution Pack 按 fail-closed 规则因缺失正式 environment gate 而拒绝继续 |
+| E02 Authority Seal | **未运行** | 尚无 Production Authority hash；不能启动正式 Canary |
+| E03 Production Canary | **未运行** | 16 questions 已准备，但 E00/E01/E02 gate 尚未满足 |
+| E04 Oracle Pilot | **未运行** | 100 questions 已准备；必须等待 E03 Canary 通过 |
+| E05–E17 | **未开始** | 严格等待 DAG 上游阶段和既有 Gate |
 
-**整体进度：约 85%（11/13 任务完成）。**
+目前没有正式 stage record、GPU runtime、observation count、measured cost、result 或 gate verdict。不得把 E00 `--check` 描述为 E00 正式完成。
 
 ---
 
-## 3. 量化数据
+## 6. 验证与测试证据
 
-| 指标 | 数值 |
+本轮工程验证记录：
+
+```text
+pytest -q tests/assets tests/production tests/integration
+203 passed in 16.06s
+
+python -m fidmem.production.pack_cli --validate-registry
+valid: true
+
+artifact-chain consistency audit
+ARTIFACT_CHAIN_OK videos=45 questions=180 canary=16 oracle=100 raw_decode=20
+
+git diff --check
+PASS
+```
+
+补充说明：
+
+- 四个模型 snapshot 已执行真实磁盘 rehash，而非仅验证 marker。
+- 完整 `pytest -q` 曾启动，但现有 CPU-only Router 训练用例包含 200-step 长运行，手动停止前未出现失败；因此本报告**不声称 full suite 已通过**。
+- 当前节点没有可用 NVIDIA runtime，未伪造 GPU 验证。
+
+---
+
+## 7. 磁盘与运行环境
+
+| 路径/资产 | 当前状态 |
 |---|---|
-| feature 分支最新提交 | `bab7ce6` |
-| 全量测试结果（Task 11 round 4） | 356 passed, 2 skipped |
-| Router 测试结果 | 104 passed, 1 skipped |
-| DAgger 测试结果 | 50 passed, 1 skipped |
-| Task 10 round 3 新增测试 | 6 passed |
-| Router 生产模型可训练参数量 | 121,049,935（落在 100M–300M 冻结区间内） |
-| BC 训练目标函数 | `CE(action) + 0.3·BCE(sufficiency) + 0.1·SmoothL1(cost_to_go)` |
-| 预注册种子 | 13 / 37 / 73 |
+| 模型 snapshots | 约 41 GiB |
+| Video-MME-v2 metadata | 约 8.7 MiB |
+| Pilot raw media | 约 14 GiB |
+| `/mnt/disk1` | 约 101 GiB 可用，99% 已用 |
+| `/home` | 约 22 GiB 可用，98% 已用 |
+| GPU | `nvidia-smi` 无法连接 driver |
+
+在保留安全余量且不删除既有数据的前提下，当前不适合继续下载 full Video-MME-v2。待扩容后，应复用相同官方来源、冻结 revision、下载器和 manifest 规则补齐全量数据。
 
 ---
 
-## 4. Task 10–11 round 4 验证结论
+## 8. Git 与 provenance 状态
 
-Task 10 与 Task 11 均已完成 round 4 独立 review，review clean。实际提交链为：`477b4f2 → e8fd813 → 00bf3b9 → d58d7ff → d600e89`（Task 10）；`5ae79ac → b0e4ee2 → 0228261 → d4fb0cf → bab7ce6`（Task 11）。 Task 10 的最终实现覆盖 **数据/checkpoint 溯源信任链的进一步加固**：
+- 当前 HEAD：`63e0fcab8a817b0c6015fbf8c0fe74be45903c9f`
+- E00 `--check` 记录的 execution source-tree hash：`08568c76f2c378d7935a870502db0f1acba943543aa249591531dbdcd521a5de`
+- 当前工作树有未提交变更：
+  - `src/fidmem/assets/setup.py`
+  - `src/fidmem/assets/videomme_v2.py`
+  - `tests/assets/test_setup_wrappers.py`
+  - `tests/assets/test_videomme_v2.py`
+  - `PROGRESS_REPORT.md`
+- 本次只更新进度报告，没有创建 commit、tag 或外部发布。
 
-- 每个 segment 必须恰有一个真实 source owner，且 asset hash、event identity 与时间范围均需匹配；
-- `SufficiencyLabelArtifact` 改为自算 self-hash，禁止调用方注入 label 或自定义 judge；
-- loader 强制要求 content-addressed 的 `.authority.json` sidecar，缺失/篡改即失败关闭；
-- 伪造的 row provenance 无法自洽（Task8 lineage 全链路重算比对）；
-- `_git_commit` 在无仓库或无构建元数据时失败关闭。
-
-Task 11 的最终实现覆盖无新 VLM 的缓存 DAgger、多轮原子发布、身份绑定、恢复与 indeterminate commit 处理。
-
-**验证结果（2026-08-24 实测）：**
-
-| 检查项 | 结果 |
-|---|---|
-| Task 11 DAgger 全套 | ✅ 50 passed, 1 skipped |
-| `pytest tests/router` | ✅ 104 passed, 1 skipped |
-| `pytest`（全量） | ✅ 356 passed, 2 skipped |
-| `compileall src tests` | ✅ exit 0 |
-| `git diff --check` | ✅ exit 0 |
-| Task 11 round 4 full verification | ✅ 无 OMP/MKL workaround，75.41s，低于 180s bound |
-
-**结论：Task 10–11 已完成且独立 review clean；不要将 Task 12 误报为已完成。**
+`PROGRESS_REPORT.md` 属于非执行报告，按现有 source identity 规则不进入 execution source-tree hash；正式 E00 前仍需重新生成并核对全部 provenance 证据。
 
 ---
 
-## 5. 当前下一步
+## 9. 当前阻断项与下一步
 
-Task 12 正在进行：实现公平基线、评测指标与 benchmark Runner，并核对 BC/BC+DAgger 的统一评测口径。Task 13 尚未开始，后续负责 CLI、端到端复现与验收门槛。
+### 正式实验阻断项
 
-## 6. 剩余工作（Task 12–13）
+1. 当前机器 NVIDIA driver / GPU runtime 不可用。
+2. E01 仍需人工完成 Production Readiness Audit 并签署现有 Gate。
+3. E00 正式运行尚未生成可供 Execution Pack 接受的 environment gate。
+4. E02 Authority Seal 尚未建立，因此 E03 不能正式启动。
+5. 工程修复与本报告仍在 dirty worktree，尚无新的不可变 source commit identity。
 
-1. **Task 12 — 公平基线与评测**：固定策略 / Rule / Prompt / Text-Adaptive / BC / BC+DAgger 基线，Pareto、Cost@Accuracy、五类互斥错误归因。
-2. **Task 13 — CLI 与端到端复现**：Typer CLI（8 个子命令）、dry-run 预算外推、`docs/RUNBOOK.md`、验收门槛。
+### 下一正式阶段
+
+**下一步应执行 E00 Environment & Asset Freeze。** 推荐顺序：
+
+1. 在不改变实验定义的前提下，为当前工程变更建立不可变 source identity；提交动作需项目所有者明确授权。
+2. 切换到满足冻结环境要求的目标 GPU 节点，重新执行 E00 正式环境与资产冻结。
+3. 完成人工 E01 Production Readiness Audit。
+4. 对所有冻结字段生成 E02 Authority Seal。
+5. E02 通过后运行 E03 Canary（16 questions）；Canary 通过后运行 E04 Oracle Pilot（100 questions）。
+
+当前未发现新的 `RESEARCH_OWNER_DECISION_REQUIRED`；现有阻断均属于环境、provenance 或既定人工 Gate，而不是需要改变论文定义的研究参数。
 
 ---
 
-## 7. 残余风险
+## 10. 证据分级声明
 
-- **CUDA 复现性未验证**：Router 的 121M 生产模型从未做过真实 GPU 训练，CUDA 位级 replay、确定性与显存峰值均未实测。
-- **生产预训练编码器未下载**：测试全程 CPU-only + `local_files_only`，正式训练需预先本地化的不可变 HF snapshot。
-- **CI symlink residual**：无 symlink 权限的 Windows 主机跳过真实 symlink-alias 回归，需在 Linux CI 执行。
-- **测试可诊断性 residual**：此前声称的 OpenMP/MKL Barrier 死锁未复现，尚未确认；`OMP_NUM_THREADS=1` 与 `MKL_NUM_THREADS=1` 仅保留为 CI workaround。仍需补充有超时的 Barrier/future 诊断，避免测试挂起时不可诊断。
-- **若干 minor 问题被延期**：Task 1–9 各留了少量 minor（如原子写失败路径测试、线程竞争未证明跨进程互斥、POSIX `fcntl.flock` 分支需 Linux CI 验证等），详见 SDD ledger `progress.md`。
-
----
-
-## 8. 环境要点
-
-- **Python**：`D:/Anaconda/python.exe`（Anaconda 环境，已装 torch/pydantic/hydra 等）。
-- **无系统 ffmpeg**：用 `imageio-ffmpeg==0.6.0` 提供打包的 ffmpeg，用于确定性 MP4 fixture。
-- **smoke 命令**需 `PYTHONPATH='src'` 前缀（worktree 未 editable-install）。
-- **测试隔离**：宿主无 CUDA，GPU 专项测试以 skip 处理。
-
-
-
-
-
+- 当前数据、代码、manifest、split、模型校验和测试结果属于 **engineering evidence**。
+- 尚无 E00–E04 正式阶段结果，因此没有 **production evidence**。
+- 尚未执行 final target benchmark，因此没有 **paper evidence**。
+- `PARTIAL_DATASET_PILOT` 的任何后续结果都必须显式保留该标签，不得写成 full Video-MME-v2 结果。

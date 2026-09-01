@@ -12,6 +12,7 @@ from fidmem.assets.authority_draft import build_authority_draft, write_authority
 from fidmem.assets.videomme_v2 import (
     DATASET_ID,
     FROZEN_REVISION,
+    METADATA_FILES,
     prepare_e01 as prepare_videomme_e01,
     prepare_videos,
     verify_metadata,
@@ -54,20 +55,34 @@ def _atomic_payload(path: Path, payload: object) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _metadata_from_lock(lock_path: Path):
+def _metadata_asset_from_lock(lock_path: Path):
     lock = load_asset_lock(lock_path)
     asset_id = lock.logical_roles["source_dataset"]
     entry = lock.physical_assets[asset_id]
     if entry.repo_id != DATASET_ID:
         raise ValueError("stack source_dataset is not the approved Video-MME-v2 repository")
+    if entry.repo_type != "dataset":
+        raise ValueError("Video-MME-v2 metadata asset is not a dataset snapshot")
+    if entry.immutable_revision != FROZEN_REVISION:
+        raise ValueError("Video-MME-v2 metadata asset differs from frozen revision")
+    if entry.expected_files != tuple(sorted(METADATA_FILES)):
+        raise ValueError("Video-MME-v2 metadata asset file manifest differs")
     if entry.state is not AssetState.VERIFIED:
         raise ValueError("Video-MME-v2 metadata asset is not VERIFIED")
+    if entry.local_snapshot_path is None:
+        raise ValueError("Video-MME-v2 metadata asset lacks a local snapshot")
     verified = verify_entry(entry)
     if verified.local_snapshot_sha256 != entry.local_snapshot_sha256:
         raise ValueError("Video-MME-v2 metadata snapshot differs from asset lock")
-    return verify_metadata(
-        str(entry.local_snapshot_path), immutable_revision=FROZEN_REVISION
+    snapshot_root = Path(entry.local_snapshot_path)
+    return (
+        verify_metadata(snapshot_root, immutable_revision=FROZEN_REVISION),
+        snapshot_root,
     )
+
+
+def _metadata_from_lock(lock_path: Path):
+    return _metadata_asset_from_lock(lock_path)[0]
 
 
 def _config_snapshot() -> dict[str, Any]:
@@ -103,29 +118,33 @@ def main(argv: list[str] | None = None) -> int:
     lock_path = _resolve_project_path(root, args.lock)
     roots = storage_roots()
     if args.command == "metadata":
-        parsed = _metadata_from_lock(lock_path)
+        parsed, _metadata_root = _metadata_asset_from_lock(lock_path)
         payload = parsed.report.model_dump(mode="json")
         if args.output and not args.check:
             atomic_write_model(Path(args.output), parsed.report)
     elif args.command == "videos":
-        parsed = _metadata_from_lock(lock_path)
+        parsed, metadata_root = _metadata_asset_from_lock(lock_path)
         raw_value = os.environ.get("FIDMEM_VIDEOMME_V2_RAW_ROOT")
         cache_value = os.environ.get("FIDMEM_CACHE_ROOT")
         if not raw_value or not cache_value:
             raise ValueError("FIDMEM_VIDEOMME_V2_RAW_ROOT and FIDMEM_CACHE_ROOT are required")
         prepared = prepare_videos(
             parsed, Path(raw_value), Path(cache_value), scope=args.scope,
+            subtitle_zip=metadata_root / "subtitle.zip",
             check=args.check, resume=args.resume, verify_only=args.verify_only,
         )
         payload = prepared.model_dump(mode="json")
+        if args.output and not args.check:
+            _atomic_payload(Path(args.output) / "media_preparation.json", payload)
     elif args.command == "manifests":
-        parsed = _metadata_from_lock(lock_path)
+        parsed, metadata_root = _metadata_asset_from_lock(lock_path)
         raw_value = os.environ.get("FIDMEM_VIDEOMME_V2_RAW_ROOT")
         cache_value = os.environ.get("FIDMEM_CACHE_ROOT")
         if not raw_value or not cache_value:
             raise ValueError("FIDMEM_VIDEOMME_V2_RAW_ROOT and FIDMEM_CACHE_ROOT are required")
         prepared = prepare_videos(
             parsed, Path(raw_value), Path(cache_value), scope="pilot",
+            subtitle_zip=metadata_root / "subtitle.zip",
             check=False, resume=False, verify_only=True,
         )
         if prepared.selection is None:
@@ -137,14 +156,21 @@ def main(argv: list[str] | None = None) -> int:
             else Path(os.environ["FIDMEM_VIDEOMME_V2_PREPARATION_ROOT"])
         )
         payload = write_dataset_preparation(
-            parsed, report, prepared.archive_index, prepared.selection, output
+            parsed,
+            report,
+            prepared.archive_index,
+            prepared.selection,
+            output,
+            check=args.check,
         )
     elif args.command == "e01":
         preparation = os.environ.get("FIDMEM_VIDEOMME_V2_PREPARATION_ROOT")
         human_value = os.environ.get("FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT")
         if not preparation or not human_value:
             raise ValueError("FIDMEM_VIDEOMME_V2_PREPARATION_ROOT and FIDMEM_VIDEOMME_V2_HUMAN_AUDIT_RESULT are required")
-        output = Path(args.output) if args.output else Path(os.environ["FIDMEM_RUN_DIR"]) / "results"
+        output = Path(args.output) if args.output else None
+        if output is None and not args.check:
+            output = Path(os.environ["FIDMEM_RUN_DIR"]) / "results"
         payload = prepare_videomme_e01(
             Path(preparation), Path(human_value), output_dir=output, check=args.check
         )

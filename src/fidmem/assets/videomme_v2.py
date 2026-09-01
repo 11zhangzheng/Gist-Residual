@@ -44,6 +44,9 @@ OFFICIAL_ARCHIVE_PATHS = tuple(f"videos/{number:03d}.zip" for number in range(1,
 OFFICIAL_VIDEO_IDS = tuple(f"{number:03d}" for number in range(1, 801))
 POOL_SEED = "videomme-v2-partial-pilot-pool-v1"
 POOL_ALGORITHM = "videomme-v2-archive-aware-hash-v1"
+SPLIT_POLICY_SOURCE_SHA256 = (
+    "dbd4ef4a51d548d705c4763d4415c1e4e4680f4639f3c456f20417205b5480fa"
+)
 DOWNLOAD_SAFETY_MARGIN_BYTES = 20 * 1024**3
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _EXPECTED_COLUMNS = (
@@ -119,6 +122,9 @@ class ResolvedSplitPolicy(_FrozenModel):
     algorithm: Literal["videomme-v2-partial-pilot-split-v1"] = (
         "videomme-v2-partial-pilot-split-v1"
     )
+    source_policy_sha256: Literal[SPLIT_POLICY_SOURCE_SHA256] = (
+        SPLIT_POLICY_SOURCE_SHA256
+    )
     source_metadata_sha256: str = Field(pattern=_SHA256_PATTERN)
     video_groups: dict[Literal["oracle", "canary", "holdout", "development"], tuple[str, ...]]
 
@@ -180,8 +186,13 @@ def verify_raw_videos(
             continue
         try:
             observed = probe(path)
-            if observed.duration_sec <= 0:
-                raise ValueError("non-positive duration")
+            if (
+                observed.duration_sec <= 0
+                or observed.width <= 0
+                or observed.height <= 0
+                or observed.fps <= 0
+            ):
+                raise ValueError("non-positive video probe field")
             probes[video_id] = observed
             records.append(
                 VideoManifestRecord(
@@ -1246,7 +1257,10 @@ def _write_preparation_state(
 
 
 def _load_preparation_state(
-    path: Path, metadata: ParsedVideoMME, scope: Literal["pilot", "full"]
+    path: Path,
+    metadata: ParsedVideoMME,
+    scope: Literal["pilot", "full"],
+    raw_root: Path,
 ) -> tuple[ArchiveIndex, PilotSelectionManifest | None, DownloadPlan]:
     if not path.is_file() or path.is_symlink():
         raise ValueError("missing local Video-MME-v2 preparation plan for verify-only")
@@ -1285,12 +1299,14 @@ def _load_preparation_state(
     expected_members = tuple(member_by_video[video_id] for video_id in video_ids)
     if plan.archives != expected_archives or plan.selected_members != expected_members:
         raise ValueError("Video-MME-v2 download plan differs from archive index")
-    return archive_index, selection, plan
-
-
-def _subtitle_zip(raw_root: Path, cache_root: Path) -> Path:
-    raw_candidate = raw_root / "subtitle.zip"
-    return raw_candidate if raw_candidate.is_file() else cache_root / "subtitle.zip"
+    current_plan = _build_download_plan(
+        scope=scope,
+        archive_index=archive_index,
+        archive_paths=archive_paths,
+        video_ids=video_ids,
+        raw_root=raw_root,
+    )
+    return archive_index, selection, current_plan
 
 
 def _verify_prepared_files(
@@ -1322,7 +1338,7 @@ def _verify_prepared_files(
             raise ValueError("missing Video-MME-v2 subtitle ZIP")
         try:
             with ZipFile(subtitle_zip) as archive:
-                info = archive.getinfo(f"{member.video_id}.jsonl")
+                info = archive.getinfo(f"subtitle/{member.video_id}.jsonl")
         except (BadZipFile, KeyError) as error:
             raise ValueError("missing Video-MME-v2 selected subtitle") from error
         subtitle_source = {
@@ -1342,6 +1358,7 @@ def prepare_videos(
     raw_root: Path,
     cache_root: Path,
     *,
+    subtitle_zip: str | Path,
     scope: Literal["pilot", "full"],
     check: bool,
     resume: bool,
@@ -1352,13 +1369,14 @@ def prepare_videos(
         raise ValueError("exactly one of check, resume, or verify_only is required")
     raw_directory = Path(raw_root)
     cache_directory = Path(cache_root)
+    subtitle_path = Path(subtitle_zip)
     state_path = _preparation_state_path(cache_directory, scope)
     if verify_only:
         archive_index, selection, plan = _load_preparation_state(
-            state_path, metadata, scope
+            state_path, metadata, scope, raw_directory
         )
         archives, videos, subtitles = _verify_prepared_files(
-            plan, raw_directory, _subtitle_zip(raw_directory, cache_directory)
+            plan, raw_directory, subtitle_path
         )
         return DatasetPreparationResult(
             scope=scope,
@@ -1371,26 +1389,32 @@ def prepare_videos(
             subtitle_paths=subtitles,
         )
 
-    identities = load_official_archive_identities()
-    archive_index = build_archive_index(
-        identities,
-        open_official_archive,
-        metadata_video_ids=metadata.video_ids,
-    )
-    if scope == "pilot":
-        selection = select_pilot(metadata, archive_index)
-        archive_paths = selection.selected_archive_paths
-        video_ids = selection.selected_video_ids
+    if resume and state_path.is_file():
+        archive_index, selection, plan = _load_preparation_state(
+            state_path, metadata, scope, raw_directory
+        )
+        video_ids = plan.video_ids
     else:
-        selection = None
-        archive_paths, video_ids = full_scope_media(archive_index)
-    plan = _build_download_plan(
-        scope=scope,
-        archive_index=archive_index,
-        archive_paths=archive_paths,
-        video_ids=video_ids,
-        raw_root=raw_directory,
-    )
+        identities = load_official_archive_identities()
+        archive_index = build_archive_index(
+            identities,
+            open_official_archive,
+            metadata_video_ids=metadata.video_ids,
+        )
+        if scope == "pilot":
+            selection = select_pilot(metadata, archive_index)
+            archive_paths = selection.selected_archive_paths
+            video_ids = selection.selected_video_ids
+        else:
+            selection = None
+            archive_paths, video_ids = full_scope_media(archive_index)
+        plan = _build_download_plan(
+            scope=scope,
+            archive_index=archive_index,
+            archive_paths=archive_paths,
+            video_ids=video_ids,
+            raw_root=raw_directory,
+        )
     check_download_capacity(plan, raw_directory)
     _write_preparation_state(
         state_path,
@@ -1445,7 +1469,7 @@ def prepare_videos(
         archive_index,
         raw_directory / "archives",
         raw_directory / "videos",
-        _subtitle_zip(raw_directory, cache_directory),
+        subtitle_path,
     )
     subtitles = tuple(
         raw_directory / "subtitles" / f"{video_id}.jsonl" for video_id in video_ids
@@ -1620,6 +1644,8 @@ def verify_metadata(
         raise ValueError("Video-MME-v2 question count differs from the official snapshot")
     if len(video_ids) != _expected_video_count:
         raise ValueError("Video-MME-v2 video count differs from the official snapshot")
+    if _expected_video_count == len(OFFICIAL_VIDEO_IDS) and video_ids != OFFICIAL_VIDEO_IDS:
+        raise ValueError("Video-MME-v2 metadata differs from the exact official video ID set")
     _verify_subtitles(directory / "subtitle.zip", set(video_ids))
     file_identities = tuple(
         MetadataFileIdentity(
@@ -1729,6 +1755,8 @@ def write_dataset_preparation(
     archive_index: ArchiveIndex,
     selection: PilotSelectionManifest,
     output_dir: str | Path,
+    *,
+    check: bool = False,
 ) -> dict[str, object]:
     """Write auditable pilot artifacts without manufacturing human PASS evidence."""
     video_manifest, question_manifest, dataset_manifest, canary, oracle, split = (
@@ -1739,9 +1767,24 @@ def write_dataset_preparation(
         selected_video_ids=tuple(selection.selected_video_ids),
         seed="videomme-v2-human-audit-v1",
     )
-    root = Path(output_dir)
     if selection.source_archive_index_sha256 != archive_index.archive_index_sha256:
         raise ValueError("pilot selection differs from archive index")
+    payload: dict[str, object] = {
+        "dataset": DATASET_ID,
+        "dataset_revision": FROZEN_REVISION,
+        "dataset_scope": "PARTIAL_DATASET_PILOT",
+        "selected_video_count": 45,
+        "selected_question_count": 180,
+        "video_disjoint": True,
+        "hashes_valid": True,
+        "manifests_complete": True,
+        "status": "PENDING_HUMAN_AUDIT",
+        "source_gate": "PENDING_HUMAN_AUDIT",
+        "human_audit_manifest_sha256": audit.manifest_sha256,
+    }
+    if check:
+        return payload
+    root = Path(output_dir)
     artifacts = {
         "metadata_verification.json": metadata.report,
         "archive_index.json": archive_index,
@@ -1757,19 +1800,6 @@ def write_dataset_preparation(
     }
     for name, value in artifacts.items():
         _atomic_json(root / name, _json_value(value))
-    payload: dict[str, object] = {
-        "dataset": DATASET_ID,
-        "dataset_revision": FROZEN_REVISION,
-        "dataset_scope": "PARTIAL_DATASET_PILOT",
-        "selected_video_count": 45,
-        "selected_question_count": 180,
-        "video_disjoint": True,
-        "hashes_valid": True,
-        "manifests_complete": True,
-        "status": "PENDING_HUMAN_AUDIT",
-        "source_gate": "PENDING_HUMAN_AUDIT",
-        "human_audit_manifest_sha256": audit.manifest_sha256,
-    }
     _atomic_json(root / "source_gate.json", payload)
     return payload
 
@@ -1780,6 +1810,7 @@ def prepare_e01(
     *,
     output_dir: str | Path | None = None,
     check: bool,
+    probe: Callable[[str | Path], VideoProbe] = probe_video,
 ) -> dict[str, object]:
     """Revalidate preparation identities and require independent human evidence."""
     root = Path(preparation_root)
@@ -1823,13 +1854,126 @@ def prepare_e01(
     oracle = SelectionManifest.model_validate_json(
         (root / "oracle_selection_manifest.json").read_text()
     )
+    try:
+        pending_source_gate = json.loads(
+            (root / "source_gate.json").read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError("pending Source Gate is invalid JSON") from error
+    if not isinstance(pending_source_gate, dict):
+        raise ValueError("pending Source Gate must be an object")
+    validate_human_audit_result(audit, human_result)
     validate_split_isolation(videos, questions)
     if raw_videos.status != "PASS":
         raise ValueError("raw-video Source Gate is not PASS")
+    if (
+        metadata.question_count != 3200
+        or metadata.video_count != 800
+        or metadata.files != METADATA_FILES
+    ):
+        raise ValueError("metadata verification differs from full Video-MME-v2 scope")
+    if (
+        tuple(archive.path for archive in archive_index.archives)
+        != OFFICIAL_ARCHIVE_PATHS
+        or tuple(sorted(archive_index.video_ids)) != OFFICIAL_VIDEO_IDS
+    ):
+        raise ValueError("archive index differs from full Video-MME-v2 scope")
     if selection.source_metadata_sha256 != metadata.metadata_sha256:
         raise ValueError("pilot selection metadata identity mismatch")
     if selection.source_archive_index_sha256 != archive_index.archive_index_sha256:
         raise ValueError("pilot selection archive identity mismatch")
+    if selection.available_video_count != 800 or selection.selected_video_count != 45:
+        raise ValueError("pilot selection counts differ from frozen protocol")
+    selected_ids = tuple(selection.selected_video_ids)
+    selected_set = set(selected_ids)
+    archive_by_video = {
+        member.video_id: member.archive_path for member in archive_index.members
+    }
+    expected_archive_paths = tuple(
+        sorted({archive_by_video[video_id] for video_id in selected_ids})
+    )
+    if selection.selected_archive_paths != expected_archive_paths:
+        raise ValueError("pilot selection archive membership mismatch")
+    raw_ids = tuple(record.video_id for record in raw_videos.video_records)
+    if (
+        raw_videos.expected_video_count != 45
+        or raw_videos.verified_video_count != 45
+        or raw_videos.random_decode_required < 20
+        or raw_videos.random_decode_completed < raw_videos.random_decode_required
+        or set(raw_ids) != selected_set
+        or len(raw_ids) != 45
+    ):
+        raise ValueError("raw-video report differs from frozen pilot scope")
+    approved_root = Path(raw_videos.approved_video_root).resolve()
+    for record in raw_videos.video_records:
+        expected_path = approved_root / "videos" / f"{record.video_id}.mp4"
+        path = Path(record.uri)
+        if (
+            path.resolve() != expected_path
+            or not path.is_file()
+            or path.is_symlink()
+            or _file_sha256(path) != record.content_sha256
+        ):
+            raise ValueError(
+                f"current raw video identity mismatch: {record.video_id}"
+            )
+        observed = probe(path)
+        if (
+            observed.duration_sec <= 0
+            or observed.width <= 0
+            or observed.height <= 0
+            or observed.fps <= 0
+            or abs(observed.duration_sec - record.duration_seconds) > 0.001
+        ):
+            raise ValueError(f"current raw video probe mismatch: {record.video_id}")
+        subtitle_path = approved_root / "subtitles" / f"{record.video_id}.jsonl"
+        if not subtitle_path.is_file() or subtitle_path.is_symlink():
+            raise ValueError(f"current subtitle identity mismatch: {record.video_id}")
+    video_ids = tuple(record.video_id for record in videos.records)
+    if len(video_ids) != 45 or set(video_ids) != selected_set:
+        raise ValueError("video manifest differs from frozen pilot scope")
+    if len(questions.records) != 180:
+        raise ValueError("question manifest differs from frozen pilot scope")
+    question_counts = Counter(record.video_id for record in questions.records)
+    if set(question_counts) != selected_set or any(
+        count != 4 for count in question_counts.values()
+    ):
+        raise ValueError("question manifest coverage differs from frozen pilot scope")
+    ranked = tuple(
+        sorted(
+            selected_ids,
+            key=lambda video_id: (
+                canonical_sha256(
+                    {
+                        "seed": "videomme-v2-partial-pilot-split-v1",
+                        "video_id": video_id,
+                    }
+                ),
+                video_id,
+            ),
+        )
+    )
+    expected_groups = {
+        "oracle": ranked[:25],
+        "canary": ranked[25:29],
+        "holdout": ranked[29:33],
+        "development": ranked[33:],
+    }
+    if (
+        split.source_metadata_sha256 != metadata.metadata_sha256
+        or split.video_groups != expected_groups
+    ):
+        raise ValueError("resolved split differs from frozen pilot protocol")
+    group_by_video = {
+        video_id: group
+        for group, ids in expected_groups.items()
+        for video_id in ids
+    }
+    if any(
+        record.group != group_by_video.get(record.video_id)
+        for record in videos.records
+    ):
+        raise ValueError("video manifest groups differ from resolved split")
     if dataset.source_metadata_sha256 != metadata.metadata_sha256:
         raise ValueError("dataset manifest metadata identity mismatch")
     if dataset.source_archive_index_sha256 != archive_index.archive_index_sha256:
@@ -1842,6 +1986,17 @@ def prepare_e01(
         raise ValueError("dataset manifest question identity mismatch")
     if dataset.split_policy_sha256 != split.policy_sha256:
         raise ValueError("dataset manifest split-policy identity mismatch")
+    if (
+        dataset.dataset_name != DATASET_ID
+        or dataset.dataset_version != FROZEN_REVISION
+        or dataset.dataset_scope != "PARTIAL_DATASET_PILOT"
+        or dataset.selected_video_count != 45
+        or dataset.selected_question_count != 180
+        or dataset.available_video_count != 800
+        or dataset.available_question_count != 3200
+        or dataset.split_policy_id != split.split_policy_id
+    ):
+        raise ValueError("dataset manifest scope differs from frozen pilot protocol")
     for name, selected_manifest in (("canary", canary), ("oracle", oracle)):
         if (
             selected_manifest.source_video_manifest_sha256 != videos.manifest_sha256
@@ -1853,7 +2008,43 @@ def prepare_e01(
         raise ValueError("Canary/Oracle selection counts differ from frozen protocol")
     if set(canary.video_ids) & set(oracle.video_ids):
         raise ValueError("Canary and Oracle selections are not video-disjoint")
-    validate_human_audit_result(audit, human_result)
+    expected_canary = select_questions_deterministically(
+        videos,
+        questions,
+        group="canary",
+        count=16,
+        seed="videomme-v2-production-canary-v1",
+    )
+    expected_oracle = select_questions_deterministically(
+        videos,
+        questions,
+        group="oracle",
+        count=100,
+        seed="videomme-v2-oracle-pilot-v1",
+    )
+    if canary != expected_canary or oracle != expected_oracle:
+        raise ValueError("Canary/Oracle selections differ from frozen protocol")
+    if (
+        audit.source_metadata_sha256 != metadata.metadata_sha256
+        or audit.required_items != 100
+        or any(item.video_id not in selected_set for item in audit.items)
+    ):
+        raise ValueError("human audit manifest differs from frozen pilot scope")
+    expected_pending_gate = {
+        "dataset": DATASET_ID,
+        "dataset_revision": FROZEN_REVISION,
+        "dataset_scope": "PARTIAL_DATASET_PILOT",
+        "selected_video_count": 45,
+        "selected_question_count": 180,
+        "video_disjoint": True,
+        "hashes_valid": True,
+        "manifests_complete": True,
+        "status": "PENDING_HUMAN_AUDIT",
+        "source_gate": "PENDING_HUMAN_AUDIT",
+        "human_audit_manifest_sha256": audit.manifest_sha256,
+    }
+    if pending_source_gate != expected_pending_gate:
+        raise ValueError("pending Source Gate differs from preparation evidence")
     payload: dict[str, object] = {
         "status": "CHECK_PASSED" if check else "COMPLETED",
         "dataset": DATASET_ID,

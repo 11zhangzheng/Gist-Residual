@@ -29,6 +29,7 @@ from fidmem.assets.videomme_v2 import (
     OFFICIAL_VIDEO_IDS,
     POOL_ALGORITHM,
     POOL_SEED,
+    PilotSelectionManifest,
     check_download_capacity,
     download_pinned_file,
     extract_selected_media,
@@ -46,6 +47,7 @@ from fidmem.assets.videomme_v2 import (
     verify_raw_videos,
     write_dataset_preparation,
     prepare_e01,
+    _verify_prepared_files,
 )
 from fidmem.data.video import VideoProbe
 from fidmem.production.authority import canonical_sha256
@@ -211,6 +213,40 @@ def test_source_gate_fails_closed_for_missing_or_duplicate_content(tmp_path: Pat
     assert report.duplicate_video_ids
 
 
+@pytest.mark.parametrize(
+    "probe",
+    (
+        VideoProbe(Path("ignored"), 1.0, 0, 1, 1.0),
+        VideoProbe(Path("ignored"), 1.0, 1, 0, 1.0),
+        VideoProbe(Path("ignored"), 1.0, 1, 1, 0.0),
+    ),
+)
+def test_source_gate_rejects_nonpositive_geometry_or_fps(
+    tmp_path: Path, probe: VideoProbe
+) -> None:
+    raw = tmp_path / "raw"
+    (raw / "videos").mkdir(parents=True)
+    (raw / "subtitles").mkdir()
+    selected = tuple(f"{item:03d}" for item in range(1, 46))
+    for index, video_id in enumerate(selected):
+        (raw / "videos" / f"{video_id}.mp4").write_bytes(
+            f"unique-{index}".encode()
+        )
+        (raw / "subtitles" / f"{video_id}.jsonl").write_text("{}\n")
+
+    report = verify_raw_videos(
+        selected,
+        raw,
+        probe=lambda path: VideoProbe(
+            Path(path), probe.duration_sec, probe.width, probe.height, probe.fps
+        ),
+        decode=lambda path, timestamp: None,
+    )
+
+    assert report.status == "FAIL"
+    assert report.corrupt_video_ids == selected
+
+
 def test_manifests_bind_pilot_provenance_and_gold_scope(tmp_path: Path) -> None:
     metadata_root = tmp_path / "metadata"
     _metadata(metadata_root, rows=_rows(videos=45))
@@ -250,6 +286,13 @@ def test_manifests_bind_pilot_provenance_and_gold_scope(tmp_path: Path) -> None:
     assert all(record.gold_answer_sha256 is None for record in question_manifest.records if record.group in {"development", "canary"})
     assert all(record.gold_answer_sha256 for record in question_manifest.records if record.group in {"oracle", "holdout"})
     assert split.policy_sha256 == dataset_manifest.split_policy_sha256
+    source_policy = (
+        Path(__file__).resolve().parents[2]
+        / "configs/experiment_stacks/videomme_v2_pilot_split_policy.yaml"
+    )
+    assert split.source_policy_sha256 == hashlib.sha256(
+        source_policy.read_bytes()
+    ).hexdigest()
 
 
 def test_dataset_preparation_is_pending_and_formal_e01_requires_real_audit(tmp_path: Path) -> None:
@@ -268,15 +311,37 @@ def test_dataset_preparation_is_pending_and_formal_e01_requires_real_audit(tmp_p
         probe=lambda path: VideoProbe(Path(path), 60.0, 1, 1, 1.0),
         decode=lambda path, timestamp: None,
     )
-    selection = SimpleNamespace(
-        selection_sha256="2" * 64,
-        source_archive_index_sha256="3" * 64,
-        available_video_count=800,
-        selected_video_ids=selected,
+    archive_index = _full_population_archive_index(_even_archive_members())
+    member_archives = {
+        member.video_id: member.archive_path for member in archive_index.members
+    }
+    selection_payload = {
+        "schema_version": 1,
+        "dataset_id": DATASET_ID,
+        "immutable_revision": FROZEN_REVISION,
+        "source_metadata_sha256": parsed.report.metadata_sha256,
+        "source_archive_index_sha256": archive_index.archive_index_sha256,
+        "pool_seed": POOL_SEED,
+        "pool_algorithm": POOL_ALGORITHM,
+        "available_video_count": 800,
+        "selected_video_count": 45,
+        "selected_archive_paths": tuple(
+            sorted({member_archives[video_id] for video_id in selected})
+        ),
+        "selected_video_ids": selected,
+    }
+    selection = PilotSelectionManifest(
+        **selection_payload,
+        selection_sha256=canonical_sha256(selection_payload),
     )
     output = tmp_path / "preparation"
 
-    archive_index = SimpleNamespace(archive_index_sha256="3" * 64)
+    checked = write_dataset_preparation(
+        parsed, videos, archive_index, selection, output, check=True
+    )
+    assert checked["status"] == "PENDING_HUMAN_AUDIT"
+    assert not output.exists()
+
     payload = write_dataset_preparation(parsed, videos, archive_index, selection, output)
 
     assert payload["status"] == "PENDING_HUMAN_AUDIT"
@@ -309,6 +374,21 @@ def test_metadata_rejects_duplicate_question_ids(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="duplicate question IDs"):
         _verify(root)
+
+
+def test_metadata_rejects_nonofficial_video_id_set_at_full_count(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "metadata"
+    rows = _rows(videos=800)
+    rows = [
+        (("000", *row[1:]) if row[0] == "800" else row)
+        for row in rows
+    ]
+    _metadata(root, rows=rows)
+
+    with pytest.raises(ValueError, match="exact official video ID set"):
+        _verify(root, expected_question_count=3200, expected_video_count=800)
 
 
 def test_metadata_rejects_video_without_exactly_four_questions(tmp_path: Path) -> None:
@@ -732,13 +812,23 @@ def test_formal_e01_revalidates_archive_selection_and_manifest_chain(tmp_path: P
     audit_result = tmp_path / "audit-result.json"
     _write_audit_result(audit_result, _completed_audit_payload(audit))
 
-    assert prepare_e01(preparation, audit_result, check=True)["source_gate"] == "PASS"
+    e01_probe = lambda path: VideoProbe(Path(path), 60.0, 1, 1, 1.0)
+    assert prepare_e01(
+        preparation, audit_result, check=True, probe=e01_probe
+    )["source_gate"] == "PASS"
+
+    selected_video = Path(videos.video_records[0].uri)
+    original_video = selected_video.read_bytes()
+    selected_video.write_bytes(original_video + b"tampered")
+    with pytest.raises(ValueError, match="current raw video identity"):
+        prepare_e01(preparation, audit_result, check=True, probe=e01_probe)
+    selected_video.write_bytes(original_video)
 
     archive_payload = json.loads((preparation / "archive_index.json").read_text())
     archive_payload["archives"][0]["size"] += 1
     (preparation / "archive_index.json").write_text(json.dumps(archive_payload))
     with pytest.raises(ValueError, match="archive_index_sha256"):
-        prepare_e01(preparation, audit_result, check=True)
+        prepare_e01(preparation, audit_result, check=True, probe=e01_probe)
 
 
 def _even_archive_members() -> tuple[tuple[str, ...], ...]:
@@ -1178,6 +1268,37 @@ def test_extract_writes_only_selected_mp4s_and_subtitles_atomically(
     assert not tuple(tmp_path.rglob("*.tmp"))
 
 
+def test_verify_prepared_files_accepts_official_nested_subtitle_layout(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "raw" / "archives"
+    archive_root.mkdir(parents=True)
+    archive_path = archive_root / "001.zip"
+    with ZipFile(archive_path, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("001.mp4", b"official-video")
+    index = _single_archive_index(archive_path, member_names=("001.mp4",))
+    subtitle_zip = tmp_path / "metadata" / "subtitle.zip"
+    subtitle_zip.parent.mkdir()
+    _subtitle_fixture(subtitle_zip, ("001",))
+    extract_selected_media(
+        ("001",), index, archive_root, tmp_path / "raw" / "videos", subtitle_zip
+    )
+    plan = DownloadPlan(
+        scope="full",
+        archives=index.archives,
+        selected_members=index.members,
+        archive_bytes_remaining=0,
+    )
+
+    archives, videos, subtitles = _verify_prepared_files(
+        plan, tmp_path / "raw", subtitle_zip
+    )
+
+    assert archives == (archive_path,)
+    assert videos == (tmp_path / "raw" / "videos" / "001.mp4",)
+    assert subtitles == (tmp_path / "raw" / "subtitles" / "001.jsonl",)
+
+
 def test_extract_reuses_output_only_while_recorded_size_and_hash_match(
     tmp_path: Path,
 ) -> None:
@@ -1351,6 +1472,7 @@ def test_prepare_check_plans_exact_pilot_and_full_scopes_without_downloading(
         metadata,
         tmp_path / "pilot-raw",
         tmp_path / "pilot-cache",
+        subtitle_zip=tmp_path / "subtitle.zip",
         scope="pilot",
         check=True,
         resume=False,
@@ -1360,6 +1482,7 @@ def test_prepare_check_plans_exact_pilot_and_full_scopes_without_downloading(
         metadata,
         tmp_path / "full-raw",
         tmp_path / "full-cache",
+        subtitle_zip=tmp_path / "subtitle.zip",
         scope="full",
         check=True,
         resume=False,
@@ -1407,6 +1530,7 @@ def test_prepare_capacity_fails_before_downloader_is_invoked(
             metadata,
             tmp_path / "raw",
             tmp_path / "cache",
+            subtitle_zip=tmp_path / "subtitle.zip",
             scope="pilot",
             check=False,
             resume=True,
@@ -1458,6 +1582,7 @@ def test_prepare_check_rejects_unsafe_or_invalid_existing_partial(
             metadata,
             raw_root,
             tmp_path / "cache",
+            subtitle_zip=tmp_path / "subtitle.zip",
             scope="pilot",
             check=True,
             resume=False,
@@ -1490,6 +1615,7 @@ def test_prepare_verify_only_uses_recorded_plan_and_never_network(
         metadata,
         raw_root,
         cache_root,
+        subtitle_zip=tmp_path / "subtitle.zip",
         scope="pilot",
         check=True,
         resume=False,
@@ -1510,11 +1636,80 @@ def test_prepare_verify_only_uses_recorded_plan_and_never_network(
             metadata,
             raw_root,
             cache_root,
+            subtitle_zip=tmp_path / "subtitle.zip",
             scope="pilot",
             check=False,
             resume=False,
             verify_only=True,
         )
+
+
+def test_prepare_resume_uses_recorded_plan_without_reindexing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    index = _full_population_archive_index(_even_archive_members())
+    metadata = SimpleNamespace(
+        video_ids=OFFICIAL_VIDEO_IDS, report=SimpleNamespace(metadata_sha256="7" * 64)
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities",
+        lambda: index.archives,
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", lambda *_args, **_kwargs: index
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100 * 1024**3, used=0, free=100 * 1024**3),
+    )
+    raw_root = tmp_path / "raw"
+    cache_root = tmp_path / "cache"
+    subtitle_zip = tmp_path / "subtitle.zip"
+    prepare_videos(
+        metadata,
+        raw_root,
+        cache_root,
+        subtitle_zip=subtitle_zip,
+        scope="pilot",
+        check=True,
+        resume=False,
+        verify_only=False,
+    )
+
+    def forbidden_network(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("resume must reuse the recorded archive index")
+
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.load_official_archive_identities", forbidden_network
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.build_archive_index", forbidden_network
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.download_pinned_file",
+        lambda _identity, destination, **_kwargs: Path(destination),
+    )
+    monkeypatch.setattr(
+        "fidmem.assets.videomme_v2.extract_selected_media",
+        lambda video_ids, _index, _archives, video_root, _subtitles: tuple(
+            Path(video_root) / f"{video_id}.mp4" for video_id in video_ids
+        ),
+    )
+
+    result = prepare_videos(
+        metadata,
+        raw_root,
+        cache_root,
+        subtitle_zip=subtitle_zip,
+        scope="pilot",
+        check=False,
+        resume=True,
+        verify_only=False,
+    )
+
+    assert result.status == "PREPARED"
+    assert result.archive_index == index
 
 
 def test_prepare_verify_only_rejects_plan_identity_tampering_before_media_use(
@@ -1542,6 +1737,7 @@ def test_prepare_verify_only_rejects_plan_identity_tampering_before_media_use(
         metadata,
         raw_root,
         cache_root,
+        subtitle_zip=tmp_path / "subtitle.zip",
         scope="pilot",
         check=True,
         resume=False,
@@ -1557,6 +1753,7 @@ def test_prepare_verify_only_rejects_plan_identity_tampering_before_media_use(
             metadata,
             raw_root,
             cache_root,
+            subtitle_zip=tmp_path / "subtitle.zip",
             scope="pilot",
             check=False,
             resume=False,

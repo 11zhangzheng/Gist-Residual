@@ -4,9 +4,9 @@
 >
 > 工作区：`/home/zhangzheng/projects/Gist-Residual`
 >
-> 当前 HEAD：`63e0fcab8a817b0c6015fbf8c0fe74be45903c9f`（`更换数据集`）
+> 当前 HEAD：`86517e2c051730ebc32ad8b8de57b4e91ddca6f8`（`Refactor metadata handling and enhance video preparation logic`）
 >
-> 当前状态：Video-MME-v2 工程迁移和 pilot 数据准备完成；正式实验停在 E00 前置条件，尚无 Production Authority、production result 或 paper result。
+> 当前状态：Video-MME-v2 代码迁移及 45-video pilot 下载已完成；数据资产布局和 manifest 绝对路径仍需修复并重新冻结。正式实验停在 E00 前置条件，尚无 Production Authority、production result 或 paper result。
 
 ---
 
@@ -77,12 +77,19 @@ Video → event segmentation / Gist Memory Index
 
 验证结果：
 
-- 45/45 raw MP4 存在且通过文件身份验证
-- 45/45 subtitles 存在
-- 20 个视频完成 midpoint decode smoke check
+- 当前 live raw root 中 45/45 raw MP4、45/45 subtitles 和 3/3 archives 均存在
+- 历史 raw verification 记录 45/45 文件身份通过、20/20 midpoint decode smoke check 通过
 - 三个归档的待提取成员数均为 0
 - 下载器支持 `--check`、`--resume`、`--verify-only`
 - 已修复 resume 模式误读旧报告的问题；恢复判断现在使用可恢复 state
+
+当前 live raw root 为：
+
+```text
+/mnt/disk1/zhangzheng/fidmem/datasets/videomme_v2_metadata/Raw/Video-MME-v2
+```
+
+该目录位于被冻结的 metadata snapshot 内，会改变 snapshot 的目录级 identity；因此当前 metadata asset lock 的 re-verification **FAIL**。此外，历史 manifest 仍绑定已不存在的旧 raw root `/mnt/disk1/zhangzheng/Tvqa_data/Raw/Video-MME-v2`。必须先把 raw media 放回独立于 metadata snapshot 的稳定路径，并重新执行 `--verify-only` 和 manifest 生成，才能进入 E01。
 
 **证据边界：该子集只能用于方法验证和 E03/E04 pilot，不得表述为 full Video-MME-v2 benchmark result。**
 
@@ -90,13 +97,13 @@ Video → event segmentation / Gist Memory Index
 
 ## 4. Manifest 与 video-disjoint split
 
-权威工程产物目录：
+当前工程产物目录：
 
 ```text
 artifacts/dataset-preparation/videomme-v2-pilot-v1/
 ```
 
-### Manifest 身份
+### 历史 Manifest 身份
 
 | 产物 | SHA-256 |
 |---|---|
@@ -116,6 +123,8 @@ artifacts/dataset-preparation/videomme-v2-pilot-v1/
 
 Source policy SHA-256：`dbd4ef4a51d548d705c4763d4415c1e4e4680f4639f3c456f20417205b5480fa`
 
+这些文件的内容哈希均可复核，但它们当前不是可执行的最终冻结 manifest：`video_manifest.json` 中 45/45 `uri` 均指向已不存在的旧 raw root，`raw_video_verification.json` 和 `media_preparation.json` 也绑定相同旧路径。重新生成后文件哈希将变化，报告中的本组哈希应保留为历史工程证据，而不是 E01/E02 Authority 输入。
+
 ### Split 分布
 
 | Split | Videos | Questions | 用途 |
@@ -123,7 +132,7 @@ Source policy SHA-256：`dbd4ef4a51d548d705c4763d4415c1e4e4680f4639f3c456f204172
 | `development` | 12 | 48 | Source / Router development |
 | `canary` | 4 | 16 | E03 Production Canary |
 | `oracle` | 25 | 100 | E04 Oracle Pilot |
-| `source_holdout` | 4 | 16 | Source holdout |
+| `holdout` | 4 | 16 | Source holdout |
 | **合计** | **45** | **180** | `PARTIAL_DATASET_PILOT` |
 
 四个 split 已通过 video-disjoint 审计；Canary 与 Oracle 没有共享 `video_id`。
@@ -134,8 +143,8 @@ Source policy SHA-256：`dbd4ef4a51d548d705c4763d4415c1e4e4680f4639f3c456f204172
 
 | Stage | 当前状态 | 说明 |
 |---|---|---|
-| E00 Environment & Asset Freeze | **仅 `--check` 通过，正式阶段未运行** | 配置 SHA-256 `7f79b0c67e4df482b40b4e03158027ede686947fe1f22029db0be56f325ccd23`；当前 `selected_gpus=[]`、NVIDIA driver 不可用 |
-| E01 Production Readiness Audit | **工程准备完成，正式人工审计未签署** | Execution Pack 按 fail-closed 规则因缺失正式 environment gate 而拒绝继续 |
+| E00 Environment & Asset Freeze | **仅 `--check` 通过，正式阶段未运行** | 配置 SHA-256 `7f79b0c67e4df482b40b4e03158027ede686947fe1f22029db0be56f325ccd23`；当前 `selected_gpus=[]`、NVIDIA driver 不可用；metadata snapshot identity 仍需恢复 |
+| E01 Production Readiness Audit | **未就绪，正式人工审计未签署** | live raw root 与冻结 metadata snapshot 重叠，历史 manifest 路径失效；Execution Pack 继续 fail closed |
 | E02 Authority Seal | **未运行** | 尚无 Production Authority hash；不能启动正式 Canary |
 | E03 Production Canary | **未运行** | 16 questions 已准备，但 E00/E01/E02 gate 尚未满足 |
 | E04 Oracle Pilot | **未运行** | 100 questions 已准备；必须等待 E03 Canary 通过 |
@@ -151,7 +160,7 @@ Source policy SHA-256：`dbd4ef4a51d548d705c4763d4415c1e4e4680f4639f3c456f204172
 
 ```text
 pytest -q tests/assets tests/production tests/integration
-203 passed in 16.06s
+203 passed in 17.70s
 
 python -m fidmem.production.pack_cli --validate-registry
 valid: true
@@ -166,6 +175,8 @@ PASS
 补充说明：
 
 - 四个模型 snapshot 已执行真实磁盘 rehash，而非仅验证 marker。
+- 当前 raw root 下 45/45 MP4、45/45 subtitle 和 3/3 archive 均存在；但历史 manifest URI 的存在性检查为 0/45。
+- 对当前 live root 运行 `06_prepare_videomme_v2_videos.sh --verify-only` 时，在读取数据前即按 fail-closed 规则报错：`Video-MME-v2 metadata snapshot differs from asset lock`。原因是 raw media 被放入 metadata snapshot 内，而不是 metadata 三个冻结文件本身发生已知内容变化。
 - 完整 `pytest -q` 曾启动，但现有 CPU-only Router 训练用例包含 200-step 长运行，手动停止前未出现失败；因此本报告**不声称 full suite 已通过**。
 - 当前节点没有可用 NVIDIA runtime，未伪造 GPU 验证。
 
@@ -188,15 +199,11 @@ PASS
 
 ## 8. Git 与 provenance 状态
 
-- 当前 HEAD：`63e0fcab8a817b0c6015fbf8c0fe74be45903c9f`
+- 当前 HEAD：`86517e2c051730ebc32ad8b8de57b4e91ddca6f8`
+- `origin/main`：`63e0fcab8a817b0c6015fbf8c0fe74be45903c9f`；本地 `main` 领先 1 个 commit
 - E00 `--check` 记录的 execution source-tree hash：`08568c76f2c378d7935a870502db0f1acba943543aa249591531dbdcd521a5de`
-- 当前工作树有未提交变更：
-  - `src/fidmem/assets/setup.py`
-  - `src/fidmem/assets/videomme_v2.py`
-  - `tests/assets/test_setup_wrappers.py`
-  - `tests/assets/test_videomme_v2.py`
-  - `PROGRESS_REPORT.md`
-- 本次只更新进度报告，没有创建 commit、tag 或外部发布。
+- 当前工作树仅 `PROGRESS_REPORT.md` 有未提交变更。
+- 本地 commit `86517e2` 已包含 metadata/preparation 修复和报告初次刷新；当前报告的后续一致性更正尚未提交。没有 tag 或外部发布记录。
 
 `PROGRESS_REPORT.md` 属于非执行报告，按现有 source identity 规则不进入 execution source-tree hash；正式 E00 前仍需重新生成并核对全部 provenance 证据。
 
@@ -206,21 +213,24 @@ PASS
 
 ### 正式实验阻断项
 
-1. 当前机器 NVIDIA driver / GPU runtime 不可用。
-2. E01 仍需人工完成 Production Readiness Audit 并签署现有 Gate。
-3. E00 正式运行尚未生成可供 Execution Pack 接受的 environment gate。
-4. E02 Authority Seal 尚未建立，因此 E03 不能正式启动。
-5. 工程修复与本报告仍在 dirty worktree，尚无新的不可变 source commit identity。
+1. raw media 当前位于冻结 metadata snapshot 内，导致 metadata asset lock re-verification 失败。
+2. 历史 manifest 中 45/45 video URI 指向不存在的旧 raw root，必须从 live media 重新生成。
+3. 当前机器 NVIDIA driver / GPU runtime 不可用。
+4. E01 仍需人工完成 Production Readiness Audit 并签署现有 Gate。
+5. E00 正式运行尚未生成可供 Execution Pack 接受的 environment gate。
+6. E02 Authority Seal 尚未建立，因此 E03 不能正式启动。
+7. 当前报告仍在 dirty worktree；本地新 commit 尚未出现在 `origin/main`。
 
 ### 下一正式阶段
 
-**下一步应执行 E00 Environment & Asset Freeze。** 推荐顺序：
+**下一正式阶段仍是 E00 Environment & Asset Freeze，但必须先修复数据资产布局。** 推荐顺序：
 
-1. 在不改变实验定义的前提下，为当前工程变更建立不可变 source identity；提交动作需项目所有者明确授权。
-2. 切换到满足冻结环境要求的目标 GPU 节点，重新执行 E00 正式环境与资产冻结。
-3. 完成人工 E01 Production Readiness Audit。
-4. 对所有冻结字段生成 E02 Authority Seal。
-5. E02 通过后运行 E03 Canary（16 questions）；Canary 通过后运行 E04 Oracle Pilot（100 questions）。
+1. 将 45-video raw media 放到 metadata snapshot 之外的稳定目录，不删除现有数据；恢复 metadata lock identity。
+2. 对新 raw root 执行 `--verify-only`，重新生成 dataset/video/question、Canary/Oracle 和 Source Gate preparation artifacts，并复核新的哈希及 video-disjoint 性。
+3. 在满足冻结环境要求的目标 GPU 节点，重新执行 E00 正式环境与资产冻结。
+4. 完成人工 E01 Production Readiness Audit。
+5. 对所有冻结字段生成 E02 Authority Seal。
+6. E02 通过后运行 E03 Canary（16 questions）；Canary 通过后运行 E04 Oracle Pilot（100 questions）。
 
 当前未发现新的 `RESEARCH_OWNER_DECISION_REQUIRED`；现有阻断均属于环境、provenance 或既定人工 Gate，而不是需要改变论文定义的研究参数。
 
